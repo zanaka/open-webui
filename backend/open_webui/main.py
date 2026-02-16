@@ -1363,6 +1363,28 @@ async def commit_session_after_request(request: Request, call_next):
 
 
 @app.middleware("http")
+async def inject_dek_middleware(request: Request, call_next):
+    from open_webui.utils.crypto_context import set_dek, clear_dek, get_cached_dek
+    from open_webui.utils.auth import decode_token
+
+    try:
+        dek = None
+        token = getattr(request.state, "token", None)
+        if token and hasattr(token, "credentials"):
+            try:
+                data = decode_token(token.credentials)
+                if data and "id" in data:
+                    dek = get_cached_dek(data["id"])
+            except Exception:
+                pass
+        set_dek(dek)
+        response = await call_next(request)
+        return response
+    finally:
+        clear_dek()
+
+
+@app.middleware("http")
 async def check_url(request: Request, call_next):
     start_time = int(time.time())
     request.state.token = get_http_authorization_cred(

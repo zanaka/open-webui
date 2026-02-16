@@ -49,6 +49,14 @@ from open_webui.config import (
 from pydantic import BaseModel
 
 from open_webui.utils.misc import parse_duration, validate_email_format
+from open_webui.utils.crypto_context import cache_dek, get_cached_dek, set_dek
+from open_webui.utils.crypto_utils import (
+    derive_kek,
+    generate_dek,
+    generate_kdf_salt,
+    unwrap_dek,
+    wrap_dek,
+)
 from open_webui.utils.auth import (
     validate_password,
     verify_password,
@@ -82,6 +90,43 @@ from ldap3.utils.conv import escape_filter_chars
 router = APIRouter()
 
 log = logging.getLogger(__name__)
+
+DEFAULT_DEK_CACHE_TTL = 86400  # 24 hours fallback
+
+
+def _get_dek_cache_ttl(app_config) -> float:
+    """Derive DEK cache TTL from JWT expiry config."""
+    try:
+        delta = parse_duration(app_config.JWT_EXPIRES_IN)
+        if delta:
+            return delta.total_seconds()
+    except Exception:
+        pass
+    return DEFAULT_DEK_CACHE_TTL
+
+
+def _setup_dek_for_user(
+    user_id: str, password: str, app_config, db=None
+) -> None:
+    """Derive or create DEK for a user and cache it in memory + ContextVar."""
+    kdf_salt, wrapped = Auths.get_encryption_params(user_id, db=db)
+    ttl = _get_dek_cache_ttl(app_config)
+
+    if kdf_salt and wrapped:
+        # Existing user with encryption keys — unwrap DEK
+        kek = derive_kek(password, kdf_salt)
+        dek = unwrap_dek(wrapped, kek)
+    else:
+        # New or pre-encryption user — generate DEK (lazy migration)
+        dek = generate_dek()
+        salt = generate_kdf_salt()
+        kek = derive_kek(password, salt)
+        wrapped_new = wrap_dek(dek, kek)
+        Auths.set_encryption_params(user_id, salt, wrapped_new, db=db)
+
+    cache_dek(user_id, dek, ttl)
+    set_dek(dek)
+
 
 signin_rate_limiter = RateLimiter(
     redis_client=get_redis_client(), limit=5 * 3, window=60 * 3
@@ -222,6 +267,7 @@ async def update_timezone(
 
 @router.post("/update/password", response_model=bool)
 async def update_password(
+    request: Request,
     form_data: UpdatePasswordForm,
     session_user=Depends(get_current_user),
     db: Session = Depends(get_session),
@@ -237,9 +283,29 @@ async def update_password(
 
         if user:
             try:
-                validate_password(form_data.password)
+                validate_password(form_data.new_password)
             except Exception as e:
                 raise HTTPException(400, detail=str(e))
+
+            # Re-wrap DEK with new password
+            try:
+                kdf_salt, wrapped = Auths.get_encryption_params(user.id, db=db)
+                if kdf_salt and wrapped:
+                    old_kek = derive_kek(form_data.password, kdf_salt)
+                    dek = unwrap_dek(wrapped, old_kek)
+
+                    new_salt = generate_kdf_salt()
+                    new_kek = derive_kek(form_data.new_password, new_salt)
+                    new_wrapped = wrap_dek(dek, new_kek)
+
+                    Auths.set_encryption_params(user.id, new_salt, new_wrapped, db=db)
+
+                    ttl = _get_dek_cache_ttl(request.app.state.config)
+                    cache_dek(user.id, dek, ttl)
+            except Exception as e:
+                log.error(f"Failed to re-wrap DEK for user {user.id}: {e}")
+                raise HTTPException(500, detail="Failed to update encryption keys.")
+
             hashed = get_password_hash(form_data.new_password)
             return Auths.update_user_password_by_id(user.id, hashed, db=db)
         else:
@@ -646,6 +712,14 @@ async def signin(
         )
 
     if user:
+        # Setup DEK for envelope encryption (only for password-based auth)
+        if WEBUI_AUTH and not WEBUI_AUTH_TRUSTED_EMAIL_HEADER:
+            try:
+                _setup_dek_for_user(
+                    user.id, form_data.password, request.app.state.config, db=db
+                )
+            except Exception as e:
+                log.error(f"Failed to setup DEK for user {user.id}: {e}")
 
         expires_delta = parse_duration(request.app.state.config.JWT_EXPIRES_IN)
         expires_at = None
@@ -748,6 +822,14 @@ async def signup(
         )
 
         if user:
+            # Setup DEK for envelope encryption
+            try:
+                _setup_dek_for_user(
+                    user.id, form_data.password, request.app.state.config, db=db
+                )
+            except Exception as e:
+                log.error(f"Failed to setup DEK for user {user.id}: {e}")
+
             expires_delta = parse_duration(request.app.state.config.JWT_EXPIRES_IN)
             expires_at = None
             if expires_delta:

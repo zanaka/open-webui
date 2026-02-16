@@ -188,6 +188,37 @@ class AuthsTable:
         except Exception:
             return False
 
+    def get_encryption_params(
+        self, user_id: str, db: Optional[Session] = None
+    ) -> tuple[Optional[bytes], Optional[bytes]]:
+        try:
+            with get_db_context(db) as db:
+                auth = db.query(Auth).filter_by(id=user_id).first()
+                if auth and auth.kdf_salt and auth.wrapped_dek:
+                    return (auth.kdf_salt, auth.wrapped_dek)
+                return (None, None)
+        except Exception:
+            return (None, None)
+
+    def set_encryption_params(
+        self,
+        user_id: str,
+        kdf_salt: bytes,
+        wrapped_dek: bytes,
+        db: Optional[Session] = None,
+    ) -> bool:
+        try:
+            with get_db_context(db) as db:
+                result = (
+                    db.query(Auth)
+                    .filter_by(id=user_id)
+                    .update({"kdf_salt": kdf_salt, "wrapped_dek": wrapped_dek})
+                )
+                db.commit()
+                return result == 1
+        except Exception:
+            return False
+
     def delete_auth_by_id(self, id: str, db: Optional[Session] = None) -> bool:
         try:
             with get_db_context(db) as db:
