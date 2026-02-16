@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from open_webui.internal.db import Base, JSONField, get_db, get_db_context
 from open_webui.models.users import UserModel, UserProfileImageResponse, Users
 from pydantic import BaseModel
-from sqlalchemy import Boolean, Column, String, Text
+from sqlalchemy import Boolean, Column, LargeBinary, String, Text
 
 log = logging.getLogger(__name__)
 
@@ -22,6 +22,8 @@ class Auth(Base):
     email = Column(String)
     password = Column(Text)
     active = Column(Boolean)
+    kdf_salt = Column(LargeBinary, nullable=True)
+    wrapped_dek = Column(LargeBinary, nullable=True)
 
 
 class AuthModel(BaseModel):
@@ -183,6 +185,37 @@ class AuthsTable:
                 result = db.query(Auth).filter_by(id=id).update({"email": email})
                 db.commit()
                 return True if result == 1 else False
+        except Exception:
+            return False
+
+    def get_encryption_params(
+        self, user_id: str, db: Optional[Session] = None
+    ) -> tuple[Optional[bytes], Optional[bytes]]:
+        try:
+            with get_db_context(db) as db:
+                auth = db.query(Auth).filter_by(id=user_id).first()
+                if auth and auth.kdf_salt and auth.wrapped_dek:
+                    return (auth.kdf_salt, auth.wrapped_dek)
+                return (None, None)
+        except Exception:
+            return (None, None)
+
+    def set_encryption_params(
+        self,
+        user_id: str,
+        kdf_salt: bytes,
+        wrapped_dek: bytes,
+        db: Optional[Session] = None,
+    ) -> bool:
+        try:
+            with get_db_context(db) as db:
+                result = (
+                    db.query(Auth)
+                    .filter_by(id=user_id)
+                    .update({"kdf_salt": kdf_salt, "wrapped_dek": wrapped_dek})
+                )
+                db.commit()
+                return result == 1
         except Exception:
             return False
 
