@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from open_webui.internal.db import Base, JSONField, get_db, get_db_context
 from open_webui.models.users import UserModel, UserProfileImageResponse, Users
 from pydantic import BaseModel
-from sqlalchemy import Boolean, Column, String, Text
+from sqlalchemy import Boolean, Column, LargeBinary, String, Text
 
 log = logging.getLogger(__name__)
 
@@ -22,6 +22,8 @@ class Auth(Base):
     email = Column(String)
     password = Column(Text)
     active = Column(Boolean)
+    kdf_salt = Column(LargeBinary, nullable=True)
+    wrapped_dek = Column(LargeBinary, nullable=True)
 
 
 class AuthModel(BaseModel):
