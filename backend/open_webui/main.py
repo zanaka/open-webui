@@ -60,6 +60,7 @@ from starsessions.stores.redis import RedisStore
 from open_webui.utils import logger
 from open_webui.utils.audit import AuditLevel, AuditLoggingMiddleware
 from open_webui.utils.logger import start_logger
+from open_webui.utils.memory_lock import enable_memory_lock
 from open_webui.socket.main import (
     MODELS,
     app as socket_app,
@@ -586,6 +587,7 @@ https://github.com/open-webui/open-webui
 async def lifespan(app: FastAPI):
     app.state.instance_id = INSTANCE_ID
     start_logger()
+    enable_memory_lock()
 
     if RESET_CONFIG_ON_START:
         reset_config()
