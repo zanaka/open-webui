@@ -54,8 +54,8 @@ class JSONField(types.TypeDecorator):
 class EncryptedJSON(types.TypeDecorator):
     """
     Transparently encrypts/decrypts JSON data using the per-request DEK.
-    Stores as base64-encoded ciphertext (Text column) when DEK is available.
-    Falls back to plaintext JSON when no DEK is present (backward compatibility).
+    Stores as base64-encoded ciphertext (Text column).
+    Raises RuntimeError if no DEK is available.
     """
 
     impl = types.Text
@@ -64,40 +64,36 @@ class EncryptedJSON(types.TypeDecorator):
     def process_bind_param(self, value: Optional[_T], dialect: Dialect) -> Any:
         if value is None:
             return None
-        json_str = json.dumps(value)
 
         from open_webui.utils.crypto_context import get_dek
         from open_webui.utils.crypto_utils import encrypt_value
 
         dek = get_dek()
-        if dek is not None:
-            encrypted = encrypt_value(json_str.encode("utf-8"), dek)
-            return base64.b64encode(encrypted).decode("ascii")
-        else:
-            return json_str
+        if dek is None:
+            raise RuntimeError(
+                "No DEK available in context. "
+                "User must be authenticated to write encrypted data."
+            )
+        json_str = json.dumps(value)
+        encrypted = encrypt_value(json_str.encode("utf-8"), dek)
+        return base64.b64encode(encrypted).decode("ascii")
 
     def process_result_value(self, value: Optional[_T], dialect: Dialect) -> Any:
         if value is None:
             return None
 
-        from open_webui.utils.crypto_utils import is_encrypted
+        from open_webui.utils.crypto_context import get_dek
+        from open_webui.utils.crypto_utils import decrypt_value
 
-        if is_encrypted(value):
-            from open_webui.utils.crypto_context import get_dek
-            from open_webui.utils.crypto_utils import decrypt_value
-
-            dek = get_dek()
-            if dek is None:
-                raise RuntimeError(
-                    "Encrypted data found but no DEK available in context. "
-                    "User must re-login to access encrypted data."
-                )
-            encrypted_bytes = base64.b64decode(value)
-            plaintext = decrypt_value(encrypted_bytes, dek)
-            return json.loads(plaintext.decode("utf-8"))
-        else:
-            # Plaintext JSON (pre-migration or no DEK at write time)
-            return json.loads(value)
+        dek = get_dek()
+        if dek is None:
+            raise RuntimeError(
+                "Encrypted data found but no DEK available in context. "
+                "User must re-login to access encrypted data."
+            )
+        encrypted_bytes = base64.b64decode(value)
+        plaintext = decrypt_value(encrypted_bytes, dek)
+        return json.loads(plaintext.decode("utf-8"))
 
     def copy(self, **kw: Any) -> Self:
         return EncryptedJSON(self.impl.length)
