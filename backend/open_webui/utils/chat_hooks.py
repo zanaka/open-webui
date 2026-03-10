@@ -8,15 +8,12 @@ is preserved by wrapping ciphertext in {"__encrypted__": "<base64>"}.
 
 import json
 import base64
-import logging
 
 from sqlalchemy import event
 
 from open_webui.models.chats import Chat
 from open_webui.utils.crypto_utils import encrypt_value, decrypt_value
 from open_webui.utils.crypto_context import get_cached_dek
-
-log = logging.getLogger(__name__)
 
 
 def _encrypt_chat(target: Chat) -> None:
@@ -26,7 +23,10 @@ def _encrypt_chat(target: Chat) -> None:
         return
     dek = get_cached_dek(target.user_id)
     if dek is None:
-        return
+        raise RuntimeError(
+            f"No DEK cached for user {target.user_id}. "
+            "User must be authenticated to save chat data."
+        )
     plaintext = json.dumps(target.chat).encode("utf-8")
     encrypted = encrypt_value(plaintext, dek)
     target._chat_plaintext = target.chat
