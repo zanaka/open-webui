@@ -61,6 +61,7 @@ from open_webui.utils import logger
 from open_webui.utils.audit import AuditLevel, AuditLoggingMiddleware
 from open_webui.utils.logger import start_logger
 from open_webui.utils.memory_lock import enable_memory_lock
+import open_webui.encryption.chat_hooks  # noqa: F401 — registers SQLAlchemy event listeners
 from open_webui.socket.main import (
     MODELS,
     app as socket_app,
