@@ -1,24 +1,6 @@
 import threading
 import time
-from contextvars import ContextVar
 from typing import Optional
-
-# Per-request DEK (Data Encryption Key)
-# Set by inject_dek_middleware, consumed by EncryptedJSON TypeDecorator
-_current_dek: ContextVar[Optional[bytes]] = ContextVar("current_dek", default=None)
-
-
-def get_dek() -> Optional[bytes]:
-    return _current_dek.get()
-
-
-def set_dek(dek: Optional[bytes]) -> None:
-    _current_dek.set(dek)
-
-
-def clear_dek() -> None:
-    _current_dek.set(None)
-
 
 # ---------------------------------------------------------------------------
 # In-memory DEK cache (user_id -> DEK)
