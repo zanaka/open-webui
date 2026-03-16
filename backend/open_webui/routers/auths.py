@@ -231,6 +231,7 @@ async def update_password(
     if session_user:
         user = Auths.authenticate_user(
             session_user.email,
+            form_data.password,
             lambda pw: verify_password(form_data.password, pw),
             db=db,
         )
@@ -452,12 +453,14 @@ async def ldap_auth(
                         else request.app.state.config.DEFAULT_USER_ROLE
                     )
 
+                    ldap_password = str(uuid.uuid4())
                     user = Auths.insert_new_auth(
                         email=email,
-                        password=str(uuid.uuid4()),
+                        password=ldap_password,
                         name=cn,
                         role=role,
                         db=db,
+                        raw_password=ldap_password,
                     )
 
                     if not user:
@@ -604,6 +607,7 @@ async def signin(
         if Users.get_user_by_email(admin_email.lower(), db=db):
             user = Auths.authenticate_user(
                 admin_email.lower(),
+                admin_password,
                 lambda pw: verify_password(admin_password, pw),
                 db=db,
             )
@@ -620,6 +624,7 @@ async def signin(
 
             user = Auths.authenticate_user(
                 admin_email.lower(),
+                admin_password,
                 lambda pw: verify_password(admin_password, pw),
                 db=db,
             )
@@ -641,6 +646,7 @@ async def signin(
 
         user = Auths.authenticate_user(
             form_data.email.lower(),
+            form_data.password,
             lambda pw: verify_password(form_data.password, pw),
             db=db,
         )
@@ -742,8 +748,9 @@ async def signup(
             form_data.email.lower(),
             hashed,
             form_data.name,
-            form_data.profile_image_url,
-            role,
+            raw_password=form_data.password,
+            profile_image_url=form_data.profile_image_url,
+            role=role,
             db=db,
         )
 
@@ -930,8 +937,9 @@ async def add_user(
             form_data.email.lower(),
             hashed,
             form_data.name,
-            form_data.profile_image_url,
-            form_data.role,
+            raw_password=form_data.password,
+            profile_image_url=form_data.profile_image_url,
+            role=form_data.role,
             db=db,
         )
 

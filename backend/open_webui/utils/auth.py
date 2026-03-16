@@ -448,6 +448,7 @@ def create_admin_user(email: str, password: str, name: str = "Admin"):
             password=hashed,
             name=name,
             role="admin",
+            raw_password=password,
         )
         if user:
             log.info(f"Admin account created successfully: {email}")

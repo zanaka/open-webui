@@ -5,6 +5,8 @@ from typing import Optional
 from sqlalchemy.orm import Session
 from open_webui.internal.db import Base, JSONField, get_db, get_db_context
 from open_webui.models.users import UserModel, UserProfileImageResponse, Users
+from open_webui.utils.crypto_utils import generate_dek, generate_kdf_salt, derive_kek, wrap_dek, unwrap_dek
+from open_webui.utils.crypto_context import cache_dek
 from pydantic import BaseModel
 from sqlalchemy import Boolean, Column, LargeBinary, String, Text
 
@@ -31,6 +33,8 @@ class AuthModel(BaseModel):
     email: str
     password: str
     active: bool = True
+    kdf_salt: bytes
+    wrapped_dek: bytes
 
 
 ####################
@@ -87,6 +91,7 @@ class AuthsTable:
         email: str,
         password: str,
         name: str,
+        raw_password: str,
         profile_image_url: str = "/user.png",
         role: str = "pending",
         oauth: Optional[dict] = None,
@@ -97,8 +102,18 @@ class AuthsTable:
 
             id = str(uuid.uuid4())
 
+            dek = generate_dek()
+            kdf_salt = generate_kdf_salt()
+            kek = derive_kek(raw_password, kdf_salt)
+            wrapped_dek = wrap_dek(dek, kek)
+
             auth = AuthModel(
-                **{"id": id, "email": email, "password": password, "active": True}
+                id=id,
+                email=email,
+                password=password,
+                active=True,
+                kdf_salt=kdf_salt,
+                wrapped_dek=wrapped_dek,
             )
             result = Auth(**auth.model_dump())
             db.add(result)
@@ -111,12 +126,13 @@ class AuthsTable:
             db.refresh(result)
 
             if result and user:
+                cache_dek(id, dek, ttl_seconds=3600)
                 return user
             else:
                 return None
 
     def authenticate_user(
-        self, email: str, verify_password: callable, db: Optional[Session] = None
+        self, email: str, password: str, verify_password: callable, db: Optional[Session] = None
     ) -> Optional[UserModel]:
         log.info(f"authenticate_user: {email}")
 
@@ -129,12 +145,16 @@ class AuthsTable:
                 auth = db.query(Auth).filter_by(id=user.id, active=True).first()
                 if auth:
                     if verify_password(auth.password):
+                        kek = derive_kek(password, auth.kdf_salt)
+                        dek = unwrap_dek(auth.wrapped_dek, kek)
+                        cache_dek(user.id, dek, ttl_seconds=3600)
                         return user
                     else:
                         return None
                 else:
                     return None
-        except Exception:
+        except Exception as e:
+            log.exception(f"authenticate_user error: {e}")
             return None
 
     def authenticate_user_by_api_key(

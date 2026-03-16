@@ -34,6 +34,7 @@ class TestAuths(AbstractPostgresTest):
             name="John Doe",
             profile_image_url="/user.png",
             role="user",
+            raw_password="old_password",
         )
 
         with mock_webui_user(id=user.id):
@@ -47,7 +48,7 @@ class TestAuths(AbstractPostgresTest):
         assert db_user.profile_image_url == "/user2.png"
 
     def test_update_password(self):
-        from open_webui.utils.auth import get_password_hash
+        from open_webui.utils.auth import get_password_hash, verify_password
 
         user = self.auths.insert_new_auth(
             email="john.doe@openwebui.com",
@@ -55,6 +56,7 @@ class TestAuths(AbstractPostgresTest):
             name="John Doe",
             profile_image_url="/user.png",
             role="user",
+            raw_password="old_password",
         )
 
         with mock_webui_user(id=user.id):
@@ -65,11 +67,15 @@ class TestAuths(AbstractPostgresTest):
         assert response.status_code == 200
 
         old_auth = self.auths.authenticate_user(
-            "john.doe@openwebui.com", "old_password"
+            "john.doe@openwebui.com",
+            "old_password",
+            lambda pw: verify_password("old_password", pw),
         )
         assert old_auth is None
         new_auth = self.auths.authenticate_user(
-            "john.doe@openwebui.com", "new_password"
+            "john.doe@openwebui.com",
+            "new_password",
+            lambda pw: verify_password("new_password", pw),
         )
         assert new_auth is not None
 
@@ -82,6 +88,7 @@ class TestAuths(AbstractPostgresTest):
             name="John Doe",
             profile_image_url="/user.png",
             role="user",
+            raw_password="password",
         )
         response = self.fast_api_client.post(
             self.create_url("/signin"),
@@ -144,6 +151,7 @@ class TestAuths(AbstractPostgresTest):
             name="John Doe",
             profile_image_url="/user.png",
             role="admin",
+            raw_password="password",
         )
         with mock_webui_user():
             response = self.fast_api_client.get(self.create_url("/admin/details"))
@@ -161,6 +169,7 @@ class TestAuths(AbstractPostgresTest):
             name="John Doe",
             profile_image_url="/user.png",
             role="admin",
+            raw_password="password",
         )
         with mock_webui_user(id=user.id):
             response = self.fast_api_client.post(self.create_url("/api_key"))
@@ -176,6 +185,7 @@ class TestAuths(AbstractPostgresTest):
             name="John Doe",
             profile_image_url="/user.png",
             role="admin",
+            raw_password="password",
         )
         self.users.update_user_api_key_by_id(user.id, "abc")
         with mock_webui_user(id=user.id):
@@ -192,6 +202,7 @@ class TestAuths(AbstractPostgresTest):
             name="John Doe",
             profile_image_url="/user.png",
             role="admin",
+            raw_password="password",
         )
         self.users.update_user_api_key_by_id(user.id, "abc")
         with mock_webui_user(id=user.id):

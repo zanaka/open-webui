@@ -1583,16 +1583,16 @@ class OAuthManager:
                         log.warning("Username claim is missing, using email as name")
                         name = email
 
+                    oauth_random_password = str(uuid.uuid4())
                     user = Auths.insert_new_auth(
                         email=email,
-                        password=get_password_hash(
-                            str(uuid.uuid4())
-                        ),  # Random password, not used
+                        password=get_password_hash(oauth_random_password),
                         name=name,
                         profile_image_url=picture_url,
                         role=self.get_user_role(None, user_data),
                         oauth=oauth_data,
                         db=db,
+                        raw_password=oauth_random_password,
                     )
 
                     if auth_manager_config.WEBHOOK_URL:
