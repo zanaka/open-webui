@@ -231,8 +231,8 @@ async def update_password(
     if session_user:
         user = Auths.authenticate_user(
             session_user.email,
-            raw_password=form_data.password,
-            verify_password=lambda pw: verify_password(form_data.password, pw),
+            form_data.password,
+            lambda pw: verify_password(form_data.password, pw),
             db=db,
         )
 
@@ -607,8 +607,8 @@ async def signin(
         if Users.get_user_by_email(admin_email.lower(), db=db):
             user = Auths.authenticate_user(
                 admin_email.lower(),
-                raw_password=admin_password,
-                verify_password=lambda pw: verify_password(admin_password, pw),
+                admin_password,
+                lambda pw: verify_password(admin_password, pw),
                 db=db,
             )
         else:
@@ -624,8 +624,8 @@ async def signin(
 
             user = Auths.authenticate_user(
                 admin_email.lower(),
-                raw_password=admin_password,
-                verify_password=lambda pw: verify_password(admin_password, pw),
+                admin_password,
+                lambda pw: verify_password(admin_password, pw),
                 db=db,
             )
     else:
@@ -646,8 +646,8 @@ async def signin(
 
         user = Auths.authenticate_user(
             form_data.email.lower(),
-            raw_password=form_data.password,
-            verify_password=lambda pw: verify_password(form_data.password, pw),
+            form_data.password,
+            lambda pw: verify_password(form_data.password, pw),
             db=db,
         )
 

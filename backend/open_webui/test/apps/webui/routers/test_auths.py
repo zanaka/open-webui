@@ -68,14 +68,14 @@ class TestAuths(AbstractPostgresTest):
 
         old_auth = self.auths.authenticate_user(
             "john.doe@openwebui.com",
-            raw_password="old_password",
-            verify_password=lambda pw: verify_password("old_password", pw),
+            "old_password",
+            lambda pw: verify_password("old_password", pw),
         )
         assert old_auth is None
         new_auth = self.auths.authenticate_user(
             "john.doe@openwebui.com",
-            raw_password="new_password",
-            verify_password=lambda pw: verify_password("new_password", pw),
+            "new_password",
+            lambda pw: verify_password("new_password", pw),
         )
         assert new_auth is not None
 

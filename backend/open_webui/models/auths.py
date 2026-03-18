@@ -153,8 +153,8 @@ class AuthsTable:
                         return None
                 else:
                     return None
-        except Exception as e:
-            log.exception(f"authenticate_user error: {e}")
+        except Exception:
+            log.exception("authenticate_user error")
             return None
 
     def authenticate_user_by_api_key(
