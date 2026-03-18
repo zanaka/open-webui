@@ -132,7 +132,7 @@ class AuthsTable:
                 return None
 
     def authenticate_user(
-        self, email: str, password: str, verify_password: callable, db: Optional[Session] = None
+        self, email: str, raw_password: str, verify_password: callable, db: Optional[Session] = None
     ) -> Optional[UserModel]:
         log.info(f"authenticate_user: {email}")
 
@@ -145,7 +145,7 @@ class AuthsTable:
                 auth = db.query(Auth).filter_by(id=user.id, active=True).first()
                 if auth:
                     if verify_password(auth.password):
-                        kek = derive_kek(password, auth.kdf_salt)
+                        kek = derive_kek(raw_password, auth.kdf_salt)
                         dek = unwrap_dek(auth.wrapped_dek, kek)
                         cache_dek(user.id, dek, ttl_seconds=3600)
                         return user
