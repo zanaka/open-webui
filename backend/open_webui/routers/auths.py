@@ -748,9 +748,9 @@ async def signup(
             form_data.email.lower(),
             hashed,
             form_data.name,
-            raw_password=form_data.password,
-            profile_image_url=form_data.profile_image_url,
-            role=role,
+            form_data.password,
+            form_data.profile_image_url,
+            role,
             db=db,
         )
 
@@ -937,9 +937,9 @@ async def add_user(
             form_data.email.lower(),
             hashed,
             form_data.name,
-            raw_password=form_data.password,
-            profile_image_url=form_data.profile_image_url,
-            role=form_data.role,
+            form_data.password,
+            form_data.profile_image_url,
+            form_data.role,
             db=db,
         )
 
