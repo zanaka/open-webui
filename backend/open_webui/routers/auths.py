@@ -456,7 +456,7 @@ async def ldap_auth(
                     ldap_password = str(uuid.uuid4())
                     user = Auths.insert_new_auth(
                         email=email,
-                        password=ldap_password,
+                        hashed_password=ldap_password,
                         name=cn,
                         role=role,
                         db=db,

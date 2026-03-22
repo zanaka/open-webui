@@ -1586,7 +1586,7 @@ class OAuthManager:
                     oauth_random_password = str(uuid.uuid4())
                     user = Auths.insert_new_auth(
                         email=email,
-                        password=get_password_hash(oauth_random_password),
+                        hashed_password=get_password_hash(oauth_random_password),
                         name=name,
                         profile_image_url=picture_url,
                         role=self.get_user_role(None, user_data),

@@ -5,7 +5,13 @@ from typing import Optional
 from sqlalchemy.orm import Session
 from open_webui.internal.db import Base, JSONField, get_db, get_db_context
 from open_webui.models.users import UserModel, UserProfileImageResponse, Users
-from open_webui.utils.crypto_utils import generate_dek, generate_kdf_salt, derive_kek, wrap_dek, unwrap_dek
+from open_webui.utils.crypto_utils import (
+    generate_dek,
+    generate_kdf_salt,
+    derive_kek,
+    wrap_dek,
+    unwrap_dek,
+)
 from open_webui.utils.crypto_context import cache_dek
 from pydantic import BaseModel
 from sqlalchemy import Boolean, Column, LargeBinary, String, Text
@@ -89,7 +95,7 @@ class AuthsTable:
     def insert_new_auth(
         self,
         email: str,
-        password: str,
+        hashed_password: str,
         name: str,
         raw_password: str,
         profile_image_url: str = "/user.png",
@@ -110,7 +116,7 @@ class AuthsTable:
             auth = AuthModel(
                 id=id,
                 email=email,
-                password=password,
+                password=hashed_password,
                 active=True,
                 kdf_salt=kdf_salt,
                 wrapped_dek=wrapped_dek,
@@ -132,7 +138,11 @@ class AuthsTable:
                 return None
 
     def authenticate_user(
-        self, email: str, raw_password: str, verify_password: callable, db: Optional[Session] = None
+        self,
+        email: str,
+        raw_password: str,
+        verify_password: callable,
+        db: Optional[Session] = None,
     ) -> Optional[UserModel]:
         log.info(f"authenticate_user: {email}")
 

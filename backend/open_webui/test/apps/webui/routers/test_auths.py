@@ -30,7 +30,7 @@ class TestAuths(AbstractPostgresTest):
 
         user = self.auths.insert_new_auth(
             email="john.doe@openwebui.com",
-            password=get_password_hash("old_password"),
+            hashed_password=get_password_hash("old_password"),
             name="John Doe",
             profile_image_url="/user.png",
             role="user",
@@ -52,7 +52,7 @@ class TestAuths(AbstractPostgresTest):
 
         user = self.auths.insert_new_auth(
             email="john.doe@openwebui.com",
-            password=get_password_hash("old_password"),
+            hashed_password=get_password_hash("old_password"),
             name="John Doe",
             profile_image_url="/user.png",
             role="user",
@@ -80,7 +80,7 @@ class TestAuths(AbstractPostgresTest):
 
         user = self.auths.insert_new_auth(
             email="john.doe@openwebui.com",
-            password=get_password_hash("password"),
+            hashed_password=get_password_hash("password"),
             name="John Doe",
             profile_image_url="/user.png",
             role="user",
@@ -143,7 +143,7 @@ class TestAuths(AbstractPostgresTest):
     def test_get_admin_details(self):
         self.auths.insert_new_auth(
             email="john.doe@openwebui.com",
-            password="password",
+            hashed_password="password",
             name="John Doe",
             profile_image_url="/user.png",
             role="admin",
@@ -161,7 +161,7 @@ class TestAuths(AbstractPostgresTest):
     def test_create_api_key_(self):
         user = self.auths.insert_new_auth(
             email="john.doe@openwebui.com",
-            password="password",
+            hashed_password="password",
             name="John Doe",
             profile_image_url="/user.png",
             role="admin",
@@ -177,7 +177,7 @@ class TestAuths(AbstractPostgresTest):
     def test_delete_api_key(self):
         user = self.auths.insert_new_auth(
             email="john.doe@openwebui.com",
-            password="password",
+            hashed_password="password",
             name="John Doe",
             profile_image_url="/user.png",
             role="admin",
@@ -194,7 +194,7 @@ class TestAuths(AbstractPostgresTest):
     def test_get_api_key(self):
         user = self.auths.insert_new_auth(
             email="john.doe@openwebui.com",
-            password="password",
+            hashed_password="password",
             name="John Doe",
             profile_image_url="/user.png",
             role="admin",
