@@ -446,6 +446,11 @@ async def ldap_auth(
 
             user = Users.get_user_by_email(email, db=db)
             if not user:
+                raise HTTPException(
+                    403,
+                    detail="To use LDAP, provide data encryption key to raw_password argument.",
+                )
+
                 try:
                     role = (
                         "admin"
@@ -453,14 +458,12 @@ async def ldap_auth(
                         else request.app.state.config.DEFAULT_USER_ROLE
                     )
 
-                    ldap_password = str(uuid.uuid4())
                     user = Auths.insert_new_auth(
                         email=email,
-                        hashed_password=ldap_password,
+                        hashed_password=str(uuid.uuid4()),
                         name=cn,
                         role=role,
                         db=db,
-                        raw_password=ldap_password,
                     )
 
                     if not user:
