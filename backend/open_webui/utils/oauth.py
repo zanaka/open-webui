@@ -1583,9 +1583,14 @@ class OAuthManager:
                         log.warning("Username claim is missing, using email as name")
                         name = email
 
+                    raise HTTPException(
+                        501,
+                        detail="To use OAuth, provide data encryption key to raw_password argument.",
+                    )
+
                     user = Auths.insert_new_auth(
                         email=email,
-                        password=get_password_hash(
+                        hashed_password=get_password_hash(
                             str(uuid.uuid4())
                         ),  # Random password, not used
                         name=name,

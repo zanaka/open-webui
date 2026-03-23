@@ -30,10 +30,11 @@ class TestAuths(AbstractPostgresTest):
 
         user = self.auths.insert_new_auth(
             email="john.doe@openwebui.com",
-            password=get_password_hash("old_password"),
+            hashed_password=get_password_hash("old_password"),
             name="John Doe",
             profile_image_url="/user.png",
             role="user",
+            raw_password="old_password",
         )
 
         with mock_webui_user(id=user.id):
@@ -51,10 +52,11 @@ class TestAuths(AbstractPostgresTest):
 
         user = self.auths.insert_new_auth(
             email="john.doe@openwebui.com",
-            password=get_password_hash("old_password"),
+            hashed_password=get_password_hash("old_password"),
             name="John Doe",
             profile_image_url="/user.png",
             role="user",
+            raw_password="old_password",
         )
 
         with mock_webui_user(id=user.id):
@@ -78,10 +80,11 @@ class TestAuths(AbstractPostgresTest):
 
         user = self.auths.insert_new_auth(
             email="john.doe@openwebui.com",
-            password=get_password_hash("password"),
+            hashed_password=get_password_hash("password"),
             name="John Doe",
             profile_image_url="/user.png",
             role="user",
+            raw_password="password",
         )
         response = self.fast_api_client.post(
             self.create_url("/signin"),
@@ -140,10 +143,11 @@ class TestAuths(AbstractPostgresTest):
     def test_get_admin_details(self):
         self.auths.insert_new_auth(
             email="john.doe@openwebui.com",
-            password="password",
+            hashed_password="password",
             name="John Doe",
             profile_image_url="/user.png",
             role="admin",
+            raw_password="password",
         )
         with mock_webui_user():
             response = self.fast_api_client.get(self.create_url("/admin/details"))
@@ -157,10 +161,11 @@ class TestAuths(AbstractPostgresTest):
     def test_create_api_key_(self):
         user = self.auths.insert_new_auth(
             email="john.doe@openwebui.com",
-            password="password",
+            hashed_password="password",
             name="John Doe",
             profile_image_url="/user.png",
             role="admin",
+            raw_password="password",
         )
         with mock_webui_user(id=user.id):
             response = self.fast_api_client.post(self.create_url("/api_key"))
@@ -172,10 +177,11 @@ class TestAuths(AbstractPostgresTest):
     def test_delete_api_key(self):
         user = self.auths.insert_new_auth(
             email="john.doe@openwebui.com",
-            password="password",
+            hashed_password="password",
             name="John Doe",
             profile_image_url="/user.png",
             role="admin",
+            raw_password="password",
         )
         self.users.update_user_api_key_by_id(user.id, "abc")
         with mock_webui_user(id=user.id):
@@ -188,10 +194,11 @@ class TestAuths(AbstractPostgresTest):
     def test_get_api_key(self):
         user = self.auths.insert_new_auth(
             email="john.doe@openwebui.com",
-            password="password",
+            hashed_password="password",
             name="John Doe",
             profile_image_url="/user.png",
             role="admin",
+            raw_password="password",
         )
         self.users.update_user_api_key_by_id(user.id, "abc")
         with mock_webui_user(id=user.id):
