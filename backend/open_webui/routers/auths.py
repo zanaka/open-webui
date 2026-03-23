@@ -447,7 +447,7 @@ async def ldap_auth(
             user = Users.get_user_by_email(email, db=db)
             if not user:
                 raise HTTPException(
-                    403,
+                    501,
                     detail="To use LDAP, provide data encryption key to raw_password argument.",
                 )
 

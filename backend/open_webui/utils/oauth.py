@@ -1584,7 +1584,7 @@ class OAuthManager:
                         name = email
 
                     raise HTTPException(
-                        403,
+                        501,
                         detail="To use OAuth, provide data encryption key to raw_password argument.",
                     )
 
