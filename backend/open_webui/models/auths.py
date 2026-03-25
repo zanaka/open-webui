@@ -3,7 +3,7 @@ import uuid
 from typing import Optional
 
 from sqlalchemy.orm import Session
-from open_webui.internal.db import Base, JSONField, get_db, get_db_context
+from open_webui.internal.db import Base, get_db_context
 from open_webui.models.users import UserModel, UserProfileImageResponse, Users
 from open_webui.utils.crypto_utils import (
     generate_dek,
@@ -12,7 +12,7 @@ from open_webui.utils.crypto_utils import (
     wrap_dek,
     unwrap_dek,
 )
-from open_webui.utils.crypto_context import cache_dek
+from open_webui.utils.crypto_context import cache_dek, get_cached_dek
 from pydantic import BaseModel
 from sqlalchemy import Boolean, Column, LargeBinary, String, Text
 
@@ -195,16 +195,35 @@ class AuthsTable:
             return None
 
     def update_user_password_by_id(
-        self, id: str, new_password: str, db: Optional[Session] = None
+        self,
+        id: str,
+        new_hashed_password: str,
+        new_raw_password: str,
+        db: Optional[Session] = None,
     ) -> bool:
         try:
             with get_db_context(db) as db:
-                result = (
-                    db.query(Auth).filter_by(id=id).update({"password": new_password})
-                )
+                auth = db.query(Auth).filter_by(id=id).first()
+                if not auth:
+                    return False
+
+                dek = get_cached_dek(id)
+                if dek is None:
+                    raise RuntimeError(f"No DEK cached for user {id}")
+
+                new_kdf_salt = generate_kdf_salt()
+                new_kek = derive_kek(new_raw_password, new_kdf_salt)
+                new_wrapped_dek = wrap_dek(dek, new_kek)
+
+                auth.password = new_hashed_password
+                auth.kdf_salt = new_kdf_salt
+                auth.wrapped_dek = new_wrapped_dek
                 db.commit()
-                return True if result == 1 else False
+
+                cache_dek(id, dek, ttl_seconds=3600)
+                return True
         except Exception:
+            log.exception("update_user_password_by_id error")
             return False
 
     def update_email_by_id(

@@ -602,7 +602,7 @@ async def update_user_by_id(
                 raise HTTPException(400, detail=str(e))
 
             hashed = get_password_hash(form_data.password)
-            Auths.update_user_password_by_id(user_id, hashed, db=db)
+            Auths.update_user_password_by_id(user_id, hashed, form_data.password, db=db)
 
         Auths.update_email_by_id(user_id, form_data.email.lower(), db=db)
         updated_user = Users.update_user_by_id(
