@@ -12,7 +12,7 @@ from open_webui.utils.crypto_utils import (
     wrap_dek,
     unwrap_dek,
 )
-from open_webui.utils.crypto_context import cache_dek, get_cached_dek
+from open_webui.utils.crypto_context import cache_dek
 from pydantic import BaseModel
 from sqlalchemy import Boolean, Column, LargeBinary, String, Text
 
@@ -199,6 +199,7 @@ class AuthsTable:
         id: str,
         new_hashed_password: str,
         new_raw_password: str,
+        current_raw_password: str,
         db: Optional[Session] = None,
     ) -> bool:
         try:
@@ -207,9 +208,8 @@ class AuthsTable:
                 if not auth:
                     return False
 
-                dek = get_cached_dek(id)
-                if dek is None:
-                    raise RuntimeError(f"No DEK cached for user {id}")
+                current_kek = derive_kek(current_raw_password, auth.kdf_salt)
+                dek = unwrap_dek(auth.wrapped_dek, current_kek)
 
                 new_kdf_salt = generate_kdf_salt()
                 new_kek = derive_kek(new_raw_password, new_kdf_salt)

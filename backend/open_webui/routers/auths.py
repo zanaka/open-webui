@@ -243,7 +243,7 @@ async def update_password(
                 raise HTTPException(400, detail=str(e))
             hashed = get_password_hash(form_data.new_password)
             return Auths.update_user_password_by_id(
-                user.id, hashed, form_data.new_password, db=db
+                user.id, hashed, form_data.new_password, form_data.password, db=db
             )
         else:
             raise HTTPException(400, detail=ERROR_MESSAGES.INCORRECT_PASSWORD)

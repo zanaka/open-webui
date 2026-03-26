@@ -35,9 +35,7 @@ from open_webui.internal.db import get_session
 
 from open_webui.utils.auth import (
     get_admin_user,
-    get_password_hash,
     get_verified_user,
-    validate_password,
 )
 from open_webui.utils.access_control import get_permissions, has_permission
 
@@ -596,13 +594,10 @@ async def update_user_by_id(
                 )
 
         if form_data.password:
-            try:
-                validate_password(form_data.password)
-            except Exception as e:
-                raise HTTPException(400, detail=str(e))
-
-            hashed = get_password_hash(form_data.password)
-            Auths.update_user_password_by_id(user_id, hashed, form_data.password, db=db)
+            raise HTTPException(
+                410,
+                detail="Admin password change is not available because the current password is required to re-wrap the DEK (Data Encryption Key).",
+            )
 
         Auths.update_email_by_id(user_id, form_data.email.lower(), db=db)
         updated_user = Users.update_user_by_id(
