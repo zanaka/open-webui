@@ -211,12 +211,10 @@ class AuthsTable:
                 current_kek = derive_kek(current_raw_password, auth.kdf_salt)
                 dek = unwrap_dek(auth.wrapped_dek, current_kek)
 
-                new_kdf_salt = generate_kdf_salt()
-                new_kek = derive_kek(new_raw_password, new_kdf_salt)
+                new_kek = derive_kek(new_raw_password, auth.kdf_salt)
                 new_wrapped_dek = wrap_dek(dek, new_kek)
 
                 auth.password = new_hashed_password
-                auth.kdf_salt = new_kdf_salt
                 auth.wrapped_dek = new_wrapped_dek
                 db.commit()
 
