@@ -3,7 +3,7 @@ import uuid
 from typing import Optional
 
 from sqlalchemy.orm import Session
-from open_webui.internal.db import Base, JSONField, get_db, get_db_context
+from open_webui.internal.db import Base, get_db_context
 from open_webui.models.users import UserModel, UserProfileImageResponse, Users
 from open_webui.utils.crypto_utils import (
     generate_dek,
@@ -195,16 +195,33 @@ class AuthsTable:
             return None
 
     def update_user_password_by_id(
-        self, id: str, new_password: str, db: Optional[Session] = None
+        self,
+        id: str,
+        new_hashed_password: str,
+        new_raw_password: str,
+        current_raw_password: str,
+        db: Optional[Session] = None,
     ) -> bool:
         try:
             with get_db_context(db) as db:
-                result = (
-                    db.query(Auth).filter_by(id=id).update({"password": new_password})
-                )
+                auth = db.query(Auth).filter_by(id=id).first()
+                if not auth:
+                    return False
+
+                current_kek = derive_kek(current_raw_password, auth.kdf_salt)
+                dek = unwrap_dek(auth.wrapped_dek, current_kek)
+
+                new_kek = derive_kek(new_raw_password, auth.kdf_salt)
+                new_wrapped_dek = wrap_dek(dek, new_kek)
+
+                auth.password = new_hashed_password
+                auth.wrapped_dek = new_wrapped_dek
                 db.commit()
-                return True if result == 1 else False
+
+                cache_dek(id, dek, ttl_seconds=3600)
+                return True
         except Exception:
+            log.exception("update_user_password_by_id error")
             return False
 
     def update_email_by_id(
