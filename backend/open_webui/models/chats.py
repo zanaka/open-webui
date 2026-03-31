@@ -4,7 +4,12 @@ import time
 import uuid
 from typing import Optional
 
+import base64
+
 from sqlalchemy.orm import Session
+
+from open_webui.utils.crypto_utils import decrypt_value
+from open_webui.utils.crypto_context import get_cached_dek
 from open_webui.internal.db import Base, JSONField, get_db, get_db_context
 from open_webui.models.tags import TagModel, Tag, Tags
 from open_webui.models.folders import Folders
@@ -738,7 +743,7 @@ class ChatTable:
                 query = query.filter_by(archived=False)
 
             query = query.order_by(Chat.updated_at.desc()).with_entities(
-                Chat.id, Chat.title, Chat.updated_at, Chat.created_at
+                Chat.id, Chat.title, Chat.user_id, Chat.updated_at, Chat.created_at
             )
 
             if skip:
@@ -749,17 +754,31 @@ class ChatTable:
             all_chats = query.all()
 
             # result has to be destructured from sqlalchemy `row` and mapped to a dict since the `ChatModel`is not the returned dataclass.
-            return [
-                ChatTitleIdResponse.model_validate(
-                    {
-                        "id": chat[0],
-                        "title": chat[1],
-                        "updated_at": chat[2],
-                        "created_at": chat[3],
-                    }
+            result = []
+            for chat in all_chats:
+                title = chat.title
+                dek = get_cached_dek(chat.user_id)
+
+                if dek is None:
+                    raise RuntimeError(
+                        f"No DEK cached for user {chat.user_id}. "
+                        "User must re-login to access encrypted data."
+                    )
+
+                encrypted_bytes = base64.b64decode(title)
+                title = decrypt_value(encrypted_bytes, dek).decode("utf-8")
+
+                result.append(
+                    ChatTitleIdResponse.model_validate(
+                        {
+                            "id": chat.id,
+                            "title": title,
+                            "updated_at": chat.updated_at,
+                            "created_at": chat.created_at,
+                        }
+                    )
                 )
-                for chat in all_chats
-            ]
+            return result
 
     def get_chat_list_by_chat_ids(
         self,
