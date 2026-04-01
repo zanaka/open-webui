@@ -731,6 +731,13 @@ class ChatTable:
         db: Optional[Session] = None,
     ) -> list[ChatTitleIdResponse]:
         with get_db_context(db) as db:
+            dek = get_cached_dek(user_id)
+            if dek is None:
+                raise RuntimeError(
+                    f"No DEK cached for user {user_id}. "
+                    "User must re-login to access encrypted data."
+                )
+
             query = db.query(Chat).filter_by(user_id=user_id)
 
             if not include_folders:
@@ -743,7 +750,7 @@ class ChatTable:
                 query = query.filter_by(archived=False)
 
             query = query.order_by(Chat.updated_at.desc()).with_entities(
-                Chat.id, Chat.title, Chat.user_id, Chat.updated_at, Chat.created_at
+                Chat.id, Chat.title, Chat.updated_at, Chat.created_at
             )
 
             if skip:
@@ -756,17 +763,8 @@ class ChatTable:
             # result has to be destructured from sqlalchemy `row` and mapped to a dict since the `ChatModel`is not the returned dataclass.
             result = []
             for chat in all_chats:
-                title = chat.title
-                dek = get_cached_dek(chat.user_id)
-
-                if dek is None:
-                    raise RuntimeError(
-                        f"No DEK cached for user {chat.user_id}. "
-                        "User must re-login to access encrypted data."
-                    )
-
-                encrypted_bytes = base64.b64decode(title)
-                title = decrypt_value(encrypted_bytes, dek).decode("utf-8")
+                encrypted_title = base64.b64decode(chat.title)
+                title = decrypt_value(encrypted_title, dek).decode("utf-8")
 
                 result.append(
                     ChatTitleIdResponse.model_validate(
