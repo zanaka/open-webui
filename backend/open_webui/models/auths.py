@@ -12,9 +12,16 @@ from open_webui.utils.crypto_utils import (
     wrap_dek,
     unwrap_dek,
 )
-from open_webui.utils.crypto_context import cache_dek
+from dataclasses import dataclass, field
+
 from pydantic import BaseModel
 from sqlalchemy import Boolean, Column, LargeBinary, String, Text
+
+
+@dataclass
+class UserWithDek:
+    user: UserModel
+    dek: bytes = field(repr=False)
 
 log = logging.getLogger(__name__)
 
@@ -102,7 +109,7 @@ class AuthsTable:
         role: str = "pending",
         oauth: Optional[dict] = None,
         db: Optional[Session] = None,
-    ) -> Optional[UserModel]:
+    ) -> Optional[UserWithDek]:
         with get_db_context(db) as db:
             log.info("insert_new_auth")
 
@@ -132,8 +139,7 @@ class AuthsTable:
             db.refresh(result)
 
             if result and user:
-                cache_dek(id, dek, ttl_seconds=3600)
-                return user
+                return UserWithDek(user=user, dek=dek)
             else:
                 return None
 
@@ -143,7 +149,7 @@ class AuthsTable:
         raw_password: str,
         verify_password: callable,
         db: Optional[Session] = None,
-    ) -> Optional[UserModel]:
+    ) -> Optional[UserWithDek]:
         log.info(f"authenticate_user: {email}")
 
         user = Users.get_user_by_email(email, db=db)
@@ -157,8 +163,7 @@ class AuthsTable:
                     if verify_password(auth.password):
                         kek = derive_kek(raw_password, auth.kdf_salt)
                         dek = unwrap_dek(auth.wrapped_dek, kek)
-                        cache_dek(user.id, dek, ttl_seconds=3600)
-                        return user
+                        return UserWithDek(user=user, dek=dek)
                     else:
                         return None
                 else:
@@ -218,7 +223,6 @@ class AuthsTable:
                 auth.wrapped_dek = new_wrapped_dek
                 db.commit()
 
-                cache_dek(id, dek, ttl_seconds=3600)
                 return True
         except Exception:
             log.exception("update_user_password_by_id error")
