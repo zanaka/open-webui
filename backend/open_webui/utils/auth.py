@@ -190,14 +190,19 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     )
 
 
-def create_token(data: dict, expires_delta: Union[timedelta, None] = None) -> str:
+def create_token(
+    data: dict,
+    expires_delta: Union[timedelta, None] = None,
+    jti: Union[str, None] = None,
+) -> str:
     payload = data.copy()
 
     if expires_delta:
         expire = datetime.now(UTC) + expires_delta
         payload.update({"exp": expire})
 
-    jti = str(uuid.uuid4())
+    if jti is None:
+        jti = str(uuid.uuid4())
     payload.update({"jti": jti})
 
     encoded_jwt = jwt.encode(payload, SESSION_SECRET, algorithm=ALGORITHM)
