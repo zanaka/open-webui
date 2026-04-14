@@ -1588,7 +1588,7 @@ class OAuthManager:
                         detail="To use OAuth, provide data encryption key to raw_password argument.",
                     )
 
-                    auth = Auths.insert_new_auth(
+                    user_with_dek = Auths.insert_new_auth(
                         email=email,
                         hashed_password=get_password_hash(
                             str(uuid.uuid4())
@@ -1599,7 +1599,7 @@ class OAuthManager:
                         oauth=oauth_data,
                         db=db,
                     )
-                    user = auth.user
+                    user = user_with_dek.user
 
                     if auth_manager_config.WEBHOOK_URL:
                         await post_webhook(

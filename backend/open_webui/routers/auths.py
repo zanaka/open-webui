@@ -231,36 +231,37 @@ async def update_password(
     if WEBUI_AUTH_TRUSTED_EMAIL_HEADER:
         raise HTTPException(400, detail=ERROR_MESSAGES.ACTION_PROHIBITED)
     if session_user:
-        auth = Auths.authenticate_user(
+        user_with_dek = Auths.authenticate_user(
             session_user.email,
             form_data.password,
             lambda pw: verify_password(form_data.password, pw),
             db=db,
         )
 
-        if auth:
+        if user_with_dek:
             try:
                 validate_password(form_data.new_password)
             except Exception as e:
                 raise HTTPException(400, detail=str(e))
             hashed = get_password_hash(form_data.new_password)
             success = Auths.update_user_password_by_id(
-                auth.user.id, hashed, form_data.new_password, form_data.password, db=db
+                user_with_dek.user.id, hashed, form_data.new_password, form_data.password, db=db
             )
             if success:
                 # Re-register the DEK under the current session
                 token = request.cookies.get("token") or (
                     request.headers.get("Authorization", "").replace("Bearer ", "")
                 )
-                decoded = decode_token(token) if token else None
-                if decoded:
-                    jti = decoded.get("jti")
-                    if jti:
+                token_payload = decode_token(token) if token else None
+                if token_payload:
+                    jti = token_payload.get("jti")
+                    exp = token_payload.get("exp")
+                    if jti and exp:
                         cache_dek(
-                            auth.user.id,
-                            auth.dek,
+                            user_with_dek.user.id,
+                            user_with_dek.dek,
                             jti,
-                            float(decoded.get("exp", time.time() + 86400 * 28)),
+                            float(exp),
                         )
             return success
         else:
@@ -478,7 +479,7 @@ async def ldap_auth(
                         else request.app.state.config.DEFAULT_USER_ROLE
                     )
 
-                    auth = Auths.insert_new_auth(
+                    user_with_dek = Auths.insert_new_auth(
                         email=email,
                         hashed_password=str(uuid.uuid4()),
                         name=cn,
@@ -486,14 +487,14 @@ async def ldap_auth(
                         db=db,
                     )
 
-                    if not auth:
+                    if not user_with_dek:
                         raise HTTPException(
                             500, detail=ERROR_MESSAGES.CREATE_USER_ERROR
                         )
 
                     apply_default_group_assignment(
                         request.app.state.config.DEFAULT_GROUP_ID,
-                        auth.user.id,
+                        user_with_dek.user.id,
                         db=db,
                     )
 
@@ -631,14 +632,15 @@ async def signin(
         admin_password = "admin"
 
         if Users.get_user_by_email(admin_email.lower(), db=db):
-            auth = Auths.authenticate_user(
+            user_with_dek = Auths.authenticate_user(
                 admin_email.lower(),
                 admin_password,
                 lambda pw: verify_password(admin_password, pw),
                 db=db,
             )
-            if auth:
-                user, dek = auth.user, auth.dek
+            if user_with_dek:
+                user = user_with_dek.user
+                dek = user_with_dek.dek
         else:
             if Users.has_users(db=db):
                 raise HTTPException(400, detail=ERROR_MESSAGES.EXISTING_USERS)
@@ -650,14 +652,15 @@ async def signin(
                 db=db,
             )
 
-            auth = Auths.authenticate_user(
+            user_with_dek = Auths.authenticate_user(
                 admin_email.lower(),
                 admin_password,
                 lambda pw: verify_password(admin_password, pw),
                 db=db,
             )
-            if auth:
-                user, dek = auth.user, auth.dek
+            if user_with_dek:
+                user = user_with_dek.user
+                dek = user_with_dek.dek
     else:
         if signin_rate_limiter.is_limited(form_data.email.lower()):
             raise HTTPException(
@@ -674,14 +677,15 @@ async def signin(
             # decode safely — ignore incomplete UTF-8 sequences
             form_data.password = password_bytes.decode("utf-8", errors="ignore")
 
-        auth = Auths.authenticate_user(
+        user_with_dek = Auths.authenticate_user(
             form_data.email.lower(),
             form_data.password,
             lambda pw: verify_password(form_data.password, pw),
             db=db,
         )
-        if auth:
-            user, dek = auth.user, auth.dek
+        if user_with_dek:
+            user = user_with_dek.user
+            dek = user_with_dek.dek
 
     if user:
 
@@ -781,7 +785,7 @@ async def signup(
         hashed = get_password_hash(form_data.password)
 
         role = "admin" if not has_users else request.app.state.config.DEFAULT_USER_ROLE
-        auth = Auths.insert_new_auth(
+        user_with_dek = Auths.insert_new_auth(
             form_data.email.lower(),
             hashed,
             form_data.name,
@@ -791,8 +795,9 @@ async def signup(
             db=db,
         )
 
-        if auth:
-            user, dek = auth.user, auth.dek
+        if user_with_dek:
+            user = user_with_dek.user
+            dek = user_with_dek.dek
             expires_delta = parse_duration(request.app.state.config.JWT_EXPIRES_IN)
             expires_at = None
             if expires_delta:
@@ -885,10 +890,10 @@ async def signout(
     if token:
         await invalidate_token(request, token)
 
-        decoded = decode_token(token)
-        if decoded:
-            jti = decoded.get("jti")
-            user_id = decoded.get("id")
+        token_payload = decode_token(token)
+        if token_payload:
+            jti = token_payload.get("jti")
+            user_id = token_payload.get("id")
             if jti and user_id:
                 remove_session(user_id, jti)
 
@@ -983,7 +988,7 @@ async def add_user(
             raise HTTPException(400, detail=str(e))
 
         hashed = get_password_hash(form_data.password)
-        auth = Auths.insert_new_auth(
+        user_with_dek = Auths.insert_new_auth(
             form_data.email.lower(),
             hashed,
             form_data.name,
@@ -993,8 +998,8 @@ async def add_user(
             db=db,
         )
 
-        if auth:
-            user = auth.user
+        if user_with_dek:
+            user = user_with_dek.user
             apply_default_group_assignment(
                 request.app.state.config.DEFAULT_GROUP_ID,
                 user.id,

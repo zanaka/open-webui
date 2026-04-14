@@ -448,16 +448,16 @@ def create_admin_user(email: str, password: str, name: str = "Admin"):
     log.info(f"Creating admin account from environment variables: {email}")
     try:
         hashed = get_password_hash(password)
-        auth = Auths.insert_new_auth(
+        user_with_dek = Auths.insert_new_auth(
             email=email.lower(),
             hashed_password=hashed,
             name=name,
             role="admin",
             raw_password=password,
         )
-        if auth:
+        if user_with_dek:
             log.info(f"Admin account created successfully: {email}")
-            return auth.user
+            return user_with_dek.user
         else:
             log.error("Failed to create admin account from environment variables")
             return None
