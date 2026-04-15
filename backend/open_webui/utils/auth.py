@@ -190,14 +190,19 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     )
 
 
-def create_token(data: dict, expires_delta: Union[timedelta, None] = None) -> str:
+def create_token(
+    data: dict,
+    expires_delta: Union[timedelta, None] = None,
+    jti: Union[str, None] = None,
+) -> str:
     payload = data.copy()
 
     if expires_delta:
         expire = datetime.now(UTC) + expires_delta
         payload.update({"exp": expire})
 
-    jti = str(uuid.uuid4())
+    if jti is None:
+        jti = str(uuid.uuid4())
     payload.update({"jti": jti})
 
     encoded_jwt = jwt.encode(payload, SESSION_SECRET, algorithm=ALGORITHM)
@@ -443,16 +448,16 @@ def create_admin_user(email: str, password: str, name: str = "Admin"):
     log.info(f"Creating admin account from environment variables: {email}")
     try:
         hashed = get_password_hash(password)
-        user = Auths.insert_new_auth(
+        user_with_dek = Auths.insert_new_auth(
             email=email.lower(),
             hashed_password=hashed,
             name=name,
             role="admin",
             raw_password=password,
         )
-        if user:
+        if user_with_dek:
             log.info(f"Admin account created successfully: {email}")
-            return user
+            return user_with_dek.user
         else:
             log.error("Failed to create admin account from environment variables")
             return None

@@ -1,19 +1,25 @@
 import threading
-import time
 from typing import Optional
 
 # ---------------------------------------------------------------------------
-# In-memory DEK cache (user_id -> DEK)
+# In-memory DEK cache with per-session (JTI) tracking.
 # Protected by mlockall (swap disabled). No Redis required.
+#
+# Structure: user_id -> (dek, {jti: expires_at, jti: expires_at...})
+# The DEK stays cached as long as at least one session is active.
 # ---------------------------------------------------------------------------
 
 _cache_lock = threading.Lock()
-_dek_cache: dict[str, tuple[bytes, float]] = {}  # user_id -> (dek, expires_at)
+_dek_cache: dict[str, tuple[bytes, dict[str, float]]] = {}
 
 
-def cache_dek(user_id: str, dek: bytes, ttl_seconds: float) -> None:
+def cache_dek(user_id: str, dek: bytes, jti: str, expires_at: float) -> None:
     with _cache_lock:
-        _dek_cache[user_id] = (dek, time.time() + ttl_seconds)
+        entry = _dek_cache.get(user_id)
+        if entry is not None:
+            entry[1][jti] = expires_at
+        else:
+            _dek_cache[user_id] = (dek, {jti: expires_at})
 
 
 def get_cached_dek(user_id: str) -> Optional[bytes]:
@@ -21,13 +27,15 @@ def get_cached_dek(user_id: str) -> Optional[bytes]:
         entry = _dek_cache.get(user_id)
         if entry is None:
             return None
-        dek, expires_at = entry
-        if time.time() > expires_at:
-            del _dek_cache[user_id]
+        dek, sessions = entry
+        if not sessions:
             return None
         return dek
 
 
-def evict_dek(user_id: str) -> None:
+def remove_session(user_id: str, jti: str) -> None:
     with _cache_lock:
-        _dek_cache.pop(user_id, None)
+        entry = _dek_cache.get(user_id)
+        if entry is None:
+            return
+        entry[1].pop(jti, None)
