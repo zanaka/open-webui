@@ -37,6 +37,7 @@ from open_webui.env import (
     WEBSOCKET_SERVER_PING_INTERVAL,
     WEBSOCKET_SERVER_LOGGING,
     WEBSOCKET_SERVER_ENGINEIO_LOGGING,
+    DEK_CACHE_CLEANUP_INTERVAL,
 )
 from open_webui.utils.auth import decode_token
 from open_webui.socket.utils import RedisDict, RedisLock, YdocManager
@@ -44,11 +45,11 @@ from open_webui.tasks import create_task, stop_item_tasks
 from open_webui.utils.redis import get_redis_connection
 from open_webui.utils.access_control import has_access, get_users_with_access
 
-
 from open_webui.env import (
     GLOBAL_LOG_LEVEL,
 )
 
+from open_webui.utils.crypto_context import purge_expired_sessions
 
 logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
 log = logging.getLogger(__name__)
@@ -162,6 +163,11 @@ YDOC_MANAGER = YdocManager(
 )
 
 
+def periodic_tasks():
+    _ = asyncio.create_task(periodic_usage_pool_cleanup())
+    _ = asyncio.create_task(periodic_dek_cache_cleanup())
+
+
 async def periodic_usage_pool_cleanup():
     max_retries = 2
     retry_delay = random.uniform(
@@ -218,6 +224,13 @@ app = socketio.ASGIApp(
     sio,
     socketio_path="/ws/socket.io",
 )
+
+
+async def periodic_dek_cache_cleanup():
+    while True:
+        purge_expired_sessions(time.time())
+
+        await asyncio.sleep(DEK_CACHE_CLEANUP_INTERVAL)
 
 
 def get_models_in_use():
