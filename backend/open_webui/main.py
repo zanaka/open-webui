@@ -65,6 +65,7 @@ import open_webui.utils.chat_hooks  # noqa: F401 — registers SQLAlchemy event 
 from open_webui.socket.main import (
     MODELS,
     app as socket_app,
+    periodic_tasks,
     periodic_usage_pool_cleanup,
     get_event_emitter,
     get_models_in_use,
@@ -625,7 +626,7 @@ async def lifespan(app: FastAPI):
         limiter = anyio.to_thread.current_default_thread_limiter()
         limiter.total_tokens = THREAD_POOL_SIZE
 
-    asyncio.create_task(periodic_usage_pool_cleanup())
+    periodic_tasks()
 
     if app.state.config.ENABLE_BASE_MODELS_CACHE:
         await get_all_models(
