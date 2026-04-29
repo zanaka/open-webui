@@ -68,7 +68,7 @@ from open_webui.utils.webhook import post_webhook
 from open_webui.utils.access_control import get_permissions, has_permission
 from open_webui.utils.groups import apply_default_group_assignment
 
-from open_webui.utils.crypto_context import cache_dek, remove_session
+from open_webui.utils.crypto_context import cache_dek, remove_session, get_cached_dek
 from open_webui.utils.redis import get_redis_client
 from open_webui.utils.rate_limit import RateLimiter
 
@@ -111,6 +111,11 @@ async def get_session_user(
     user=Depends(get_current_user),
     db: Session = Depends(get_session),
 ):
+    if get_cached_dek(user.id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session expired. Please log in again.",
+        )
 
     auth_header = request.headers.get("Authorization")
     auth_token = get_http_authorization_cred(auth_header)
