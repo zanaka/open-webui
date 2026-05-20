@@ -11,13 +11,11 @@ from fastapi import (
     UploadFile,
 )
 from typing import Optional
-from pathlib import Path
-
-from open_webui.storage.provider import Storage
 
 from open_webui.models.chats import Chats
 from open_webui.models.files import Files
 from open_webui.routers.files import upload_file_handler
+from open_webui.utils.encrypted_files import iter_decrypted_file
 
 import mimetypes
 import base64
@@ -46,16 +44,10 @@ def get_image_base64_from_url(url: str) -> Optional[str]:
             if not file:
                 return None
 
-            file_path = Storage.get_file(file.path)
-            file_path = Path(file_path)
-
-            if file_path.is_file():
-                with open(file_path, "rb") as image_file:
-                    encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
-                    content_type, _ = mimetypes.guess_type(file_path.name)
-                    return f"data:{content_type};base64,{encoded_string}"
-            else:
-                return None
+            image_data = b"".join(iter_decrypted_file(file))
+            encoded_string = base64.b64encode(image_data).decode("utf-8")
+            content_type = file.meta.get("content_type", "image/png")
+            return f"data:{content_type};base64,{encoded_string}"
 
     except Exception as e:
         return None
@@ -160,18 +152,9 @@ def get_image_base64_from_file_id(id: str) -> Optional[str]:
         return None
 
     try:
-        file_path = Storage.get_file(file.path)
-        file_path = Path(file_path)
-
-        # Check if the file already exists in the cache
-        if file_path.is_file():
-            import base64
-
-            with open(file_path, "rb") as image_file:
-                encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
-                content_type, _ = mimetypes.guess_type(file_path.name)
-                return f"data:{content_type};base64,{encoded_string}"
-        else:
-            return None
+        image_data = b"".join(iter_decrypted_file(file))
+        encoded_string = base64.b64encode(image_data).decode("utf-8")
+        content_type = file.meta.get("content_type", "image/png")
+        return f"data:{content_type};base64,{encoded_string}"
     except Exception as e:
         return None

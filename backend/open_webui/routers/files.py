@@ -20,10 +20,11 @@ from fastapi import (
     Query,
 )
 
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from open_webui.internal.db import get_session, SessionLocal
 
+from open_webui.config import UPLOAD_DIR
 from open_webui.constants import ERROR_MESSAGES
 from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
 
@@ -48,6 +49,14 @@ from open_webui.storage.provider import Storage
 
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.access_control import has_access
+from open_webui.utils.crypto_context import get_cached_dek
+from open_webui.utils.crypto_utils import stream_encrypt_file
+from open_webui.utils.encrypted_files import (
+    decrypt_file_to_temp,
+    get_encrypted_file_path,
+    iter_decrypted_file,
+    remove_temp_file,
+)
 from open_webui.utils.misc import strict_match_mime_type
 from pydantic import BaseModel
 
@@ -134,10 +143,14 @@ def process_uploaded_file(
                 if strict_match_mime_type(
                     stt_supported_content_types, file.content_type
                 ):
-                    file_path_processed = Storage.get_file(file_path)
-                    result = transcribe(
-                        request, file_path_processed, file_metadata, user
-                    )
+                    file_path_processed = None
+                    try:
+                        file_path_processed = decrypt_file_to_temp(file_item)
+                        result = transcribe(
+                            request, file_path_processed, file_metadata, user
+                        )
+                    finally:
+                        remove_temp_file(file_path_processed)
 
                     process_file(
                         request,
@@ -212,6 +225,25 @@ def upload_file(
     )
 
 
+def cleanup_uploaded_file(path: str | None) -> None:
+    if not path:
+        return
+    try:
+        Path(path).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+class DecryptedFileResponse(StreamingResponse):
+    def __init__(self, file, *, headers=None, media_type=None):
+        encrypted_path = get_encrypted_file_path(file)
+        super().__init__(
+            iter_decrypted_file(file, encrypted_path),
+            headers=headers,
+            media_type=media_type,
+        )
+
+
 def upload_file_handler(
     request: Request,
     file: UploadFile = File(...),
@@ -233,6 +265,7 @@ def upload_file_handler(
                 detail=ERROR_MESSAGES.DEFAULT("Invalid metadata format"),
             )
     file_metadata = metadata if metadata else {}
+    file_path = None
 
     try:
         unsanitized_filename = file.filename
@@ -255,19 +288,23 @@ def upload_file_handler(
                     ),
                 )
 
-        # replace filename with uuid
         id = str(uuid.uuid4())
         name = filename
-        filename = f"{id}_{filename}"
-        contents, file_path = Storage.upload_file(
+        dek = get_cached_dek(user.id)
+        if dek is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=ERROR_MESSAGES.DEFAULT("User must re-login to upload files"),
+            )
+
+        storage_filename = f"{id}.owenc"
+        file_path = f"{UPLOAD_DIR}/{storage_filename}"
+        file_size = stream_encrypt_file(
             file.file,
-            filename,
-            {
-                "OpenWebUI-User-Email": user.email,
-                "OpenWebUI-User-Id": user.id,
-                "OpenWebUI-User-Name": user.name,
-                "OpenWebUI-File-Id": id,
-            },
+            file_path,
+            dek,
+            user_id=user.id,
+            file_id=id,
         )
 
         file_item = Files.insert_new_file(
@@ -283,7 +320,7 @@ def upload_file_handler(
                     "meta": {
                         "name": name,
                         "content_type": file.content_type,
-                        "size": len(contents),
+                        "size": file_size,
                         "data": file_metadata,
                     },
                 }
@@ -332,8 +369,12 @@ def upload_file_handler(
                     detail=ERROR_MESSAGES.DEFAULT("Error uploading file"),
                 )
 
+    except HTTPException:
+        cleanup_uploaded_file(file_path)
+        raise
     except Exception as e:
         log.exception(e)
+        cleanup_uploaded_file(file_path)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=ERROR_MESSAGES.DEFAULT("Error uploading file"),
@@ -640,44 +681,39 @@ async def get_file_content_by_id(
         or has_access_to_file(id, "read", user, db=db)
     ):
         try:
-            file_path = Storage.get_file(file.path)
-            file_path = Path(file_path)
+            filename = file.meta.get("name", file.filename)
+            encoded_filename = quote(filename)
 
-            # Check if the file already exists in the cache
-            if file_path.is_file():
-                # Handle Unicode filenames
-                filename = file.meta.get("name", file.filename)
-                encoded_filename = quote(filename)  # RFC5987 encoding
+            content_type = file.meta.get("content_type")
+            headers = {}
 
-                content_type = file.meta.get("content_type")
-                filename = file.meta.get("name", file.filename)
-                encoded_filename = quote(filename)
-                headers = {}
-
-                if attachment:
+            if attachment:
+                headers["Content-Disposition"] = (
+                    f"attachment; filename*=UTF-8''{encoded_filename}"
+                )
+            else:
+                if content_type == "application/pdf" or filename.lower().endswith(
+                    ".pdf"
+                ):
+                    headers["Content-Disposition"] = (
+                        f"inline; filename*=UTF-8''{encoded_filename}"
+                    )
+                    content_type = "application/pdf"
+                elif content_type != "text/plain":
                     headers["Content-Disposition"] = (
                         f"attachment; filename*=UTF-8''{encoded_filename}"
                     )
-                else:
-                    if content_type == "application/pdf" or filename.lower().endswith(
-                        ".pdf"
-                    ):
-                        headers["Content-Disposition"] = (
-                            f"inline; filename*=UTF-8''{encoded_filename}"
-                        )
-                        content_type = "application/pdf"
-                    elif content_type != "text/plain":
-                        headers["Content-Disposition"] = (
-                            f"attachment; filename*=UTF-8''{encoded_filename}"
-                        )
 
-                return FileResponse(file_path, headers=headers, media_type=content_type)
-
-            else:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=ERROR_MESSAGES.NOT_FOUND,
-                )
+            return DecryptedFileResponse(
+                file,
+                headers=headers,
+                media_type=content_type,
+            )
+        except FileNotFoundError:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=ERROR_MESSAGES.NOT_FOUND,
+            )
         except Exception as e:
             log.exception(e)
             log.error("Error getting file content")
@@ -717,18 +753,16 @@ async def get_html_file_content_by_id(
         or has_access_to_file(id, "read", user, db=db)
     ):
         try:
-            file_path = Storage.get_file(file.path)
-            file_path = Path(file_path)
-
-            # Check if the file already exists in the cache
-            if file_path.is_file():
-                log.info(f"file_path: {file_path}")
-                return FileResponse(file_path)
-            else:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=ERROR_MESSAGES.NOT_FOUND,
-                )
+            log.info(f"file_path: {file.path}")
+            return DecryptedFileResponse(
+                file,
+                media_type=file.meta.get("content_type") or "text/html",
+            )
+        except FileNotFoundError:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=ERROR_MESSAGES.NOT_FOUND,
+            )
         except Exception as e:
             log.exception(e)
             log.error("Error getting file content")
@@ -770,13 +804,12 @@ async def get_file_content_by_id(
         }
 
         if file_path:
-            file_path = Storage.get_file(file_path)
-            file_path = Path(file_path)
-
-            # Check if the file already exists in the cache
-            if file_path.is_file():
-                return FileResponse(file_path, headers=headers)
-            else:
+            try:
+                return DecryptedFileResponse(
+                    file,
+                    headers=headers,
+                )
+            except FileNotFoundError:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail=ERROR_MESSAGES.NOT_FOUND,

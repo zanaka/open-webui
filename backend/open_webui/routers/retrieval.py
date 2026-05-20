@@ -39,6 +39,7 @@ from langchain_core.documents import Document
 from open_webui.models.files import FileModel, FileUpdateForm, Files
 from open_webui.models.knowledge import Knowledges
 from open_webui.storage.provider import Storage
+from open_webui.utils.encrypted_files import decrypt_file_to_temp, remove_temp_file
 from open_webui.internal.db import get_session
 from sqlalchemy.orm import Session
 
@@ -1663,42 +1664,45 @@ def process_file(
                 # Usage: /files/
                 file_path = file.path
                 if file_path:
-                    file_path = Storage.get_file(file_path)
-                    loader = Loader(
-                        engine=request.app.state.config.CONTENT_EXTRACTION_ENGINE,
-                        user=user,
-                        DATALAB_MARKER_API_KEY=request.app.state.config.DATALAB_MARKER_API_KEY,
-                        DATALAB_MARKER_API_BASE_URL=request.app.state.config.DATALAB_MARKER_API_BASE_URL,
-                        DATALAB_MARKER_ADDITIONAL_CONFIG=request.app.state.config.DATALAB_MARKER_ADDITIONAL_CONFIG,
-                        DATALAB_MARKER_SKIP_CACHE=request.app.state.config.DATALAB_MARKER_SKIP_CACHE,
-                        DATALAB_MARKER_FORCE_OCR=request.app.state.config.DATALAB_MARKER_FORCE_OCR,
-                        DATALAB_MARKER_PAGINATE=request.app.state.config.DATALAB_MARKER_PAGINATE,
-                        DATALAB_MARKER_STRIP_EXISTING_OCR=request.app.state.config.DATALAB_MARKER_STRIP_EXISTING_OCR,
-                        DATALAB_MARKER_DISABLE_IMAGE_EXTRACTION=request.app.state.config.DATALAB_MARKER_DISABLE_IMAGE_EXTRACTION,
-                        DATALAB_MARKER_FORMAT_LINES=request.app.state.config.DATALAB_MARKER_FORMAT_LINES,
-                        DATALAB_MARKER_USE_LLM=request.app.state.config.DATALAB_MARKER_USE_LLM,
-                        DATALAB_MARKER_OUTPUT_FORMAT=request.app.state.config.DATALAB_MARKER_OUTPUT_FORMAT,
-                        EXTERNAL_DOCUMENT_LOADER_URL=request.app.state.config.EXTERNAL_DOCUMENT_LOADER_URL,
-                        EXTERNAL_DOCUMENT_LOADER_API_KEY=request.app.state.config.EXTERNAL_DOCUMENT_LOADER_API_KEY,
-                        TIKA_SERVER_URL=request.app.state.config.TIKA_SERVER_URL,
-                        DOCLING_SERVER_URL=request.app.state.config.DOCLING_SERVER_URL,
-                        DOCLING_API_KEY=request.app.state.config.DOCLING_API_KEY,
-                        DOCLING_PARAMS=request.app.state.config.DOCLING_PARAMS,
-                        PDF_EXTRACT_IMAGES=request.app.state.config.PDF_EXTRACT_IMAGES,
-                        DOCUMENT_INTELLIGENCE_ENDPOINT=request.app.state.config.DOCUMENT_INTELLIGENCE_ENDPOINT,
-                        DOCUMENT_INTELLIGENCE_KEY=request.app.state.config.DOCUMENT_INTELLIGENCE_KEY,
-                        DOCUMENT_INTELLIGENCE_MODEL=request.app.state.config.DOCUMENT_INTELLIGENCE_MODEL,
-                        MISTRAL_OCR_API_BASE_URL=request.app.state.config.MISTRAL_OCR_API_BASE_URL,
-                        MISTRAL_OCR_API_KEY=request.app.state.config.MISTRAL_OCR_API_KEY,
-                        MINERU_API_MODE=request.app.state.config.MINERU_API_MODE,
-                        MINERU_API_URL=request.app.state.config.MINERU_API_URL,
-                        MINERU_API_KEY=request.app.state.config.MINERU_API_KEY,
-                        MINERU_API_TIMEOUT=request.app.state.config.MINERU_API_TIMEOUT,
-                        MINERU_PARAMS=request.app.state.config.MINERU_PARAMS,
-                    )
-                    docs = loader.load(
-                        file.filename, file.meta.get("content_type"), file_path
-                    )
+                    file_path = decrypt_file_to_temp(file)
+                    try:
+                        loader = Loader(
+                            engine=request.app.state.config.CONTENT_EXTRACTION_ENGINE,
+                            user=user,
+                            DATALAB_MARKER_API_KEY=request.app.state.config.DATALAB_MARKER_API_KEY,
+                            DATALAB_MARKER_API_BASE_URL=request.app.state.config.DATALAB_MARKER_API_BASE_URL,
+                            DATALAB_MARKER_ADDITIONAL_CONFIG=request.app.state.config.DATALAB_MARKER_ADDITIONAL_CONFIG,
+                            DATALAB_MARKER_SKIP_CACHE=request.app.state.config.DATALAB_MARKER_SKIP_CACHE,
+                            DATALAB_MARKER_FORCE_OCR=request.app.state.config.DATALAB_MARKER_FORCE_OCR,
+                            DATALAB_MARKER_PAGINATE=request.app.state.config.DATALAB_MARKER_PAGINATE,
+                            DATALAB_MARKER_STRIP_EXISTING_OCR=request.app.state.config.DATALAB_MARKER_STRIP_EXISTING_OCR,
+                            DATALAB_MARKER_DISABLE_IMAGE_EXTRACTION=request.app.state.config.DATALAB_MARKER_DISABLE_IMAGE_EXTRACTION,
+                            DATALAB_MARKER_FORMAT_LINES=request.app.state.config.DATALAB_MARKER_FORMAT_LINES,
+                            DATALAB_MARKER_USE_LLM=request.app.state.config.DATALAB_MARKER_USE_LLM,
+                            DATALAB_MARKER_OUTPUT_FORMAT=request.app.state.config.DATALAB_MARKER_OUTPUT_FORMAT,
+                            EXTERNAL_DOCUMENT_LOADER_URL=request.app.state.config.EXTERNAL_DOCUMENT_LOADER_URL,
+                            EXTERNAL_DOCUMENT_LOADER_API_KEY=request.app.state.config.EXTERNAL_DOCUMENT_LOADER_API_KEY,
+                            TIKA_SERVER_URL=request.app.state.config.TIKA_SERVER_URL,
+                            DOCLING_SERVER_URL=request.app.state.config.DOCLING_SERVER_URL,
+                            DOCLING_API_KEY=request.app.state.config.DOCLING_API_KEY,
+                            DOCLING_PARAMS=request.app.state.config.DOCLING_PARAMS,
+                            PDF_EXTRACT_IMAGES=request.app.state.config.PDF_EXTRACT_IMAGES,
+                            DOCUMENT_INTELLIGENCE_ENDPOINT=request.app.state.config.DOCUMENT_INTELLIGENCE_ENDPOINT,
+                            DOCUMENT_INTELLIGENCE_KEY=request.app.state.config.DOCUMENT_INTELLIGENCE_KEY,
+                            DOCUMENT_INTELLIGENCE_MODEL=request.app.state.config.DOCUMENT_INTELLIGENCE_MODEL,
+                            MISTRAL_OCR_API_BASE_URL=request.app.state.config.MISTRAL_OCR_API_BASE_URL,
+                            MISTRAL_OCR_API_KEY=request.app.state.config.MISTRAL_OCR_API_KEY,
+                            MINERU_API_MODE=request.app.state.config.MINERU_API_MODE,
+                            MINERU_API_URL=request.app.state.config.MINERU_API_URL,
+                            MINERU_API_KEY=request.app.state.config.MINERU_API_KEY,
+                            MINERU_API_TIMEOUT=request.app.state.config.MINERU_API_TIMEOUT,
+                            MINERU_PARAMS=request.app.state.config.MINERU_PARAMS,
+                        )
+                        docs = loader.load(
+                            file.filename, file.meta.get("content_type"), file_path
+                        )
+                    finally:
+                        remove_temp_file(file_path)
 
                     docs = [
                         Document(

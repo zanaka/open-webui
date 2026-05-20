@@ -1,5 +1,6 @@
 import logging
 import time
+import fnmatch
 from typing import Optional
 
 from sqlalchemy.orm import Session
@@ -216,9 +217,7 @@ class FilesTable:
                     created_at=file.created_at,
                     updated_at=file.updated_at,
                 )
-                for file in db.query(
-                    File.id, File.hash, File.meta, File.created_at, File.updated_at
-                )
+                for file in db.query(File)
                 .filter(File.id.in_(ids))
                 .order_by(File.updated_at.desc())
                 .all()
@@ -283,16 +282,17 @@ class FilesTable:
             if user_id:
                 query = query.filter_by(user_id=user_id)
 
-            pattern = self._glob_to_like_pattern(filename)
-            if pattern != "%":
-                query = query.filter(File.filename.ilike(pattern, escape="\\"))
+            files = query.order_by(File.updated_at.desc()).all()
+            if filename != "*":
+                pattern = filename.lower()
+                files = [
+                    file
+                    for file in files
+                    if fnmatch.fnmatch((file.filename or "").lower(), pattern)
+                ]
 
             return [
-                FileModel.model_validate(file)
-                for file in query.order_by(File.updated_at.desc())
-                .offset(skip)
-                .limit(limit)
-                .all()
+                FileModel.model_validate(file) for file in files[skip : skip + limit]
             ]
 
     def update_file_by_id(
