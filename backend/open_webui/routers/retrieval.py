@@ -38,8 +38,8 @@ from langchain_core.documents import Document
 
 from open_webui.models.files import FileModel, FileUpdateForm, Files
 from open_webui.models.knowledge import Knowledges
-from open_webui.storage.provider import Storage
 from open_webui.internal.db import get_session
+from open_webui.utils.file_crypto import decrypted_file_path
 from sqlalchemy.orm import Session
 
 
@@ -1663,7 +1663,6 @@ def process_file(
                 # Usage: /files/
                 file_path = file.path
                 if file_path:
-                    file_path = Storage.get_file(file_path)
                     loader = Loader(
                         engine=request.app.state.config.CONTENT_EXTRACTION_ENGINE,
                         user=user,
@@ -1696,9 +1695,10 @@ def process_file(
                         MINERU_API_TIMEOUT=request.app.state.config.MINERU_API_TIMEOUT,
                         MINERU_PARAMS=request.app.state.config.MINERU_PARAMS,
                     )
-                    docs = loader.load(
-                        file.filename, file.meta.get("content_type"), file_path
-                    )
+                    with decrypted_file_path(file) as file_path:
+                        docs = loader.load(
+                            file.filename, file.meta.get("content_type"), file_path
+                        )
 
                     docs = [
                         Document(
