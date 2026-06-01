@@ -293,24 +293,26 @@ class KnowledgeTable:
                 # This makes the database handle filtering, even with 10k+ KBs
                 query = has_permission(db, Knowledge, query, filter)
 
-                # Apply filename search
-                if filter:
-                    q = filter.get("query")
-                    if q:
-                        query = query.filter(File.filename.ilike(f"%{q}%"))
-
                 # Order by file changes
                 query = query.order_by(File.updated_at.desc())
 
-                # Count before pagination
-                total = query.count()
-
-                if skip:
-                    query = query.offset(skip)
-                if limit:
-                    query = query.limit(limit)
-
                 rows = query.all()
+                if filter:
+                    q = filter.get("query")
+                    if q:
+                        query_key = q.lower()
+                        rows = [
+                            row
+                            for row in rows
+                            if query_key in ((row[0].filename or "").lower())
+                        ]
+
+                # Count before pagination
+                total = len(rows)
+
+                rows = rows[skip:]
+                if limit:
+                    rows = rows[:limit]
 
                 items = []
                 for file, user, knowledge in rows:
@@ -427,11 +429,12 @@ class KnowledgeTable:
                     .filter(KnowledgeFile.knowledge_id == knowledge_id)
                 )
 
+                query_key = None
+                order_by = None
+                direction = None
+
                 if filter:
                     query_key = filter.get("query")
-                    if query_key:
-                        query = query.filter(or_(File.filename.ilike(f"%{query_key}%")))
-
                     view_option = filter.get("view_option")
                     if view_option == "created":
                         query = query.filter(KnowledgeFile.user_id == user_id)
@@ -441,12 +444,7 @@ class KnowledgeTable:
                     order_by = filter.get("order_by")
                     direction = filter.get("direction")
 
-                    if order_by == "name":
-                        if direction == "asc":
-                            query = query.order_by(File.filename.asc())
-                        else:
-                            query = query.order_by(File.filename.desc())
-                    elif order_by == "created_at":
+                    if order_by == "created_at":
                         if direction == "asc":
                             query = query.order_by(File.created_at.asc())
                         else:
@@ -462,15 +460,26 @@ class KnowledgeTable:
                 else:
                     query = query.order_by(File.updated_at.desc())
 
-                # Count BEFORE pagination
-                total = query.count()
-
-                if skip:
-                    query = query.offset(skip)
-                if limit:
-                    query = query.limit(limit)
-
                 items = query.all()
+                if query_key:
+                    normalized_query = query_key.lower()
+                    items = [
+                        item
+                        for item in items
+                        if normalized_query in ((item[0].filename or "").lower())
+                    ]
+
+                if order_by == "name":
+                    items = sorted(
+                        items,
+                        key=lambda item: (item[0].filename or "").lower(),
+                        reverse=direction != "asc",
+                    )
+
+                total = len(items)
+                items = items[skip:]
+                if limit:
+                    items = items[:limit]
 
                 files = []
                 for file, user in items:
