@@ -63,6 +63,13 @@ def get_cached_dek(user_id: str) -> Optional[bytes]:
         return dek
 
 
+def require_cached_dek(user_id: str) -> bytes:
+    dek = get_cached_dek(user_id)
+    if dek is None:
+        raise RuntimeError(f"No DEK cached for user {user_id}. User must re-login.")
+    return dek
+
+
 def remove_session(user_id: str, jti: str) -> None:
     with _cache_lock:
         entry = _dek_cache.get(user_id)

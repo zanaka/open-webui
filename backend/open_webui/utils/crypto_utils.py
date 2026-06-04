@@ -2,7 +2,7 @@ import os
 import base64
 import json
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from argon2.low_level import hash_secret_raw, Type
@@ -66,3 +66,35 @@ def decrypt_value(encrypted_bytes: bytes, dek: bytes) -> bytes:
     ciphertext = encrypted_bytes[NONCE_SIZE:]
     aesgcm = AESGCM(dek)
     return aesgcm.decrypt(nonce, ciphertext, None)
+
+
+def encrypt_text(value: Optional[str], dek: bytes) -> Optional[str]:
+    if value is None:
+        return None
+    encrypted = encrypt_value(value.encode("utf-8"), dek)
+    return base64.b64encode(encrypted).decode("ascii")
+
+
+def decrypt_text(value: Optional[str], dek: bytes) -> Optional[str]:
+    if value is None:
+        return None
+    encrypted = base64.b64decode(value)
+    return decrypt_value(encrypted, dek).decode("utf-8")
+
+
+def encrypt_json_value(value: Any, dek: bytes) -> Optional[str]:
+    if value is None:
+        return None
+    plaintext = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    encrypted = encrypt_value(plaintext, dek)
+    return base64.b64encode(encrypted).decode("ascii")
+
+
+def decrypt_json_value(value: Optional[str], dek: bytes) -> Any:
+    if value is None:
+        return None
+    encrypted = base64.b64decode(value)
+    plaintext = decrypt_value(encrypted, dek)
+    return json.loads(plaintext.decode("utf-8"))
