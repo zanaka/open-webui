@@ -6,17 +6,23 @@ from open_webui.utils import crypto_context
 from open_webui.utils.crypto_context import (
     cache_dek,
     get_cached_dek,
+    get_current_user_id,
     purge_expired_sessions,
     remove_session,
     require_cached_dek,
+    require_current_user_dek,
+    set_current_user_id,
 )
+from open_webui.crypto_exceptions import EncryptedDataAccessDeniedError
 from open_webui.utils.crypto_utils import generate_dek
 
 
 @pytest.fixture(autouse=True)
 def _isolate_cache():
     crypto_context._dek_cache.clear()
+    set_current_user_id(None)
     yield
+    set_current_user_id(None)
     crypto_context._dek_cache.clear()
 
 
@@ -52,3 +58,27 @@ class TestRequireCachedDek:
         assert get_cached_dek("user-missing") is None
         with pytest.raises(RuntimeError):
             require_cached_dek("user-missing")
+
+
+class TestCurrentUserDek:
+    def test_requires_current_user_context(self):
+        with pytest.raises(RuntimeError, match="No current user context"):
+            require_current_user_dek("user-1")
+
+    def test_requires_owner_match(self):
+        set_current_user_id("admin")
+        try:
+            with pytest.raises(EncryptedDataAccessDeniedError):
+                require_current_user_dek("user-1")
+        finally:
+            set_current_user_id(None)
+
+    def test_returns_current_users_cached_dek(self):
+        dek = generate_dek()
+        cache_dek("user-1", dek, jti="jti-1", expires_at=time.time() + 60)
+        set_current_user_id("user-1")
+        try:
+            assert get_current_user_id() == "user-1"
+            assert require_current_user_dek("user-1") == dek
+        finally:
+            set_current_user_id(None)

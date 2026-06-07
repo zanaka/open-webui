@@ -4,7 +4,10 @@ import time
 import pytest
 
 from open_webui.utils import crypto_context
-from open_webui.utils.crypto_context import cache_dek
+from open_webui.utils.crypto_context import (
+    cache_dek,
+)
+from open_webui.crypto_exceptions import EncryptedDataAccessDeniedError
 from open_webui.utils.crypto_utils import FILE_MAGIC, generate_dek
 from open_webui.utils.file_crypto import (
     decrypted_file_path,
@@ -57,7 +60,7 @@ def test_store_encrypted_upload_writes_opaque_encrypted_file(tmp_path, monkeypat
     assert raw.startswith(FILE_MAGIC)
     assert b"plain report" not in raw
 
-    assert read_decrypted_file(_File(path)) == b"plain report"
+    assert read_decrypted_file(_File(path), user_id=USER_ID) == b"plain report"
 
 
 def test_decrypted_file_path_creates_temporary_plaintext_file(tmp_path, monkeypatch, dek):
@@ -70,9 +73,25 @@ def test_decrypted_file_path_creates_temporary_plaintext_file(tmp_path, monkeypa
         file_id=FILE_ID,
     )
 
-    with decrypted_file_path(_File(path)) as plaintext_path:
+    with decrypted_file_path(_File(path), user_id=USER_ID) as plaintext_path:
         with open(plaintext_path, "rb") as f:
             assert f.read() == b"temporary plaintext"
+
+
+def test_other_user_cannot_read_file_even_when_owner_dek_is_cached(
+    tmp_path, monkeypatch, dek
+):
+    monkeypatch.setattr("open_webui.utils.file_crypto.STORAGE_PROVIDER", "local")
+    monkeypatch.setattr("open_webui.utils.file_crypto.UPLOAD_DIR", tmp_path)
+
+    _, path = store_encrypted_upload(
+        io.BytesIO(b"owner only"),
+        user_id=USER_ID,
+        file_id=FILE_ID,
+    )
+
+    with pytest.raises(EncryptedDataAccessDeniedError):
+        read_decrypted_file(_File(path), user_id="admin-user")
 
 
 def test_empty_upload_is_rejected_and_removed(tmp_path, monkeypatch, dek):
