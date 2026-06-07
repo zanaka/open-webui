@@ -1,0 +1,2 @@
+class EncryptedDataAccessDeniedError(RuntimeError):
+    pass

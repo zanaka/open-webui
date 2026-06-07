@@ -1,5 +1,8 @@
 import threading
+from contextvars import ContextVar
 from typing import Optional
+
+from open_webui.crypto_exceptions import EncryptedDataAccessDeniedError
 
 # ---------------------------------------------------------------------------
 # In-memory DEK cache with per-session (JTI) tracking.
@@ -40,6 +43,17 @@ class UserSessions:
 
 _cache_lock = threading.Lock()
 _dek_cache: dict[str, tuple[bytes, UserSessions]] = {}
+_current_user_id: ContextVar[Optional[str]] = ContextVar(
+    "crypto_current_user_id", default=None
+)
+
+
+def set_current_user_id(user_id: Optional[str]) -> None:
+    _current_user_id.set(user_id)
+
+
+def get_current_user_id() -> Optional[str]:
+    return _current_user_id.get()
 
 
 def cache_dek(user_id: str, dek: bytes, jti: str, expires_at: float) -> None:
@@ -68,6 +82,17 @@ def require_cached_dek(user_id: str) -> bytes:
     if dek is None:
         raise RuntimeError(f"No DEK cached for user {user_id}. User must re-login.")
     return dek
+
+
+def require_current_user_dek(owner_user_id: str) -> bytes:
+    current_user_id = get_current_user_id()
+    if current_user_id is None:
+        raise RuntimeError("No current user context. Cannot access encrypted data.")
+    if current_user_id != owner_user_id:
+        raise EncryptedDataAccessDeniedError(
+            "Cannot access another user's encrypted data."
+        )
+    return require_cached_dek(current_user_id)
 
 
 def remove_session(user_id: str, jti: str) -> None:
