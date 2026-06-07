@@ -36,6 +36,7 @@ from langchain_text_splitters import (
 )
 from langchain_core.documents import Document
 
+from open_webui.crypto_exceptions import EncryptedDataAccessDeniedError
 from open_webui.models.files import FileModel, FileUpdateForm, Files
 from open_webui.models.knowledge import Knowledges
 from open_webui.internal.db import get_session
@@ -1587,10 +1588,7 @@ def process_file(
     """
     Process a file and save its content to the vector database.
     """
-    if user.role == "admin":
-        file = Files.get_file_by_id(form_data.file_id, db=db)
-    else:
-        file = Files.get_file_by_id_and_user_id(form_data.file_id, user.id, db=db)
+    file = Files.get_file_by_id_and_user_id(form_data.file_id, user.id, db=db)
 
     if file:
         try:
@@ -1695,7 +1693,7 @@ def process_file(
                         MINERU_API_TIMEOUT=request.app.state.config.MINERU_API_TIMEOUT,
                         MINERU_PARAMS=request.app.state.config.MINERU_PARAMS,
                     )
-                    with decrypted_file_path(file) as file_path:
+                    with decrypted_file_path(file, user_id=user.id) as file_path:
                         docs = loader.load(
                             file.filename, file.meta.get("content_type"), file_path
                         )
@@ -1788,6 +1786,11 @@ def process_file(
                 except Exception as e:
                     raise e
 
+        except EncryptedDataAccessDeniedError:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=ERROR_MESSAGES.NOT_FOUND,
+            )
         except Exception as e:
             log.exception(e)
             Files.update_file_data_by_id(
@@ -2545,13 +2548,12 @@ def delete_entries_from_collection(
 ):
     try:
         if VECTOR_DB_CLIENT.has_collection(collection_name=form_data.collection_name):
-            file = Files.get_file_by_id(form_data.file_id, db=db)
-            if not file:
+            hash = Files.get_file_hash_by_id(form_data.file_id, db=db)
+            if hash is None:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail=ERROR_MESSAGES.NOT_FOUND,
                 )
-            hash = file.hash
 
             VECTOR_DB_CLIENT.delete(
                 collection_name=form_data.collection_name,
@@ -2560,6 +2562,7 @@ def delete_entries_from_collection(
             return {"status": True}
         else:
             return {"status": False}
+
     except Exception as e:
         log.exception(e)
         return {"status": False}
