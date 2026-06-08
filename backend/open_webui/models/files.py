@@ -1,3 +1,4 @@
+import fnmatch
 import logging
 import time
 from typing import Optional
@@ -216,9 +217,7 @@ class FilesTable:
                     created_at=file.created_at,
                     updated_at=file.updated_at,
                 )
-                for file in db.query(
-                    File.id, File.hash, File.meta, File.created_at, File.updated_at
-                )
+                for file in db.query(File)
                 .filter(File.id.in_(ids))
                 .order_by(File.updated_at.desc())
                 .all()
@@ -233,29 +232,6 @@ class FilesTable:
                 for file in db.query(File).filter_by(user_id=user_id).all()
             ]
 
-    @staticmethod
-    def _glob_to_like_pattern(glob: str) -> str:
-        """
-        Convert a glob/fnmatch pattern to a SQL LIKE pattern.
-
-        Escapes SQL special characters and converts glob wildcards:
-        - `*` becomes `%` (match any sequence of characters)
-        - `?` becomes `_` (match exactly one character)
-
-        Args:
-            glob: A glob pattern (e.g., "*.txt", "file?.doc")
-
-        Returns:
-            A SQL LIKE compatible pattern with proper escaping.
-        """
-        # Escape SQL special characters first, then convert glob wildcards
-        pattern = glob.replace("\\", "\\\\")
-        pattern = pattern.replace("%", "\\%")
-        pattern = pattern.replace("_", "\\_")
-        pattern = pattern.replace("*", "%")
-        pattern = pattern.replace("?", "_")
-        return pattern
-
     def search_files(
         self,
         user_id: Optional[str] = None,
@@ -266,6 +242,9 @@ class FilesTable:
     ) -> list[FileModel]:
         """
         Search files with glob pattern matching, optional user filter, and pagination.
+
+        Filename is encrypted at the column level, so the pattern match runs
+        in Python after the load hook has decrypted each row.
 
         Args:
             user_id: Filter by user ID. If None, returns files for all users.
@@ -279,20 +258,20 @@ class FilesTable:
         """
         with get_db_context(db) as db:
             query = db.query(File)
-
             if user_id:
                 query = query.filter_by(user_id=user_id)
 
-            pattern = self._glob_to_like_pattern(filename)
-            if pattern != "%":
-                query = query.filter(File.filename.ilike(pattern, escape="\\"))
+            files = query.order_by(File.updated_at.desc()).all()
+            if filename != "*":
+                pattern = filename.lower()
+                files = [
+                    file
+                    for file in files
+                    if fnmatch.fnmatch((file.filename or "").lower(), pattern)
+                ]
 
             return [
-                FileModel.model_validate(file)
-                for file in query.order_by(File.updated_at.desc())
-                .offset(skip)
-                .limit(limit)
-                .all()
+                FileModel.model_validate(file) for file in files[skip : skip + limit]
             ]
 
     def update_file_by_id(
