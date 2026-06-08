@@ -293,24 +293,28 @@ class KnowledgeTable:
                 # This makes the database handle filtering, even with 10k+ KBs
                 query = has_permission(db, Knowledge, query, filter)
 
-                # Apply filename search
-                if filter:
-                    q = filter.get("query")
-                    if q:
-                        query = query.filter(File.filename.ilike(f"%{q}%"))
-
                 # Order by file changes
                 query = query.order_by(File.updated_at.desc())
 
+                rows = query.all()
+                if filter:
+                    q = filter.get("query")
+                    if q:
+                        query_key = q.lower()
+                        filtered_rows = []
+                        for file, user, knowledge in rows:
+                            filename = (file.filename or "").lower()
+                            if query_key in filename:
+                                filtered_rows.append((file, user, knowledge))
+                        rows = filtered_rows
+
                 # Count before pagination
-                total = query.count()
+                total = len(rows)
 
                 if skip:
-                    query = query.offset(skip)
+                    rows = rows[skip:]
                 if limit:
-                    query = query.limit(limit)
-
-                rows = query.all()
+                    rows = rows[:limit]
 
                 items = []
                 for file, user, knowledge in rows:
@@ -427,11 +431,12 @@ class KnowledgeTable:
                     .filter(KnowledgeFile.knowledge_id == knowledge_id)
                 )
 
+                query_key = None
+                order_by = None
+                direction = None
+
                 if filter:
                     query_key = filter.get("query")
-                    if query_key:
-                        query = query.filter(or_(File.filename.ilike(f"%{query_key}%")))
-
                     view_option = filter.get("view_option")
                     if view_option == "created":
                         query = query.filter(KnowledgeFile.user_id == user_id)
@@ -441,12 +446,7 @@ class KnowledgeTable:
                     order_by = filter.get("order_by")
                     direction = filter.get("direction")
 
-                    if order_by == "name":
-                        if direction == "asc":
-                            query = query.order_by(File.filename.asc())
-                        else:
-                            query = query.order_by(File.filename.desc())
-                    elif order_by == "created_at":
+                    if order_by == "created_at":
                         if direction == "asc":
                             query = query.order_by(File.created_at.asc())
                         else:
@@ -462,15 +462,28 @@ class KnowledgeTable:
                 else:
                     query = query.order_by(File.updated_at.desc())
 
-                # Count BEFORE pagination
-                total = query.count()
-
-                if skip:
-                    query = query.offset(skip)
-                if limit:
-                    query = query.limit(limit)
-
                 items = query.all()
+                if query_key:
+                    normalized_query = query_key.lower()
+                    filtered_items = []
+                    for file, user in items:
+                        filename = (file.filename or "").lower()
+                        if normalized_query in filename:
+                            filtered_items.append((file, user))
+                    items = filtered_items
+
+                if order_by == "name":
+                    items = sorted(
+                        items,
+                        key=lambda item: (item[0].filename or "").lower(),
+                        reverse=direction != "asc",
+                    )
+
+                total = len(items)
+                if skip:
+                    items = items[skip:]
+                if limit:
+                    items = items[:limit]
 
                 files = []
                 for file, user in items:

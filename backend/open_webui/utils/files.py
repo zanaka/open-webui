@@ -11,13 +11,11 @@ from fastapi import (
     UploadFile,
 )
 from typing import Optional
-from pathlib import Path
-
-from open_webui.storage.provider import Storage
 
 from open_webui.models.chats import Chats
 from open_webui.models.files import Files
 from open_webui.routers.files import upload_file_handler
+from open_webui.utils.file_crypto import read_decrypted_file
 
 import mimetypes
 import base64
@@ -30,7 +28,7 @@ BASE64_IMAGE_URL_PREFIX = re.compile(r"data:image/\w+;base64,", re.IGNORECASE)
 MARKDOWN_IMAGE_URL_PATTERN = re.compile(r"!\[(.*?)\]\((.+?)\)", re.IGNORECASE)
 
 
-def get_image_base64_from_url(url: str) -> Optional[str]:
+def get_image_base64_from_url(url: str, user_id: Optional[str] = None) -> Optional[str]:
     try:
         if url.startswith("http"):
             # Download the image from the URL
@@ -41,21 +39,21 @@ def get_image_base64_from_url(url: str) -> Optional[str]:
             content_type = response.headers.get("Content-Type", "image/png")
             return f"data:{content_type};base64,{encoded_string}"
         else:
-            file = Files.get_file_by_id(url)
+            if user_id is None:
+                return None
+
+            file = Files.get_file_by_id_and_user_id(url, user_id)
 
             if not file:
                 return None
 
-            file_path = Storage.get_file(file.path)
-            file_path = Path(file_path)
-
-            if file_path.is_file():
-                with open(file_path, "rb") as image_file:
-                    encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
-                    content_type, _ = mimetypes.guess_type(file_path.name)
-                    return f"data:{content_type};base64,{encoded_string}"
-            else:
-                return None
+            encoded_string = base64.b64encode(
+                read_decrypted_file(file, user_id=user_id)
+            ).decode("utf-8")
+            content_type = file.meta.get("content_type") if file.meta else None
+            if not content_type:
+                content_type, _ = mimetypes.guess_type(file.filename)
+            return f"data:{content_type};base64,{encoded_string}"
 
     except Exception as e:
         return None
@@ -154,24 +152,23 @@ def get_file_url_from_base64(request, base64_file_string, metadata, user):
     return None
 
 
-def get_image_base64_from_file_id(id: str) -> Optional[str]:
-    file = Files.get_file_by_id(id)
+def get_image_base64_from_file_id(
+    id: str, user_id: Optional[str] = None
+) -> Optional[str]:
+    if user_id is None:
+        return None
+
+    file = Files.get_file_by_id_and_user_id(id, user_id)
     if not file:
         return None
 
     try:
-        file_path = Storage.get_file(file.path)
-        file_path = Path(file_path)
-
-        # Check if the file already exists in the cache
-        if file_path.is_file():
-            import base64
-
-            with open(file_path, "rb") as image_file:
-                encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
-                content_type, _ = mimetypes.guess_type(file_path.name)
-                return f"data:{content_type};base64,{encoded_string}"
-        else:
-            return None
+        encoded_string = base64.b64encode(
+            read_decrypted_file(file, user_id=user_id)
+        ).decode("utf-8")
+        content_type = file.meta.get("content_type") if file.meta else None
+        if not content_type:
+            content_type, _ = mimetypes.guess_type(file.filename)
+        return f"data:{content_type};base64,{encoded_string}"
     except Exception as e:
         return None

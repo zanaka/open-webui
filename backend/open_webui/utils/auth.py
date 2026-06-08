@@ -23,6 +23,7 @@ from opentelemetry import trace
 
 
 from open_webui.utils.access_control import has_permission
+from open_webui.utils.crypto_context import set_current_user_id
 from open_webui.utils.crypto_context import get_cached_dek
 from open_webui.models.users import Users
 from open_webui.models.auths import Auths
@@ -337,6 +338,7 @@ async def get_current_user(
                     detail=ERROR_MESSAGES.INVALID_TOKEN,
                 )
             else:
+                set_current_user_id(user.id)
                 if WEBUI_AUTH_TRUSTED_EMAIL_HEADER:
                     trusted_email = request.headers.get(
                         WEBUI_AUTH_TRUSTED_EMAIL_HEADER, ""

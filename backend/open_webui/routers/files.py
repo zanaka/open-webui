@@ -2,7 +2,6 @@ import logging
 import os
 import uuid
 import json
-from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 import asyncio
@@ -20,14 +19,18 @@ from fastapi import (
     Query,
 )
 
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
+from open_webui.crypto_exceptions import EncryptedDataAccessDeniedError
 from open_webui.internal.db import get_session, SessionLocal
 
 from open_webui.constants import ERROR_MESSAGES
 from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
 
 from open_webui.models.channels import Channels
+from open_webui.models.chats import Chats
+from open_webui.models.knowledge import Knowledges
+from open_webui.models.groups import Groups
 from open_webui.models.users import Users
 from open_webui.models.files import (
     FileForm,
@@ -35,9 +38,6 @@ from open_webui.models.files import (
     FileModelResponse,
     Files,
 )
-from open_webui.models.chats import Chats
-from open_webui.models.knowledge import Knowledges
-from open_webui.models.groups import Groups
 
 
 from open_webui.routers.retrieval import ProcessFileForm, process_file
@@ -48,12 +48,26 @@ from open_webui.storage.provider import Storage
 
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.access_control import has_access
+from open_webui.utils.file_crypto import (
+    DecryptedFileResponse,
+    decrypted_file_path,
+    store_encrypted_upload,
+)
 from open_webui.utils.misc import strict_match_mime_type
 from pydantic import BaseModel
 
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def cleanup_file_path(file_path: Optional[str]) -> None:
+    if not file_path:
+        return
+    try:
+        Storage.delete_file(file_path)
+    except Exception:
+        pass
 
 
 ############################
@@ -134,10 +148,12 @@ def process_uploaded_file(
                 if strict_match_mime_type(
                     stt_supported_content_types, file.content_type
                 ):
-                    file_path_processed = Storage.get_file(file_path)
-                    result = transcribe(
-                        request, file_path_processed, file_metadata, user
-                    )
+                    with decrypted_file_path(
+                        file_item, user_id=user.id
+                    ) as file_path_processed:
+                        result = transcribe(
+                            request, file_path_processed, file_metadata, user
+                        )
 
                     process_file(
                         request,
@@ -233,6 +249,7 @@ def upload_file_handler(
                 detail=ERROR_MESSAGES.DEFAULT("Invalid metadata format"),
             )
     file_metadata = metadata if metadata else {}
+    file_path = None
 
     try:
         unsanitized_filename = file.filename
@@ -258,16 +275,10 @@ def upload_file_handler(
         # replace filename with uuid
         id = str(uuid.uuid4())
         name = filename
-        filename = f"{id}_{filename}"
-        contents, file_path = Storage.upload_file(
+        file_size, file_path = store_encrypted_upload(
             file.file,
-            filename,
-            {
-                "OpenWebUI-User-Email": user.email,
-                "OpenWebUI-User-Id": user.id,
-                "OpenWebUI-User-Name": user.name,
-                "OpenWebUI-File-Id": id,
-            },
+            user_id=user.id,
+            file_id=id,
         )
 
         file_item = Files.insert_new_file(
@@ -283,7 +294,7 @@ def upload_file_handler(
                     "meta": {
                         "name": name,
                         "content_type": file.content_type,
-                        "size": len(contents),
+                        "size": file_size,
                         "data": file_metadata,
                     },
                 }
@@ -332,8 +343,24 @@ def upload_file_handler(
                     detail=ERROR_MESSAGES.DEFAULT("Error uploading file"),
                 )
 
+    except HTTPException:
+        cleanup_file_path(file_path)
+        raise
+    except RuntimeError as e:
+        cleanup_file_path(file_path)
+        if "No DEK cached" in str(e):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=ERROR_MESSAGES.DEFAULT("User must re-login to upload files"),
+            )
+        log.exception(e)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=ERROR_MESSAGES.DEFAULT("Error uploading file"),
+        )
     except Exception as e:
         log.exception(e)
+        cleanup_file_path(file_path)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=ERROR_MESSAGES.DEFAULT("Error uploading file"),
@@ -351,10 +378,7 @@ async def list_files(
     content: bool = Query(True),
     db: Session = Depends(get_session),
 ):
-    if user.role == "admin":
-        files = Files.get_files(db=db)
-    else:
-        files = Files.get_files_by_user_id(user.id, db=db)
+    files = Files.get_files_by_user_id(user.id, db=db)
 
     if not content:
         for file in files:
@@ -387,12 +411,8 @@ async def search_files(
     Search for files by filename with support for wildcard patterns.
     Uses SQL-based filtering with pagination for better performance.
     """
-    # Determine user_id: null for admin (search all), user.id for regular users
-    user_id = None if user.role == "admin" else user.id
-
-    # Use optimized database query with pagination
     files = Files.search_files(
-        user_id=user_id,
+        user_id=user.id,
         filename=filename,
         skip=skip,
         limit=limit,
@@ -451,7 +471,7 @@ async def delete_all_files(
 async def get_file_by_id(
     id: str, user=Depends(get_verified_user), db: Session = Depends(get_session)
 ):
-    file = Files.get_file_by_id(id, db=db)
+    file = Files.get_file_by_id_and_user_id(id, user.id, db=db)
 
     if not file:
         raise HTTPException(
@@ -459,17 +479,7 @@ async def get_file_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    if (
-        file.user_id == user.id
-        or user.role == "admin"
-        or has_access_to_file(id, "read", user, db=db)
-    ):
-        return file
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=ERROR_MESSAGES.NOT_FOUND,
-        )
+    return file
 
 
 @router.get("/{id}/process/status")
@@ -479,7 +489,7 @@ async def get_file_process_status(
     user=Depends(get_verified_user),
     db: Session = Depends(get_session),
 ):
-    file = Files.get_file_by_id(id, db=db)
+    file = Files.get_file_by_id_and_user_id(id, user.id, db=db)
 
     if not file:
         raise HTTPException(
@@ -487,52 +497,44 @@ async def get_file_process_status(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    if (
-        file.user_id == user.id
-        or user.role == "admin"
-        or has_access_to_file(id, "read", user, db=db)
-    ):
-        if stream:
-            MAX_FILE_PROCESSING_DURATION = 3600 * 2
+    if stream:
+        MAX_FILE_PROCESSING_DURATION = 3600 * 2
 
-            async def event_stream(file_id):
-                # NOTE: We intentionally do NOT capture the request's db session here.
-                # Each poll creates its own short-lived session to avoid holding a
-                # connection for hours. A WebSocket push would be more efficient.
-                for _ in range(MAX_FILE_PROCESSING_DURATION):
-                    file_item = Files.get_file_by_id(file_id)  # Creates own session
-                    if file_item:
-                        data = file_item.model_dump().get("data", {})
-                        status = data.get("status")
+        async def event_stream(file_id):
+            # NOTE: We intentionally do NOT capture the request's db session here.
+            # Each poll creates its own short-lived session to avoid holding a
+            # connection for hours. A WebSocket push would be more efficient.
+            for _ in range(MAX_FILE_PROCESSING_DURATION):
+                file_item = Files.get_file_by_id_and_user_id(
+                    file_id, user.id
+                )  # Creates own session
+                if file_item:
+                    data = file_item.model_dump().get("data", {})
+                    status = data.get("status")
 
-                        if status:
-                            event = {"status": status}
-                            if status == "failed":
-                                event["error"] = data.get("error")
+                    if status:
+                        event = {"status": status}
+                        if status == "failed":
+                            event["error"] = data.get("error")
 
-                            yield f"data: {json.dumps(event)}\n\n"
-                            if status in ("completed", "failed"):
-                                break
-                        else:
-                            # Legacy
+                        yield f"data: {json.dumps(event)}\n\n"
+                        if status in ("completed", "failed"):
                             break
                     else:
-                        yield f"data: {json.dumps({'status': 'not_found'})}\n\n"
+                        # Legacy
                         break
+                else:
+                    yield f"data: {json.dumps({'status': 'not_found'})}\n\n"
+                    break
 
-                    await asyncio.sleep(1)
+                await asyncio.sleep(1)
 
-            return StreamingResponse(
-                event_stream(file.id),
-                media_type="text/event-stream",
-            )
-        else:
-            return {"status": file.data.get("status", "pending")}
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=ERROR_MESSAGES.NOT_FOUND,
+        return StreamingResponse(
+            event_stream(file.id),
+            media_type="text/event-stream",
         )
+    else:
+        return {"status": file.data.get("status", "pending")}
 
 
 ############################
@@ -544,7 +546,7 @@ async def get_file_process_status(
 async def get_file_data_content_by_id(
     id: str, user=Depends(get_verified_user), db: Session = Depends(get_session)
 ):
-    file = Files.get_file_by_id(id, db=db)
+    file = Files.get_file_by_id_and_user_id(id, user.id, db=db)
 
     if not file:
         raise HTTPException(
@@ -552,17 +554,7 @@ async def get_file_data_content_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    if (
-        file.user_id == user.id
-        or user.role == "admin"
-        or has_access_to_file(id, "read", user, db=db)
-    ):
-        return {"content": file.data.get("content", "")}
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=ERROR_MESSAGES.NOT_FOUND,
-        )
+    return {"content": file.data.get("content", "")}
 
 
 ############################
@@ -582,7 +574,7 @@ async def update_file_data_content_by_id(
     user=Depends(get_verified_user),
     db: Session = Depends(get_session),
 ):
-    file = Files.get_file_by_id(id, db=db)
+    file = Files.get_file_by_id_and_user_id(id, user.id, db=db)
 
     if not file:
         raise HTTPException(
@@ -590,28 +582,18 @@ async def update_file_data_content_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    if (
-        file.user_id == user.id
-        or user.role == "admin"
-        or has_access_to_file(id, "write", user, db=db)
-    ):
-        try:
-            process_file(
-                request,
-                ProcessFileForm(file_id=id, content=form_data.content),
-                user=user,
-            )
-            file = Files.get_file_by_id(id=id, db=db)
-        except Exception as e:
-            log.exception(e)
-            log.error(f"Error processing file: {file.id}")
-
-        return {"content": file.data.get("content", "")}
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=ERROR_MESSAGES.NOT_FOUND,
+    try:
+        process_file(
+            request,
+            ProcessFileForm(file_id=id, content=form_data.content),
+            user=user,
         )
+        file = Files.get_file_by_id_and_user_id(id=id, user_id=user.id, db=db)
+    except Exception as e:
+        log.exception(e)
+        log.error(f"Error processing file: {file.id}")
+
+    return {"content": file.data.get("content", "")}
 
 
 ############################
@@ -626,7 +608,7 @@ async def get_file_content_by_id(
     attachment: bool = Query(False),
     db: Session = Depends(get_session),
 ):
-    file = Files.get_file_by_id(id, db=db)
+    file = Files.get_file_by_id_and_user_id(id, user.id, db=db)
 
     if not file:
         raise HTTPException(
@@ -634,61 +616,58 @@ async def get_file_content_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    if (
-        file.user_id == user.id
-        or user.role == "admin"
-        or has_access_to_file(id, "read", user, db=db)
-    ):
-        try:
-            file_path = Storage.get_file(file.path)
-            file_path = Path(file_path)
+    try:
+        filename = file.meta.get("name", file.filename)
+        encoded_filename = quote(filename)  # RFC5987 encoding
+        content_type = file.meta.get("content_type")
+        headers = {}
 
-            # Check if the file already exists in the cache
-            if file_path.is_file():
-                # Handle Unicode filenames
-                filename = file.meta.get("name", file.filename)
-                encoded_filename = quote(filename)  # RFC5987 encoding
-
-                content_type = file.meta.get("content_type")
-                filename = file.meta.get("name", file.filename)
-                encoded_filename = quote(filename)
-                headers = {}
-
-                if attachment:
-                    headers["Content-Disposition"] = (
-                        f"attachment; filename*=UTF-8''{encoded_filename}"
-                    )
-                else:
-                    if content_type == "application/pdf" or filename.lower().endswith(
-                        ".pdf"
-                    ):
-                        headers["Content-Disposition"] = (
-                            f"inline; filename*=UTF-8''{encoded_filename}"
-                        )
-                        content_type = "application/pdf"
-                    elif content_type != "text/plain":
-                        headers["Content-Disposition"] = (
-                            f"attachment; filename*=UTF-8''{encoded_filename}"
-                        )
-
-                return FileResponse(file_path, headers=headers, media_type=content_type)
-
-            else:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=ERROR_MESSAGES.NOT_FOUND,
-                )
-        except Exception as e:
-            log.exception(e)
-            log.error("Error getting file content")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=ERROR_MESSAGES.DEFAULT("Error getting file content"),
+        if attachment:
+            headers["Content-Disposition"] = (
+                f"attachment; filename*=UTF-8''{encoded_filename}"
             )
-    else:
+        else:
+            if content_type == "application/pdf" or filename.lower().endswith(".pdf"):
+                headers["Content-Disposition"] = (
+                    f"inline; filename*=UTF-8''{encoded_filename}"
+                )
+                content_type = "application/pdf"
+            elif content_type != "text/plain":
+                headers["Content-Disposition"] = (
+                    f"attachment; filename*=UTF-8''{encoded_filename}"
+                )
+
+        return DecryptedFileResponse(
+            file,
+            user_id=user.id,
+            headers=headers,
+            media_type=content_type,
+        )
+    except FileNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+    except EncryptedDataAccessDeniedError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+    except RuntimeError as e:
+        if "No DEK cached" in str(e):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=ERROR_MESSAGES.DEFAULT(
+                    "User must re-login to access encrypted file"
+                ),
+            )
+        raise
+    except Exception as e:
+        log.exception(e)
+        log.error("Error getting file content")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=ERROR_MESSAGES.DEFAULT("Error getting file content"),
         )
 
 
@@ -696,7 +675,7 @@ async def get_file_content_by_id(
 async def get_html_file_content_by_id(
     id: str, user=Depends(get_verified_user), db: Session = Depends(get_session)
 ):
-    file = Files.get_file_by_id(id, db=db)
+    file = Files.get_file_by_id_and_user_id(id, user.id, db=db)
 
     if not file:
         raise HTTPException(
@@ -711,35 +690,33 @@ async def get_html_file_content_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    if (
-        file.user_id == user.id
-        or user.role == "admin"
-        or has_access_to_file(id, "read", user, db=db)
-    ):
-        try:
-            file_path = Storage.get_file(file.path)
-            file_path = Path(file_path)
-
-            # Check if the file already exists in the cache
-            if file_path.is_file():
-                log.info(f"file_path: {file_path}")
-                return FileResponse(file_path)
-            else:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=ERROR_MESSAGES.NOT_FOUND,
-                )
-        except Exception as e:
-            log.exception(e)
-            log.error("Error getting file content")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=ERROR_MESSAGES.DEFAULT("Error getting file content"),
-            )
-    else:
+    try:
+        return DecryptedFileResponse(file, user_id=user.id)
+    except FileNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+    except EncryptedDataAccessDeniedError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+    except RuntimeError as e:
+        if "No DEK cached" in str(e):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=ERROR_MESSAGES.DEFAULT(
+                    "User must re-login to access encrypted file"
+                ),
+            )
+        raise
+    except Exception as e:
+        log.exception(e)
+        log.error("Error getting file content")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=ERROR_MESSAGES.DEFAULT("Error getting file content"),
         )
 
 
@@ -747,7 +724,7 @@ async def get_html_file_content_by_id(
 async def get_file_content_by_id(
     id: str, user=Depends(get_verified_user), db: Session = Depends(get_session)
 ):
-    file = Files.get_file_by_id(id, db=db)
+    file = Files.get_file_by_id_and_user_id(id, user.id, db=db)
 
     if not file:
         raise HTTPException(
@@ -755,11 +732,7 @@ async def get_file_content_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    if (
-        file.user_id == user.id
-        or user.role == "admin"
-        or has_access_to_file(id, "read", user, db=db)
-    ):
+    if file.user_id == user.id:
         file_path = file.path
 
         # Handle Unicode filenames
@@ -770,17 +743,27 @@ async def get_file_content_by_id(
         }
 
         if file_path:
-            file_path = Storage.get_file(file_path)
-            file_path = Path(file_path)
-
-            # Check if the file already exists in the cache
-            if file_path.is_file():
-                return FileResponse(file_path, headers=headers)
-            else:
+            try:
+                return DecryptedFileResponse(file, user_id=user.id, headers=headers)
+            except FileNotFoundError:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail=ERROR_MESSAGES.NOT_FOUND,
                 )
+            except EncryptedDataAccessDeniedError:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=ERROR_MESSAGES.NOT_FOUND,
+                )
+            except RuntimeError as e:
+                if "No DEK cached" in str(e):
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail=ERROR_MESSAGES.DEFAULT(
+                            "User must re-login to access encrypted file"
+                        ),
+                    )
+                raise
         else:
             # File path doesn’t exist, return the content as .txt if possible
             file_content = file.content.get("content", "")
@@ -811,7 +794,7 @@ async def get_file_content_by_id(
 async def delete_file_by_id(
     id: str, user=Depends(get_verified_user), db: Session = Depends(get_session)
 ):
-    file = Files.get_file_by_id(id, db=db)
+    file = Files.get_file_by_id_and_user_id(id, user.id, db=db)
 
     if not file:
         raise HTTPException(
@@ -819,32 +802,21 @@ async def delete_file_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    if (
-        file.user_id == user.id
-        or user.role == "admin"
-        or has_access_to_file(id, "write", user, db=db)
-    ):
-
-        result = Files.delete_file_by_id(id, db=db)
-        if result:
-            try:
-                Storage.delete_file(file.path)
-                VECTOR_DB_CLIENT.delete(collection_name=f"file-{id}")
-            except Exception as e:
-                log.exception(e)
-                log.error("Error deleting files")
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=ERROR_MESSAGES.DEFAULT("Error deleting files"),
-                )
-            return {"message": "File deleted successfully"}
-        else:
+    result = Files.delete_file_by_id(id, db=db)
+    if result:
+        try:
+            Storage.delete_file(file.path)
+            VECTOR_DB_CLIENT.delete(collection_name=f"file-{id}")
+        except Exception as e:
+            log.exception(e)
+            log.error("Error deleting files")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=ERROR_MESSAGES.DEFAULT("Error deleting file"),
+                detail=ERROR_MESSAGES.DEFAULT("Error deleting files"),
             )
+        return {"message": "File deleted successfully"}
     else:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=ERROR_MESSAGES.NOT_FOUND,
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=ERROR_MESSAGES.DEFAULT("Error deleting file"),
         )
