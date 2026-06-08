@@ -178,9 +178,12 @@ class FilesTable:
             except Exception:
                 return None
 
-    def get_files(self, db: Optional[Session] = None) -> list[FileModel]:
+    def get_file_hash_by_id(self, id: str, db: Optional[Session] = None) -> Optional[str]:
         with get_db_context(db) as db:
-            return [FileModel.model_validate(file) for file in db.query(File).all()]
+            try:
+                return db.query(File.hash).filter_by(id=id).scalar()
+            except Exception:
+                return None
 
     def check_access_by_user_id(
         self, id, user_id, permission="write", db: Optional[Session] = None

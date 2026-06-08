@@ -1360,7 +1360,7 @@ def apply_params_to_form_data(form_data, model):
     return form_data
 
 
-async def convert_url_images_to_base64(form_data):
+async def convert_url_images_to_base64(form_data, user):
     messages = form_data.get("messages", [])
 
     for message in messages:
@@ -1382,7 +1382,7 @@ async def convert_url_images_to_base64(form_data):
 
             try:
                 base64_data = await asyncio.to_thread(
-                    get_image_base64_from_url, image_url
+                    get_image_base64_from_url, image_url, user.id
                 )
                 new_content.append(
                     {
@@ -1416,7 +1416,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         except:
             pass
 
-    form_data = await convert_url_images_to_base64(form_data)
+    form_data = await convert_url_images_to_base64(form_data, user)
 
     event_emitter = get_event_emitter(metadata)
     event_caller = get_event_call(metadata)

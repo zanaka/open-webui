@@ -8,7 +8,7 @@ using the file owner's DEK from the in-memory cache.
 from sqlalchemy import event
 
 from open_webui.models.files import File
-from open_webui.utils.crypto_context import require_cached_dek
+from open_webui.utils.crypto_context import require_current_user_dek
 from open_webui.utils.crypto_utils import (
     decrypt_json_value,
     decrypt_text,
@@ -18,7 +18,7 @@ from open_webui.utils.crypto_utils import (
 
 
 def _encrypt_fields(target: File) -> None:
-    dek = require_cached_dek(target.user_id)
+    dek = require_current_user_dek(target.user_id)
 
     target._filename_plaintext = target.filename
     target._data_plaintext = target.data
@@ -30,7 +30,7 @@ def _encrypt_fields(target: File) -> None:
 
 
 def _decrypt_fields(target: File) -> None:
-    dek = require_cached_dek(target.user_id)
+    dek = require_current_user_dek(target.user_id)
 
     target.filename = decrypt_text(target.filename, dek)
     target.data = decrypt_json_value(target.data, dek)

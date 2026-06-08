@@ -8,7 +8,10 @@ from open_webui.internal import db as internal_db
 from open_webui.internal.db import Base
 from open_webui.models.files import File, Files
 from open_webui.utils import crypto_context
-from open_webui.utils.crypto_context import cache_dek
+from open_webui.utils.crypto_context import (
+    cache_dek,
+    set_current_user_id,
+)
 from open_webui.utils.crypto_utils import generate_dek
 
 # Ensure the encryption hooks are registered before File operations run.
@@ -26,7 +29,9 @@ def db(monkeypatch):
     SessionLocal = sessionmaker(bind=engine)
     session = SessionLocal()
     cache_dek(USER_ID, generate_dek(), jti="jti-1", expires_at=time.time() + 3600)
+    set_current_user_id(USER_ID)
     yield session
+    set_current_user_id(None)
     session.close()
     engine.dispose()
     crypto_context._dek_cache.clear()
@@ -91,19 +96,23 @@ class TestSearchFiles:
         _insert_files(db, ["mine.txt"])
         other_dek = generate_dek()
         cache_dek("other-user", other_dek, jti="j2", expires_at=time.time() + 3600)
-        db.add(
-            File(
-                id="other",
-                user_id="other-user",
-                filename="theirs.txt",
-                path="/uploads/other",
-                data={},
-                meta={"name": "theirs.txt"},
-                created_at=int(time.time()),
-                updated_at=int(time.time()),
+        set_current_user_id("other-user")
+        try:
+            db.add(
+                File(
+                    id="other",
+                    user_id="other-user",
+                    filename="theirs.txt",
+                    path="/uploads/other",
+                    data={},
+                    meta={"name": "theirs.txt"},
+                    created_at=int(time.time()),
+                    updated_at=int(time.time()),
+                )
             )
-        )
-        db.commit()
+            db.commit()
+        finally:
+            set_current_user_id(USER_ID)
 
         results = Files.search_files(user_id=USER_ID, db=db)
         assert {r.filename for r in results} == {"mine.txt"}

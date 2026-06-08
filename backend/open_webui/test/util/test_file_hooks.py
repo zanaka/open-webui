@@ -7,7 +7,11 @@ from sqlalchemy.orm import sessionmaker
 from open_webui.internal.db import Base
 from open_webui.models.files import File
 from open_webui.utils import crypto_context
-from open_webui.utils.crypto_context import cache_dek
+from open_webui.utils.crypto_context import (
+    cache_dek,
+    set_current_user_id,
+)
+from open_webui.crypto_exceptions import EncryptedDataAccessDeniedError
 from open_webui.utils.crypto_utils import (
     decrypt_json_value,
     decrypt_text,
@@ -27,7 +31,9 @@ USER_ID = "test-user"
 def dek() -> bytes:
     key = generate_dek()
     cache_dek(USER_ID, key, jti="test-jti", expires_at=time.time() + 3600)
+    set_current_user_id(USER_ID)
     yield key
+    set_current_user_id(None)
     crypto_context._dek_cache.clear()
 
 
@@ -182,9 +188,13 @@ class TestNoneHandling:
 class TestDekRequired:
     def test_insert_without_dek_raises(self, db):
         # No DEK cached for USER_ID
-        with pytest.raises(RuntimeError, match="No DEK cached"):
-            db.add(_make_file())
-            db.commit()
+        set_current_user_id(USER_ID)
+        try:
+            with pytest.raises(RuntimeError, match="No DEK cached"):
+                db.add(_make_file())
+                db.commit()
+        finally:
+            set_current_user_id(None)
 
     def test_load_without_dek_raises(self, db, dek):
         db.add(_make_file())
@@ -204,3 +214,22 @@ class TestDekRequired:
         f.filename = "renamed.pdf"
         with pytest.raises(RuntimeError, match="No DEK cached"):
             db.commit()
+
+    def test_load_as_different_user_raises_even_if_owner_dek_is_cached(self, db, dek):
+        db.add(_make_file())
+        db.commit()
+        db.expire_all()
+
+        other_dek = generate_dek()
+        cache_dek(
+            "admin-user",
+            other_dek,
+            jti="admin-jti",
+            expires_at=time.time() + 3600,
+        )
+        set_current_user_id("admin-user")
+        try:
+            with pytest.raises(EncryptedDataAccessDeniedError):
+                db.query(File).filter_by(id="f1").one()
+        finally:
+            set_current_user_id(USER_ID)
