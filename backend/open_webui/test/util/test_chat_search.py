@@ -6,7 +6,7 @@ from sqlalchemy.orm import sessionmaker
 
 from open_webui.internal import db as internal_db
 from open_webui.internal.db import Base
-from open_webui.models.chats import Chat, Chats
+from open_webui.models.chats import Chat, Chats, _extract_chat_search_text
 from open_webui.models.users import User
 from open_webui.utils import crypto_context
 from open_webui.utils.crypto_context import cache_dek
@@ -136,16 +136,77 @@ class TestBodySearch:
         result = _search(db, "pgvector")
         assert [c.id for c in result] == ["c1"]
 
-    def test_matches_multimodal_text_content(self, db):
+    def test_matches_text_part_of_multimodal_content(self, db):
         _insert_chat(
             db,
             "c1",
             "Untitled chat",
-            turns=[("user", [{"type": "text", "text": "look at this diagram"}])],
+            turns=[
+                (
+                    "user",
+                    [
+                        {"type": "text", "text": "look at this diagram"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.com/photo.png"},
+                        },
+                    ],
+                )
+            ],
         )
 
         result = _search(db, "diagram")
         assert [c.id for c in result] == ["c1"]
+
+    def test_does_not_match_json_structure_of_multimodal_content(self, db):
+        _insert_chat(
+            db,
+            "c1",
+            "Untitled chat",
+            turns=[
+                (
+                    "user",
+                    [
+                        {"type": "text", "text": "please review the diagram"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.com/secret-photo.png"},
+                        },
+                    ],
+                )
+            ],
+        )
+
+        for needle in ["type", "image_url", "secret-photo", "example.com", "url"]:
+            assert _search(db, needle) == [], f"unexpected hit for {needle!r}"
+
+        assert [c.id for c in _search(db, "diagram")] == ["c1"]
+
+    def test_extracts_only_visible_text_not_json_structure(self):
+        chat_json = _chat_json(
+            [
+                (
+                    "user",
+                    [
+                        {"type": "text", "text": "please review the diagram"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.com/secret-photo.png"},
+                        },
+                    ],
+                )
+            ]
+        )
+
+        extracted = _extract_chat_search_text(chat_json)
+
+        assert "please review the diagram" in extracted
+        for token in ["type", "image_url", "secret-photo", "example.com", "url"]:
+            assert token not in extracted, f"{token!r} leaked into searchable text"
+
+    def test_returns_empty_for_non_dict(self):
+        assert _extract_chat_search_text(None) == ""
+        assert _extract_chat_search_text("not a dict") == ""
 
 
 class TestSpecialTokensSearch:
