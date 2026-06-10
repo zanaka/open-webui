@@ -29,13 +29,51 @@ from sqlalchemy import (
 )
 from sqlalchemy import or_, func, select, and_, text
 from sqlalchemy.sql import exists
-from sqlalchemy.sql.expression import bindparam
 
 ####################
 # Chat DB Schema
 ####################
 
 log = logging.getLogger(__name__)
+
+
+def _message_content_to_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        )
+    return ""
+
+
+def _extract_chat_search_text(chat_json) -> str:
+    """
+    Collect searchable plaintext from a decrypted Chat.chat dict.
+
+    Chat.chat is encrypted at rest, so body content cannot be searched in SQL.
+    This concatenates every message's content (lowercased)
+    so the search can be performed in Python over already-decrypted chat objects.
+    """
+    if not isinstance(chat_json, dict):
+        return ""
+
+    parts = []
+
+    messages_map = chat_json.get("history", {}).get("messages")
+    if isinstance(messages_map, dict):
+        for message in messages_map.values():
+            if isinstance(message, dict):
+                parts.append(_message_content_to_text(message.get("content")))
+    else:
+        # Fallback: legacy top-level messages list
+        for message in chat_json.get("messages", []) or []:
+            if isinstance(message, dict):
+                parts.append(_message_content_to_text(message.get("content")))
+
+    return " ".join(parts).lower()
 
 
 class Chat(Base):
@@ -927,7 +965,10 @@ class ChatTable:
         db: Optional[Session] = None,
     ) -> list[ChatModel]:
         """
-        Filters chats based on a search query using Python, allowing pagination using skip and limit.
+        Search chats by title and message body.
+        Tag/folder/pinned/shared/archived filters are applied in SQL,
+        but title and body matching run in Python
+        because Chat.title and Chat.chat are encrypted at rest and their ciphertext is not searchable in SQL.
         """
         search_text = sanitize_text_for_db(search_text).lower().strip()
 
@@ -1013,20 +1054,9 @@ class ChatTable:
             # Check if the database dialect is either 'sqlite' or 'postgresql'
             dialect_name = db.bind.dialect.name
             if dialect_name == "sqlite":
-                # SQLite case: using JSON1 extension for JSON searching
-                sqlite_content_sql = (
-                    "EXISTS ("
-                    "    SELECT 1 "
-                    "    FROM json_each(Chat.chat, '$.messages') AS message "
-                    "    WHERE LOWER(message.value->>'content') LIKE '%' || :content_key || '%'"
-                    ")"
-                )
-                sqlite_content_clause = text(sqlite_content_sql)
-                query = query.filter(
-                    or_(
-                        Chat.title.ilike(bindparam("title_key")), sqlite_content_clause
-                    ).params(title_key=f"%{search_text}%", content_key=search_text)
-                )
+                # Note:
+                # title/body text matching is done in Python after load (Chat.title and Chat.chat are encrypted).
+                # Only tag filtering is applied in SQL here.
 
                 # Check if there are any tags to filter, it should have all the tags
                 if "none" in tag_ids:
@@ -1059,32 +1089,9 @@ class ChatTable:
                     )
 
             elif dialect_name == "postgresql":
-                # PostgreSQL doesn't allow null bytes in text. We filter those out by checking
-                # the JSON representation for \u0000 before attempting text extraction
-
-                # Safety filter: JSON field must not contain \u0000
-                query = query.filter(text("Chat.chat::text NOT LIKE '%\\\\u0000%'"))
-
-                # Safety filter: title must not contain actual null bytes
-                query = query.filter(text("Chat.title::text NOT LIKE '%\\x00%'"))
-
-                postgres_content_sql = """
-                EXISTS (
-                    SELECT 1
-                    FROM json_array_elements(Chat.chat->'messages') AS message
-                    WHERE json_typeof(message->'content') = 'string'
-                    AND LOWER(message->>'content') LIKE '%' || :content_key || '%'
-                )
-                """
-
-                postgres_content_clause = text(postgres_content_sql)
-
-                query = query.filter(
-                    or_(
-                        Chat.title.ilike(bindparam("title_key")),
-                        postgres_content_clause,
-                    )
-                ).params(title_key=f"%{search_text}%", content_key=search_text.lower())
+                # Note:
+                # title/body text matching is done in Python after load (Chat.title and Chat.chat are encrypted).
+                # Only tag filtering is applied in SQL here.
 
                 # Check if there are any tags to filter, it should have all the tags
                 if "none" in tag_ids:
@@ -1120,13 +1127,27 @@ class ChatTable:
                     f"Unsupported dialect: {db.bind.dialect.name}"
                 )
 
-            # Perform pagination at the SQL level
-            all_chats = query.offset(skip).limit(limit).all()
+            all_chats = query.all()
 
-            log.info(f"The number of chats: {len(all_chats)}")
+            matched = []
+            for chat in all_chats:
+                # Chat.title and Chat.chat are decrypted on load (see chat_hooks.py),
+                # so title/body matching is done in Python because the ciphertext is not searchable in SQL.
+                if search_text:
+                    title = (chat.title or "").lower()
+                    if (
+                        search_text not in title
+                        and search_text not in _extract_chat_search_text(chat.chat)
+                    ):
+                        continue
+                matched.append(chat)
+
+            page_chats = matched[skip : skip + limit]
+
+            log.info(f"The number of chats: {len(page_chats)}")
 
             # Validate and return chats
-            return [ChatModel.model_validate(chat) for chat in all_chats]
+            return [ChatModel.model_validate(chat) for chat in page_chats]
 
     def get_chats_by_folder_id_and_user_id(
         self,
