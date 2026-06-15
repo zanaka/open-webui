@@ -1,0 +1,55 @@
+services:
+  app:
+    build:
+      context: .
+    command:
+      - uvicorn
+      - open_webui.main:app
+      - --host=0.0.0.0
+      - --port=8080
+      - --reload
+      - --reload-dir=/app/backend/open_webui
+    working_dir: /app/backend
+    ports:
+      - "3001:8080"
+    environment:
+      WEBUI_SECRET_KEY: dev-secret-key
+      DATABASE_URL: postgresql://webui_user:changeme@db:5432/webui_db
+      OLLAMA_BASE_URL: http://ollama:11434
+    volumes:
+      - ./backend:/app/backend
+    cap_add:
+      - IPC_LOCK
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    depends_on:
+      ollama:
+        condition: service_healthy
+      db:
+        condition: service_started
+
+  db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: webui_user
+      POSTGRES_PASSWORD: changeme
+      POSTGRES_DB: webui_db
+    volumes:
+      - dev_db_data:/var/lib/postgresql/data
+
+  ollama:
+    image: ollama/ollama
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+volumes:
+  dev_db_data:
+  ollama_data:
