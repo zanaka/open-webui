@@ -11,6 +11,8 @@ from open_webui.utils.crypto_utils import (
     derive_kek,
     wrap_dek,
     unwrap_dek,
+    generate_rsa_keypair,
+    encrypt_value,
 )
 from dataclasses import dataclass, field
 
@@ -39,6 +41,8 @@ class Auth(Base):
     active = Column(Boolean)
     kdf_salt = Column(LargeBinary, nullable=False)
     wrapped_dek = Column(LargeBinary, nullable=False)
+    public_key = Column(LargeBinary, nullable=False)
+    wrapped_private_key = Column(LargeBinary, nullable=False)
 
 
 class AuthModel(BaseModel):
@@ -48,6 +52,8 @@ class AuthModel(BaseModel):
     active: bool = True
     kdf_salt: bytes
     wrapped_dek: bytes
+    public_key: bytes
+    wrapped_private_key: bytes
 
 
 ####################
@@ -120,6 +126,9 @@ class AuthsTable:
             kek = derive_kek(raw_password, kdf_salt)
             wrapped_dek = wrap_dek(dek, kek)
 
+            private_key_der, public_key_der = generate_rsa_keypair()
+            wrapped_private_key = encrypt_value(private_key_der, dek)
+
             auth = AuthModel(
                 id=id,
                 email=email,
@@ -127,6 +136,8 @@ class AuthsTable:
                 active=True,
                 kdf_salt=kdf_salt,
                 wrapped_dek=wrapped_dek,
+                public_key=public_key_der,
+                wrapped_private_key=wrapped_private_key,
             )
             result = Auth(**auth.model_dump())
             db.add(result)

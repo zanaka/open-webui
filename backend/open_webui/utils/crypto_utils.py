@@ -6,6 +6,8 @@ import struct
 from pathlib import Path
 from typing import Any, BinaryIO, Iterator, Optional
 
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from argon2.low_level import hash_secret_raw, Type
 
@@ -20,6 +22,15 @@ ARGON2_TIME_COST = 1
 ARGON2_MEMORY_COST = 2097152  # 2 GiB
 ARGON2_PARALLELISM = 4
 ARGON2_HASH_LEN = 32  # 256 bits
+
+# Per-user RSA keypair, used to wrap a 32-byte symmetric key (an AES-256 key)
+# for a recipient via RSA-OAEP-SHA256. 3072-bit gives 128-bit security.
+RSA_KEY_SIZE = 3072
+_RSA_OAEP_PADDING = padding.OAEP(
+    mgf=padding.MGF1(algorithm=hashes.SHA256()),
+    algorithm=hashes.SHA256(),
+    label=None,
+)
 
 # Chunked file encryption format
 FILE_MAGIC = b"OWUIFILEENC1\n"
@@ -73,6 +84,34 @@ def decrypt_value(encrypted_bytes: bytes, dek: bytes) -> bytes:
     ciphertext = encrypted_bytes[NONCE_SIZE:]
     aesgcm = AESGCM(dek)
     return aesgcm.decrypt(nonce, ciphertext, None)
+
+
+def generate_rsa_keypair() -> tuple[bytes, bytes]:
+    private_key = rsa.generate_private_key(
+        public_exponent=65537, key_size=RSA_KEY_SIZE
+    )
+    private_der = private_key.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    public_der = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return private_der, public_der
+
+
+def rsa_wrap_key(key_material: bytes, public_key_spki_der: bytes) -> bytes:
+    public_key = serialization.load_der_public_key(public_key_spki_der)
+    return public_key.encrypt(key_material, _RSA_OAEP_PADDING)
+
+
+def rsa_unwrap_key(wrapped_key: bytes, private_key_pkcs8_der: bytes) -> bytes:
+    private_key = serialization.load_der_private_key(
+        private_key_pkcs8_der, password=None
+    )
+    return private_key.decrypt(wrapped_key, _RSA_OAEP_PADDING)
 
 
 def encrypt_text(value: Optional[str], dek: bytes) -> Optional[str]:

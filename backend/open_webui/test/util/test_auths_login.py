@@ -78,6 +78,8 @@ def accounts() -> Accounts:
             active=False,
             kdf_salt=b"\x00" * 16,
             wrapped_dek=b"\x00" * 60,
+            public_key=b"\x00" * 32,
+            wrapped_private_key=b"\x00" * 32,
         )
     )
     session.commit()
