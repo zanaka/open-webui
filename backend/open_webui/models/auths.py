@@ -183,6 +183,20 @@ class AuthsTable:
             log.exception("authenticate_user error")
             return None
 
+    def get_public_key(
+        self, user_id: str, db: Optional[Session] = None
+    ) -> Optional[bytes]:
+        with get_db_context(db) as db:
+            auth = db.query(Auth).filter_by(id=user_id).first()
+            return auth.public_key if auth else None
+
+    def get_wrapped_private_key(
+        self, user_id: str, db: Optional[Session] = None
+    ) -> Optional[bytes]:
+        with get_db_context(db) as db:
+            auth = db.query(Auth).filter_by(id=user_id).first()
+            return auth.wrapped_private_key if auth else None
+
     def authenticate_user_by_api_key(
         self, api_key: str, db: Optional[Session] = None
     ) -> Optional[UserModel]:
