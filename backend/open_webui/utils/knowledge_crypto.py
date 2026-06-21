@@ -13,6 +13,10 @@ from open_webui.utils.crypto_utils import (
 )
 
 
+class KdekAccessError(Exception):
+    pass
+
+
 def create_owner_kdek(
     knowledge_id: str, owner_id: str, db: Optional[Session] = None
 ) -> bytes:
@@ -40,3 +44,42 @@ def resolve_kdek(
 
     private_der = decrypt_value(wrapped_private_key, dek)
     return rsa_unwrap_key(wrapped_kdek, private_der)
+
+
+def _member_ids(access_control: Optional[dict]) -> set:
+    ids: set = set()
+    if not access_control:
+        return ids
+    for permission in ("read", "write"):
+        ids.update((access_control.get(permission) or {}).get("user_ids") or [])
+    return ids
+
+
+def sync_shared_keys(
+    knowledge_id: str,
+    owner_id: str,
+    access_control: Optional[dict],
+    kdek: Optional[bytes],
+    db: Optional[Session] = None,
+) -> None:
+    target = _member_ids(access_control) - {owner_id}
+    existing = set(KnowledgeKeys.get_user_ids(knowledge_id, db=db)) - {owner_id}
+
+    added = target - existing
+    removed = existing - target
+
+    if (added or removed) and kdek is None:
+        raise KdekAccessError(
+            "Cannot change sharing without access to the knowledge key."
+        )
+
+    for user_id in added:
+        public_key = Auths.get_public_key(user_id, db=db)
+        if public_key is None:
+            continue
+        KnowledgeKeys.insert_new_key(
+            knowledge_id, user_id, rsa_wrap_key(kdek, public_key), db=db
+        )
+
+    for user_id in removed:
+        KnowledgeKeys.delete_key(knowledge_id, user_id, db=db)
