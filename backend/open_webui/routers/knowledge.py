@@ -30,7 +30,12 @@ from open_webui.storage.provider import Storage
 from open_webui.constants import ERROR_MESSAGES
 from open_webui.utils.auth import get_verified_user, get_admin_user
 from open_webui.utils.access_control import has_access, has_permission
-from open_webui.utils.knowledge_crypto import create_owner_kdek
+from open_webui.utils.knowledge_crypto import (
+    create_owner_kdek,
+    resolve_kdek,
+    sync_shared_keys,
+    KdekAccessError,
+)
 
 
 from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL
@@ -270,7 +275,10 @@ async def create_new_knowledge(
     knowledge = Knowledges.insert_new_knowledge(user.id, form_data, db=db)
 
     if knowledge:
-        create_owner_kdek(knowledge.id, user.id, db=db)
+        kdek = create_owner_kdek(knowledge.id, user.id, db=db)
+        sync_shared_keys(
+            knowledge.id, user.id, form_data.access_control, kdek, db=db
+        )
         # Embed knowledge base for semantic search
         await embed_knowledge_base_metadata(
             request,
@@ -465,6 +473,17 @@ async def update_knowledge_by_id(
         form_data.access_control = {}
 
     validate_encryptable_access_control(form_data.access_control)
+
+    actor_kdek = resolve_kdek(id, user.id, db=db)
+    try:
+        sync_shared_keys(
+            id, knowledge.user_id, form_data.access_control, actor_kdek, db=db
+        )
+    except KdekAccessError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You must be a member of this knowledge base to share it.",
+        )
 
     knowledge = Knowledges.update_knowledge_by_id(id=id, form_data=form_data, db=db)
     if knowledge:

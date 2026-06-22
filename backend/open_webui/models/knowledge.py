@@ -706,5 +706,26 @@ class KnowledgeKeysTable:
             )
             return row.wrapped_kdek if row else None
 
+    def get_user_ids(
+        self, knowledge_id: str, db: Optional[Session] = None
+    ) -> list[str]:
+        with get_db_context(db) as db:
+            rows = (
+                db.query(KnowledgeKey.user_id)
+                .filter_by(knowledge_id=knowledge_id)
+                .all()
+            )
+            return [row[0] for row in rows]
+
+    def delete_key(
+        self, knowledge_id: str, user_id: str, db: Optional[Session] = None
+    ) -> bool:
+        with get_db_context(db) as db:
+            db.query(KnowledgeKey).filter_by(
+                knowledge_id=knowledge_id, user_id=user_id
+            ).delete(synchronize_session=False)
+            db.commit()
+            return True
+
 
 KnowledgeKeys = KnowledgeKeysTable()
