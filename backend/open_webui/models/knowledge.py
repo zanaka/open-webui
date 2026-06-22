@@ -22,6 +22,7 @@ from sqlalchemy import (
     BigInteger,
     Column,
     ForeignKey,
+    LargeBinary,
     String,
     Text,
     JSON,
@@ -657,3 +658,53 @@ class KnowledgeTable:
 
 
 Knowledges = KnowledgeTable()
+
+
+####################
+# KnowledgeKey: per-knowledge KDEK, wrapped with each member's RSA public key
+####################
+
+
+class KnowledgeKey(Base):
+    __tablename__ = "knowledge_key"
+
+    knowledge_id = Column(
+        Text, ForeignKey("knowledge.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id = Column(Text, primary_key=True)
+    wrapped_kdek = Column(LargeBinary, nullable=False)
+    created_at = Column(BigInteger)
+
+
+class KnowledgeKeysTable:
+    def insert_new_key(
+        self,
+        knowledge_id: str,
+        user_id: str,
+        wrapped_kdek: bytes,
+        db: Optional[Session] = None,
+    ) -> bool:
+        with get_db_context(db) as db:
+            row = KnowledgeKey(
+                knowledge_id=knowledge_id,
+                user_id=user_id,
+                wrapped_kdek=wrapped_kdek,
+                created_at=int(time.time()),
+            )
+            db.add(row)
+            db.commit()
+            return True
+
+    def get_wrapped_kdek(
+        self, knowledge_id: str, user_id: str, db: Optional[Session] = None
+    ) -> Optional[bytes]:
+        with get_db_context(db) as db:
+            row = (
+                db.query(KnowledgeKey)
+                .filter_by(knowledge_id=knowledge_id, user_id=user_id)
+                .first()
+            )
+            return row.wrapped_kdek if row else None
+
+
+KnowledgeKeys = KnowledgeKeysTable()
