@@ -21,6 +21,7 @@ from open_webui.utils.crypto_context import cache_dek, set_current_user_id
 from open_webui.utils.crypto_utils import generate_dek
 from open_webui.utils.knowledge_crypto import create_owner_kdek, resolve_kdek
 from open_webui.utils.rag_crypto import (
+    RagEncryptionRequiredError,
     decrypt_result,
     decrypt_result_for_collection,
     encrypt_items,
@@ -157,7 +158,7 @@ def accounts() -> Accounts:
 
 
 @pytest.fixture
-def kb(accounts):
+def knowledge(accounts):
     k = Knowledges.insert_new_knowledge(
         accounts.a,
         KnowledgeForm(name="KB", description="d", access_control={}),
@@ -168,8 +169,8 @@ def kb(accounts):
 
 
 class TestCollectionOrchestration:
-    def test_owner_encrypts_then_decrypts_via_real_kdek(self, accounts, kb):
-        kid, kdek = kb
+    def test_owner_encrypts_then_decrypts_via_real_kdek(self, accounts, knowledge):
+        kid, kdek = knowledge
         items = _items()
         encrypt_items_for_collection(kid, accounts.a, items, db=accounts.session)
         assert items[0]["text"] != "patient diagnosis is confidential"
@@ -187,10 +188,22 @@ class TestCollectionOrchestration:
         assert items[0]["text"] == "patient diagnosis is confidential"
         assert items[0]["metadata"]["name"] == "report.pdf"
 
-    def test_shared_member_can_decrypt_owner_chunks(self, accounts, kb):
+    def test_missing_user_on_encrypted_collection_raises(self, accounts, knowledge):
+        kid, _ = knowledge
+        with pytest.raises(RagEncryptionRequiredError):
+            encrypt_items_for_collection(kid, None, _items(), db=accounts.session)
+
+    def test_non_member_on_encrypted_collection_raises(self, accounts, knowledge):
+        kid, _ = knowledge
+        with pytest.raises(RagEncryptionRequiredError):
+            encrypt_items_for_collection(
+                kid, "ghost-user", _items(), db=accounts.session
+            )
+
+    def test_shared_member_can_decrypt_owner_chunks(self, accounts, knowledge):
         from open_webui.utils.knowledge_crypto import sync_shared_keys
 
-        kid, kdek = kb
+        kid, kdek = knowledge
         sync_shared_keys(
             kid,
             accounts.a,
@@ -207,7 +220,7 @@ class TestCollectionOrchestration:
 
 
 class TestDecryptForCollection:
-    def test_no_current_user_passes_through(self, monkeypatch):
+    def test_no_current_user_passes_through(self):
         kdek = generate_dek()
         items = _items()
         encrypt_items(items, kdek)

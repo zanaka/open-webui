@@ -1560,8 +1560,9 @@ def save_docs_to_vector_db(
             for idx, text in enumerate(texts)
         ]
 
-        if user is not None:
-            encrypt_items_for_collection(collection_name, user.id, items)
+        encrypt_items_for_collection(
+            collection_name, user.id if user is not None else None, items
+        )
 
         log.info(f"adding to collection {collection_name}")
         VECTOR_DB_CLIENT.insert(

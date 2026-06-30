@@ -4,6 +4,7 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
+from open_webui.models.knowledge import KnowledgeKeys
 from open_webui.utils.crypto_context import get_current_user_id
 from open_webui.utils.crypto_utils import decrypt_value, encrypt_value
 from open_webui.utils.knowledge_crypto import resolve_kdek
@@ -11,6 +12,10 @@ from open_webui.utils.knowledge_crypto import resolve_kdek
 log = logging.getLogger(__name__)
 
 _ENCRYPTED_METADATA_FIELDS = ("name", "source")
+
+
+class RagEncryptionRequiredError(Exception):
+    pass
 
 
 def _encrypt_str(plaintext: str, kdek: bytes) -> str:
@@ -56,13 +61,25 @@ def decrypt_result(result, kdek: bytes):
 
 def encrypt_items_for_collection(
     collection_name: str,
-    user_id: str,
+    user_id: Optional[str],
     items: list[dict],
     db: Optional[Session] = None,
 ) -> None:
+    if not KnowledgeKeys.get_user_ids(collection_name, db=db):
+        return
+
+    if user_id is None:
+        raise RagEncryptionRequiredError(
+            f"Collection {collection_name} is encrypted but no user context was "
+            "provided to resolve its key."
+        )
+
     kdek = resolve_kdek(collection_name, user_id, db=db)
     if kdek is None:
-        return
+        raise RagEncryptionRequiredError(
+            f"Collection {collection_name} is encrypted but user {user_id} cannot "
+            "access its key."
+        )
     encrypt_items(items, kdek)
 
 
