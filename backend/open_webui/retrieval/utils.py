@@ -21,6 +21,7 @@ from langchain_core.documents import Document
 
 from open_webui.config import VECTOR_DB
 from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
+from open_webui.utils.rag_crypto import decrypt_result_for_collection
 
 
 from open_webui.models.users import UserModel
@@ -149,7 +150,7 @@ def query_doc(
         if result:
             log.info(f"query_doc:result {result.ids} {result.metadatas}")
 
-        return result
+        return decrypt_result_for_collection(collection_name, result)
     except Exception as e:
         log.exception(f"Error querying doc {collection_name} with limit {k}: {e}")
         raise e
@@ -163,7 +164,7 @@ def get_doc(collection_name: str, user: UserModel = None):
         if result:
             log.info(f"query_doc:result {result.ids} {result.metadatas}")
 
-        return result
+        return decrypt_result_for_collection(collection_name, result)
     except Exception as e:
         log.exception(f"Error getting doc {collection_name}: {e}")
         raise e
@@ -477,8 +478,9 @@ async def query_collection_with_hybrid_search(
             log.debug(
                 f"query_collection_with_hybrid_search:VECTOR_DB_CLIENT.get:collection {collection_name}"
             )
-            collection_results[collection_name] = VECTOR_DB_CLIENT.get(
-                collection_name=collection_name
+            collection_results[collection_name] = decrypt_result_for_collection(
+                collection_name,
+                VECTOR_DB_CLIENT.get(collection_name=collection_name),
             )
         except Exception as e:
             log.exception(f"Failed to fetch collection {collection_name}: {e}")

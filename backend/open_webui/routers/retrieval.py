@@ -95,6 +95,7 @@ from open_webui.utils.misc import (
 )
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.access_control import has_permission
+from open_webui.utils.rag_crypto import encrypt_items_for_collection
 
 from open_webui.config import (
     ENV,
@@ -1558,6 +1559,10 @@ def save_docs_to_vector_db(
             }
             for idx, text in enumerate(texts)
         ]
+
+        encrypt_items_for_collection(
+            collection_name, user.id if user is not None else None, items
+        )
 
         log.info(f"adding to collection {collection_name}")
         VECTOR_DB_CLIENT.insert(
