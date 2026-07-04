@@ -120,6 +120,7 @@ class VectorSearchRetriever(BaseRetriever):
             vectors=[embedding],
             limit=self.top_k,
         )
+        result = decrypt_result_for_collection(self.collection_name, result)
 
         ids = result.ids[0]
         metadatas = result.metadatas[0]
