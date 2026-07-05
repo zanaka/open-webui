@@ -22,6 +22,7 @@ from langchain_core.documents import Document
 from open_webui.config import VECTOR_DB
 from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
 from open_webui.utils.rag_crypto import decrypt_result_for_collection
+from open_webui.utils.vem_crypto import rotate_query_for_collection
 
 
 from open_webui.models.users import UserModel
@@ -115,6 +116,7 @@ class VectorSearchRetriever(BaseRetriever):
         run_manager: CallbackManagerForRetrieverRun,
     ) -> list[Document]:
         embedding = await self.embedding_function(query, RAG_EMBEDDING_QUERY_PREFIX)
+        embedding = rotate_query_for_collection(self.collection_name, embedding)
         result = VECTOR_DB_CLIENT.search(
             collection_name=self.collection_name,
             vectors=[embedding],
@@ -141,6 +143,7 @@ def query_doc(
 ):
     try:
         log.debug(f"query_doc:doc {collection_name}")
+        query_embedding = rotate_query_for_collection(collection_name, query_embedding)
         result = VECTOR_DB_CLIENT.search(
             collection_name=collection_name,
             vectors=[query_embedding],
