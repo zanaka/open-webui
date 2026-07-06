@@ -23,6 +23,8 @@ from open_webui.utils.knowledge_crypto import create_owner_kdek
 from open_webui.utils.vem_crypto import (
     _build_matrix,
     _get_matrix,
+    _seed_from_key,
+    purge_expired_vems,
     rotate_items_for_collection,
     rotate_query_for_collection,
 )
@@ -31,8 +33,10 @@ from open_webui.utils.vem_crypto import (
 @pytest.fixture(autouse=True)
 def _clear_cache():
     vem_crypto._matrix_cache.clear()
+    vem_crypto._cache_bytes = 0
     yield
     vem_crypto._matrix_cache.clear()
+    vem_crypto._cache_bytes = 0
 
 
 def _dist(a, b):
@@ -48,23 +52,24 @@ def _items(vectors):
 
 class TestMatrix:
     def test_matrix_is_orthogonal(self):
-        q = _build_matrix(generate_dek(), 16)
-        assert np.allclose(q @ q.T, np.eye(16), atol=1e-9)
+        q = _build_matrix(_seed_from_key(generate_dek()), 16)
+        assert np.allclose(q @ q.T, np.eye(16), atol=1e-5)
 
-    def test_same_key_is_deterministic(self):
-        key = generate_dek()
-        assert np.array_equal(_build_matrix(key, 16), _build_matrix(key, 16))
+    def test_matrix_is_float32(self):
+        assert _build_matrix(_seed_from_key(generate_dek()), 8).dtype == np.float32
+
+    def test_same_seed_is_deterministic(self):
+        seed = _seed_from_key(generate_dek())
+        assert np.array_equal(_build_matrix(seed, 16), _build_matrix(seed, 16))
 
     def test_different_keys_differ(self):
-        a = _build_matrix(generate_dek(), 16)
-        b = _build_matrix(generate_dek(), 16)
+        a = _build_matrix(_seed_from_key(generate_dek()), 16)
+        b = _build_matrix(_seed_from_key(generate_dek()), 16)
         assert not np.allclose(a, b)
 
     def test_cache_returns_same_object(self):
         key = generate_dek()
-        first = _get_matrix("col-x", key, 16)
-        second = _get_matrix("col-x", key, 16)
-        assert first is second
+        assert _get_matrix(key, 16) is _get_matrix(key, 16)
 
 
 @dataclass
@@ -142,7 +147,7 @@ class TestCollectionRotation:
         for i in range(len(items)):
             for j in range(i + 1, len(items)):
                 assert _dist(items[i]["vector"], items[j]["vector"]) == pytest.approx(
-                    _dist(originals[i], originals[j]), abs=1e-6
+                    _dist(originals[i], originals[j]), abs=1e-4
                 )
 
     def test_query_and_stored_rotated_same_matrix_keep_nn(self, accounts, knowledge):
@@ -153,7 +158,7 @@ class TestCollectionRotation:
         items = _items([list(v) for v in originals])
 
         rotate_items_for_collection(kid, accounts.a, items, db=accounts.session)
-        q_matrix = _build_matrix(kdek, 8)
+        q_matrix = _build_matrix(_seed_from_key(kdek), 8)
         rotated_query = (np.asarray(query) @ q_matrix.T).tolist()
 
         plain_nn = sorted(range(len(originals)), key=lambda i: _dist(originals[i], query))
@@ -174,7 +179,7 @@ class TestCollectionRotation:
         )
         assert items[0]["vector"] != originals[0]
         assert _dist(items[0]["vector"], items[1]["vector"]) == pytest.approx(
-            _dist(originals[0], originals[1]), abs=1e-6
+            _dist(originals[0], originals[1]), abs=1e-4
         )
 
     def test_non_vem_collection_is_passthrough(self, accounts):
@@ -211,8 +216,45 @@ class TestQueryRotation:
         try:
             q = list(np.random.default_rng(4).standard_normal(8))
             out = rotate_query_for_collection("kid", q)
-            expected = (np.asarray(q) @ _build_matrix(key, 8).T).tolist()
+            expected = (np.asarray(q) @ _build_matrix(_seed_from_key(key), 8).T).tolist()
             assert out != q
             assert np.allclose(out, expected)
         finally:
             set_current_user_id(None)
+
+
+class TestCache:
+    def test_same_key_collapses_to_one_entry(self, accounts):
+        for name in ("file-a", "file-b", "file-c"):
+            rotate_items_for_collection(
+                name, accounts.a, _items([[0.1] * 8]), db=accounts.session
+            )
+        assert len(vem_crypto._matrix_cache) == 1
+
+    def test_byte_cap_bounds_size(self, monkeypatch):
+        monkeypatch.setattr(vem_crypto, "_MATRIX_CACHE_MAX_BYTES", 8 * 8 * 4 * 2)
+        for _ in range(5):
+            _get_matrix(generate_dek(), 8)  # 5 distinct keys
+        assert len(vem_crypto._matrix_cache) <= 2
+        assert vem_crypto._cache_bytes <= vem_crypto._MATRIX_CACHE_MAX_BYTES
+
+    def test_lru_evicts_least_recently_used(self, monkeypatch):
+        monkeypatch.setattr(vem_crypto, "_MATRIX_CACHE_MAX_BYTES", 8 * 8 * 4 * 2)
+        k1, k2, k3 = generate_dek(), generate_dek(), generate_dek()
+        _get_matrix(k1, 8)
+        _get_matrix(k2, 8)  # cache full: [k1, k2]
+        _get_matrix(k1, 8)  # touch k1 -> k2 becomes least-recently-used
+        _get_matrix(k3, 8)  # inserting k3 evicts k2 (LRU), not k1
+        keys = set(vem_crypto._matrix_cache.keys())
+        assert (_seed_from_key(k1), 8) in keys
+        assert (_seed_from_key(k2), 8) not in keys
+        assert (_seed_from_key(k3), 8) in keys
+
+    def test_purge_expired_vems(self):
+        _get_matrix(generate_dek(), 8)
+        assert len(vem_crypto._matrix_cache) == 1
+        ck, (matrix, _) = next(iter(vem_crypto._matrix_cache.items()))
+        vem_crypto._matrix_cache[ck] = (matrix, time.time() - 1)  # force expired
+        purge_expired_vems(time.time())
+        assert len(vem_crypto._matrix_cache) == 0
+        assert vem_crypto._cache_bytes == 0
