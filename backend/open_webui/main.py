@@ -64,6 +64,7 @@ from open_webui.utils.memory_lock import enable_memory_lock
 # Register SQLAlchemy encryption event listeners.
 import open_webui.utils.chat_hooks  # noqa: F401
 import open_webui.utils.file_hooks  # noqa: F401
+import open_webui.utils.memory_hooks  # noqa: F401
 from open_webui.socket.main import (
     MODELS,
     app as socket_app,
