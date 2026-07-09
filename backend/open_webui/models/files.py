@@ -10,6 +10,16 @@ from sqlalchemy import BigInteger, Column, String, Text, JSON
 
 log = logging.getLogger(__name__)
 
+
+FILE_COLLECTION_PREFIX = "file-"
+
+
+def is_file_collection(collection_name: str) -> bool:
+    return isinstance(collection_name, str) and collection_name.startswith(
+        FILE_COLLECTION_PREFIX
+    )
+
+
 ####################
 # Files DB Schema
 ####################

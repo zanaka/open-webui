@@ -4,8 +4,9 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
+from open_webui.models.files import is_file_collection
 from open_webui.models.knowledge import KnowledgeKeys
-from open_webui.utils.crypto_context import get_current_user_id
+from open_webui.utils.crypto_context import get_cached_dek, get_current_user_id
 from open_webui.utils.crypto_utils import decrypt_value, encrypt_value
 from open_webui.utils.knowledge_crypto import resolve_kdek
 
@@ -59,28 +60,35 @@ def decrypt_result(result, kdek: bytes):
     return result
 
 
+def _collection_key(
+    collection_name: str, user_id: Optional[str], db: Optional[Session] = None
+) -> tuple[bool, Optional[bytes]]:
+    if is_file_collection(collection_name):
+        if user_id is None:
+            return True, None
+        return True, get_cached_dek(user_id)
+    if KnowledgeKeys.get_user_ids(collection_name, db=db):
+        if user_id is None:
+            return True, None
+        return True, resolve_kdek(collection_name, user_id, db=db)
+    return False, None
+
+
 def encrypt_items_for_collection(
     collection_name: str,
     user_id: Optional[str],
     items: list[dict],
     db: Optional[Session] = None,
 ) -> None:
-    if not KnowledgeKeys.get_user_ids(collection_name, db=db):
+    is_encrypted, key = _collection_key(collection_name, user_id, db=db)
+    if not is_encrypted:
         return
-
-    if user_id is None:
+    if key is None:
         raise RagEncryptionRequiredError(
-            f"Collection {collection_name} is encrypted but no user context was "
-            "provided to resolve its key."
+            f"Collection {collection_name} must be encrypted but no key is "
+            f"available for user {user_id}."
         )
-
-    kdek = resolve_kdek(collection_name, user_id, db=db)
-    if kdek is None:
-        raise RagEncryptionRequiredError(
-            f"Collection {collection_name} is encrypted but user {user_id} cannot "
-            "access its key."
-        )
-    encrypt_items(items, kdek)
+    encrypt_items(items, key)
 
 
 def decrypt_result_for_collection(collection_name: str, result):
@@ -90,10 +98,10 @@ def decrypt_result_for_collection(collection_name: str, result):
     if not user_id:
         return result
     try:
-        kdek = resolve_kdek(collection_name, user_id)
+        is_encrypted, key = _collection_key(collection_name, user_id)
     except Exception as e:
-        log.debug(f"Could not resolve KDEK for collection {collection_name}: {e}")
+        log.debug(f"Could not resolve key for collection {collection_name}: {e}")
         return result
-    if kdek is None:
+    if not is_encrypted or key is None:
         return result
-    return decrypt_result(result, kdek)
+    return decrypt_result(result, key)

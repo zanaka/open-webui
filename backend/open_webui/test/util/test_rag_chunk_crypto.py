@@ -17,7 +17,7 @@ from open_webui.models.knowledge import (
 )
 from open_webui.retrieval.vector.main import GetResult
 from open_webui.utils import rag_crypto
-from open_webui.utils.crypto_context import cache_dek, set_current_user_id
+from open_webui.utils.crypto_context import cache_dek, get_cached_dek, set_current_user_id
 from open_webui.utils.crypto_utils import generate_dek
 from open_webui.utils.knowledge_crypto import create_owner_kdek, resolve_kdek
 from open_webui.utils.rag_crypto import (
@@ -179,14 +179,30 @@ class TestCollectionOrchestration:
         assert result.documents[0][0] == "patient diagnosis is confidential"
         assert result.metadatas[0][0]["name"] == "report.pdf"
 
-    def test_non_knowledge_collection_is_passthrough(self, accounts):
-        # A standalone file-{id} collection has no KDEK; chunks stay plaintext.
+    def test_non_encrypted_collection_is_passthrough(self, accounts):
+        # web-search / knowledge-bases etc. have no key → chunks stay plaintext.
         items = _items()
         encrypt_items_for_collection(
-            "file-standalone", accounts.a, items, db=accounts.session
+            "web-search-xyz", accounts.a, items, db=accounts.session
         )
         assert items[0]["text"] == "patient diagnosis is confidential"
         assert items[0]["metadata"]["name"] == "report.pdf"
+
+    def test_file_collection_encrypted_with_owner_dek(self, accounts):
+        # A standalone file-{id} collection is encrypted with the owner's DEK.
+        items = _items()
+        encrypt_items_for_collection("file-abc", accounts.a, items, db=accounts.session)
+        assert items[0]["text"] != "patient diagnosis is confidential"
+
+        result = decrypt_result(_result_from(items), get_cached_dek(accounts.a))
+        assert result.documents[0][0] == "patient diagnosis is confidential"
+        assert result.metadatas[0][0]["name"] == "report.pdf"
+
+    def test_file_collection_missing_user_raises(self, accounts):
+        with pytest.raises(RagEncryptionRequiredError):
+            encrypt_items_for_collection(
+                "file-abc", None, _items(), db=accounts.session
+            )
 
     def test_missing_user_on_encrypted_collection_raises(self, accounts, knowledge):
         kid, _ = knowledge
@@ -238,7 +254,7 @@ class TestDecryptForCollection:
         encrypt_items(items, kdek)
         encrypted = _result_from(items)
 
-        monkeypatch.setattr(rag_crypto, "resolve_kdek", lambda c, u, db=None: kdek)
+        monkeypatch.setattr(rag_crypto, "_collection_key", lambda c, u, db=None: (True, kdek))
         set_current_user_id("member-1")
         try:
             out = decrypt_result_for_collection("kid", encrypted)
@@ -253,7 +269,7 @@ class TestDecryptForCollection:
         encrypted = _result_from(items)
 
         ciphertext = encrypted.documents[0][0]
-        monkeypatch.setattr(rag_crypto, "resolve_kdek", lambda c, u, db=None: None)
+        monkeypatch.setattr(rag_crypto, "_collection_key", lambda c, u, db=None: (False, None))
         set_current_user_id("outsider")
         try:
             out = decrypt_result_for_collection("kid", encrypted)
