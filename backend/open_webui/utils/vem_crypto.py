@@ -58,7 +58,7 @@ def _build_matrix(secret_seed: int, dim: int) -> np.ndarray:
     return q.astype(np.float32)
 
 
-def _get_matrix(key: bytes, dim: int) -> np.ndarray:
+def _resolve_matrix(key: bytes, dim: int) -> np.ndarray:
     global _cache_bytes
     secret_seed = _seed_from_key(key)
     cache_key = (secret_seed, dim)
@@ -132,7 +132,7 @@ def rotate_items_for_collection(
     vectors = [item.get("vector") for item in items]
     if any(v is None for v in vectors):
         return
-    matrix = _get_matrix(key, len(vectors[0]))
+    matrix = _resolve_matrix(key, len(vectors[0]))
     rotated = np.asarray(vectors, dtype=float) @ matrix.T
     for item, row in zip(items, rotated):
         item["vector"] = row.tolist()
@@ -147,5 +147,5 @@ def rotate_query_for_collection(collection_name: str, query_embedding: list):
     key = _resolve_vem_key(collection_name, user_id)
     if key is None:
         return query_embedding
-    matrix = _get_matrix(key, len(query_embedding))
+    matrix = _resolve_matrix(key, len(query_embedding))
     return (np.asarray(query_embedding, dtype=float) @ matrix.T).tolist()

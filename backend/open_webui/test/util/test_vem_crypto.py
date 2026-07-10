@@ -22,7 +22,7 @@ from open_webui.utils.crypto_utils import generate_dek
 from open_webui.utils.knowledge_crypto import create_owner_kdek
 from open_webui.utils.vem_crypto import (
     _build_matrix,
-    _get_matrix,
+    _resolve_matrix,
     _seed_from_key,
     purge_expired_vems,
     rotate_items_for_collection,
@@ -69,7 +69,7 @@ class TestMatrix:
 
     def test_cache_returns_same_object(self):
         key = generate_dek()
-        assert _get_matrix(key, 16) is _get_matrix(key, 16)
+        assert _resolve_matrix(key, 16) is _resolve_matrix(key, 16)
 
 
 @dataclass
@@ -234,24 +234,24 @@ class TestCache:
     def test_byte_cap_bounds_size(self, monkeypatch):
         monkeypatch.setattr(vem_crypto, "_MATRIX_CACHE_MAX_BYTES", 8 * 8 * 4 * 2)
         for _ in range(5):
-            _get_matrix(generate_dek(), 8)  # 5 distinct keys
+            _resolve_matrix(generate_dek(), 8)  # 5 distinct keys
         assert len(vem_crypto._matrix_cache) <= 2
         assert vem_crypto._cache_bytes <= vem_crypto._MATRIX_CACHE_MAX_BYTES
 
     def test_lru_evicts_least_recently_used(self, monkeypatch):
         monkeypatch.setattr(vem_crypto, "_MATRIX_CACHE_MAX_BYTES", 8 * 8 * 4 * 2)
         k1, k2, k3 = generate_dek(), generate_dek(), generate_dek()
-        _get_matrix(k1, 8)
-        _get_matrix(k2, 8)  # cache full: [k1, k2]
-        _get_matrix(k1, 8)  # touch k1 -> k2 becomes least-recently-used
-        _get_matrix(k3, 8)  # inserting k3 evicts k2 (LRU), not k1
+        _resolve_matrix(k1, 8)
+        _resolve_matrix(k2, 8)  # cache full: [k1, k2]
+        _resolve_matrix(k1, 8)  # touch k1 -> k2 becomes least-recently-used
+        _resolve_matrix(k3, 8)  # inserting k3 evicts k2 (LRU), not k1
         keys = set(vem_crypto._matrix_cache.keys())
         assert (_seed_from_key(k1), 8) in keys
         assert (_seed_from_key(k2), 8) not in keys
         assert (_seed_from_key(k3), 8) in keys
 
     def test_purge_expired_vems(self):
-        _get_matrix(generate_dek(), 8)
+        _resolve_matrix(generate_dek(), 8)
         assert len(vem_crypto._matrix_cache) == 1
         ck, (matrix, _) = next(iter(vem_crypto._matrix_cache.items()))
         vem_crypto._matrix_cache[ck] = (matrix, time.time() - 1)  # force expired
