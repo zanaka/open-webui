@@ -91,6 +91,23 @@ def encrypt_items_for_collection(
     encrypt_items(items, key)
 
 
+def redact_metadatas_for_log(metadatas):
+    if not metadatas:
+        return metadatas
+    redacted = []
+    for batch in metadatas:
+        new_batch = []
+        for metadata in batch:
+            if isinstance(metadata, dict):
+                metadata = {
+                    key: ("<redacted>" if key in _ENCRYPTED_METADATA_FIELDS else value)
+                    for key, value in metadata.items()
+                }
+            new_batch.append(metadata)
+        redacted.append(new_batch)
+    return redacted
+
+
 def decrypt_result_for_collection(collection_name: str, result):
     if result is None:
         return result
