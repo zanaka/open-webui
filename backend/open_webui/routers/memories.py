@@ -11,11 +11,26 @@ from open_webui.internal.db import get_session
 from sqlalchemy.orm import Session
 
 from open_webui.utils.access_control import has_permission
+from open_webui.utils.crypto_context import get_cached_dek, require_current_user_dek
+from open_webui.utils.rag_crypto import decrypt_result, encrypt_items
 from open_webui.constants import ERROR_MESSAGES
 
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _encrypt_memory_items(items, user_id):
+    if not items:
+        return
+    encrypt_items(items, require_current_user_dek(user_id))
+
+
+def _decrypt_memory_results(results, user_id):
+    dek = get_cached_dek(user_id)
+    if dek is not None:
+        decrypt_result(results, dek)
+    return results
 
 
 @router.get("/ef")
@@ -89,17 +104,16 @@ async def add_memory(
 
     vector = await request.app.state.EMBEDDING_FUNCTION(memory.content, user=user)
 
-    VECTOR_DB_CLIENT.upsert(
-        collection_name=f"user-memory-{user.id}",
-        items=[
-            {
-                "id": memory.id,
-                "text": memory.content,
-                "vector": vector,
-                "metadata": {"created_at": memory.created_at},
-            }
-        ],
-    )
+    items = [
+        {
+            "id": memory.id,
+            "text": memory.content,
+            "vector": vector,
+            "metadata": {"created_at": memory.created_at},
+        }
+    ]
+    _encrypt_memory_items(items, user.id)
+    VECTOR_DB_CLIENT.upsert(collection_name=f"user-memory-{user.id}", items=items)
 
     return memory
 
@@ -147,7 +161,7 @@ async def query_memory(
         limit=form_data.k,
     )
 
-    return results
+    return _decrypt_memory_results(results, user.id)
 
 
 ############################
@@ -185,21 +199,20 @@ async def reset_memory_from_vector_db(
         ]
     )
 
-    VECTOR_DB_CLIENT.upsert(
-        collection_name=f"user-memory-{user.id}",
-        items=[
-            {
-                "id": memory.id,
-                "text": memory.content,
-                "vector": vectors[idx],
-                "metadata": {
-                    "created_at": memory.created_at,
-                    "updated_at": memory.updated_at,
-                },
-            }
-            for idx, memory in enumerate(memories)
-        ],
-    )
+    items = [
+        {
+            "id": memory.id,
+            "text": memory.content,
+            "vector": vectors[idx],
+            "metadata": {
+                "created_at": memory.created_at,
+                "updated_at": memory.updated_at,
+            },
+        }
+        for idx, memory in enumerate(memories)
+    ]
+    _encrypt_memory_items(items, user.id)
+    VECTOR_DB_CLIENT.upsert(collection_name=f"user-memory-{user.id}", items=items)
 
     return True
 
@@ -277,20 +290,19 @@ async def update_memory_by_id(
     if form_data.content is not None:
         vector = await request.app.state.EMBEDDING_FUNCTION(memory.content, user=user)
 
-        VECTOR_DB_CLIENT.upsert(
-            collection_name=f"user-memory-{user.id}",
-            items=[
-                {
-                    "id": memory.id,
-                    "text": memory.content,
-                    "vector": vector,
-                    "metadata": {
-                        "created_at": memory.created_at,
-                        "updated_at": memory.updated_at,
-                    },
-                }
-            ],
-        )
+        items = [
+            {
+                "id": memory.id,
+                "text": memory.content,
+                "vector": vector,
+                "metadata": {
+                    "created_at": memory.created_at,
+                    "updated_at": memory.updated_at,
+                },
+            }
+        ]
+        _encrypt_memory_items(items, user.id)
+        VECTOR_DB_CLIENT.upsert(collection_name=f"user-memory-{user.id}", items=items)
 
     return memory
 
