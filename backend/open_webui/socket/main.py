@@ -37,7 +37,7 @@ from open_webui.env import (
     WEBSOCKET_SERVER_PING_INTERVAL,
     WEBSOCKET_SERVER_LOGGING,
     WEBSOCKET_SERVER_ENGINEIO_LOGGING,
-    DEK_CACHE_CLEANUP_INTERVAL,
+    EXPIRING_CACHE_CLEANUP_INTERVAL,
 )
 from open_webui.utils.auth import decode_token
 from open_webui.socket.utils import RedisDict, RedisLock, YdocManager
@@ -50,6 +50,7 @@ from open_webui.env import (
 )
 
 from open_webui.utils.crypto_context import purge_expired_sessions
+from open_webui.utils.vem_crypto import purge_expired_vems
 
 logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
 log = logging.getLogger(__name__)
@@ -165,7 +166,7 @@ YDOC_MANAGER = YdocManager(
 
 def periodic_tasks():
     _ = asyncio.create_task(periodic_usage_pool_cleanup())
-    _ = asyncio.create_task(periodic_dek_cache_cleanup())
+    _ = asyncio.create_task(periodic_expiring_cache_cleanup())
 
 
 async def periodic_usage_pool_cleanup():
@@ -226,11 +227,13 @@ app = socketio.ASGIApp(
 )
 
 
-async def periodic_dek_cache_cleanup():
+async def periodic_expiring_cache_cleanup():
     while True:
-        purge_expired_sessions(time.time())
+        now = time.time()
+        purge_expired_sessions(now)
+        purge_expired_vems(now)
 
-        await asyncio.sleep(DEK_CACHE_CLEANUP_INTERVAL)
+        await asyncio.sleep(EXPIRING_CACHE_CLEANUP_INTERVAL)
 
 
 def get_models_in_use():

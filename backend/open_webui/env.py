@@ -925,6 +925,11 @@ PIP_PACKAGE_INDEX_OPTIONS = os.getenv("PIP_PACKAGE_INDEX_OPTIONS", "").split()
 
 EXTERNAL_PWA_MANIFEST_URL = os.environ.get("EXTERNAL_PWA_MANIFEST_URL")
 
-DEK_CACHE_CLEANUP_INTERVAL = int(
-    os.environ.get("DEK_CACHE_CLEANUP_INTERVAL", 60 * 60 * 24)
+
+####################################
+# EXPIRING CACHE CLEANUP OPTIONS
+####################################
+
+EXPIRING_CACHE_CLEANUP_INTERVAL = int(
+    os.environ.get("EXPIRING_CACHE_CLEANUP_INTERVAL", 60 * 60 * 24)
 )
