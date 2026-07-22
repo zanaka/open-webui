@@ -26,6 +26,7 @@ from open_webui.utils.rag_crypto import (
     decrypt_result_for_collection,
     encrypt_items,
     encrypt_items_for_collection,
+    redact_metadatas_for_log,
 )
 
 
@@ -111,6 +112,25 @@ class TestChunkCryptoPrimitives:
         encrypt_items(items, generate_dek())
         with pytest.raises(Exception):
             decrypt_result(_result_from(items), generate_dek())
+
+
+class TestRedactMetadatasForLog:
+    def test_masks_filename_fields(self):
+        metadatas = [[{"name": "report.pdf", "source": "report.pdf", "page": 3}]]
+        out = redact_metadatas_for_log(metadatas)
+        assert out[0][0]["name"] == "<redacted>"
+        assert out[0][0]["source"] == "<redacted>"
+        assert out[0][0]["page"] == 3
+
+    def test_does_not_mutate_input(self):
+        metadatas = [[{"name": "report.pdf", "page": 3}]]
+        redact_metadatas_for_log(metadatas)
+        assert metadatas[0][0]["name"] == "report.pdf"
+
+    def test_handles_empty_and_non_dict(self):
+        assert redact_metadatas_for_log([]) == []
+        assert redact_metadatas_for_log(None) is None
+        assert redact_metadatas_for_log([[None]]) == [[None]]
 
 
 @dataclass

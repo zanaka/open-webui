@@ -21,7 +21,10 @@ from langchain_core.documents import Document
 
 from open_webui.config import VECTOR_DB
 from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
-from open_webui.utils.rag_crypto import decrypt_result_for_collection
+from open_webui.utils.rag_crypto import (
+    decrypt_result_for_collection,
+    redact_metadatas_for_log,
+)
 from open_webui.utils.vem_crypto import rotate_query_for_collection
 
 
@@ -314,7 +317,7 @@ async def query_doc_with_hybrid_search(
 
         log.info(
             "query_doc_with_hybrid_search:result "
-            + f'{result["metadatas"]} {result["distances"]}'
+            + f'{redact_metadatas_for_log(result["metadatas"])} {result["distances"]}'
         )
         return result
     except Exception as e:
