@@ -21,7 +21,9 @@ from open_webui.utils.crypto_utils import (
 # Importing this module registers the SQLAlchemy event listeners globally
 # for the File model. All File operations in this test module then go
 # through the encryption hooks.
-import open_webui.utils.file_hooks  # noqa: F401
+from open_webui.utils.encrypted_models import install as install_column_encryption
+
+install_column_encryption()
 
 
 USER_ID = "test-user"

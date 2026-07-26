@@ -1,0 +1,126 @@
+"""Which model columns are encrypted at rest, and the hooks that do it.
+
+One declarative table rather than a hand-written hook module per model. Adding a
+model is a line in ENCRYPTED_MODELS; leaving one out is caught at startup by
+assert_models_are_covered(), so a model carrying user content cannot quietly
+join the schema in the clear.
+
+Every model is keyed by its owner's DEK and access is refused unless the owner
+is the user making the request.
+"""
+
+import logging
+from dataclasses import dataclass
+
+from sqlalchemy import event
+
+from open_webui.models.chats import Chat
+from open_webui.models.files import File
+from open_webui.models.memories import Memory
+from open_webui.utils.crypto_context import require_current_user_dek
+from open_webui.utils.crypto_utils import (
+    decrypt_json_value,
+    decrypt_text,
+    encrypt_json_value,
+    encrypt_text,
+)
+
+log = logging.getLogger(__name__)
+
+_PLAINTEXT_STASH = "_plaintext_before_encrypt"
+
+
+@dataclass(frozen=True)
+class EncryptionPolicy:
+    """Whose key opens a row, and which of its columns are encrypted."""
+
+    owner: str
+    text: tuple[str, ...] = ()
+    json: tuple[str, ...] = ()
+
+    @property
+    def columns(self) -> tuple[str, ...]:
+        return self.text + self.json
+
+
+ENCRYPTED_MODELS: dict[type, EncryptionPolicy] = {
+    Chat: EncryptionPolicy(owner="user_id", text=("title",), json=("chat",)),
+    File: EncryptionPolicy(owner="user_id", text=("filename",), json=("data", "meta")),
+    Memory: EncryptionPolicy(owner="user_id", text=("content",)),
+}
+
+
+def _encrypt(target, policy: EncryptionPolicy) -> None:
+    dek = require_current_user_dek(getattr(target, policy.owner))
+
+    # Kept so the caller's own object still reads as plaintext after the flush.
+    stash = {column: getattr(target, column) for column in policy.columns}
+    setattr(target, _PLAINTEXT_STASH, stash)
+
+    for column in policy.text:
+        setattr(target, column, encrypt_text(stash[column], dek))
+    for column in policy.json:
+        setattr(target, column, encrypt_json_value(stash[column], dek))
+
+
+def _decrypt(target, policy: EncryptionPolicy) -> None:
+    dek = require_current_user_dek(getattr(target, policy.owner))
+
+    for column in policy.text:
+        setattr(target, column, decrypt_text(getattr(target, column), dek))
+    for column in policy.json:
+        setattr(target, column, decrypt_json_value(getattr(target, column), dek))
+
+
+def _restore_plaintext(target) -> None:
+    stash = getattr(target, _PLAINTEXT_STASH, None)
+    if stash is None:
+        return
+    for column, value in stash.items():
+        setattr(target, column, value)
+    delattr(target, _PLAINTEXT_STASH)
+
+
+def _register(model: type, policy: EncryptionPolicy) -> None:
+    @event.listens_for(model, "before_insert")
+    def _before_insert(mapper, connection, target):
+        _encrypt(target, policy)
+
+    @event.listens_for(model, "after_insert")
+    def _after_insert(mapper, connection, target):
+        _restore_plaintext(target)
+
+    @event.listens_for(model, "before_update")
+    def _before_update(mapper, connection, target):
+        _encrypt(target, policy)
+
+    @event.listens_for(model, "after_update")
+    def _after_update(mapper, connection, target):
+        _restore_plaintext(target)
+
+    @event.listens_for(model, "load")
+    def _on_load(target, context):
+        _decrypt(target, policy)
+
+    @event.listens_for(model, "refresh")
+    def _on_refresh(target, context, attrs):
+        if attrs is None or any(column in attrs for column in policy.columns):
+            _decrypt(target, policy)
+
+
+_installed = False
+
+
+def install() -> None:
+    """Attach the hooks. Safe to call more than once; listeners register once."""
+    global _installed
+    if _installed:
+        return
+    _installed = True
+
+    for model, policy in ENCRYPTED_MODELS.items():
+        _register(model, policy)
+    log.info(
+        "Column encryption installed for: %s",
+        ", ".join(model.__name__ for model in ENCRYPTED_MODELS),
+    )
