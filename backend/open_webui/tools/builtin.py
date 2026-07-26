@@ -1589,7 +1589,8 @@ async def query_knowledge_bases(
     try:
         import heapq
         from open_webui.models.knowledge import Knowledges
-        from open_webui.routers.knowledge import KNOWLEDGE_BASES_COLLECTION
+        from open_webui.routers.knowledge import kb_meta_collection
+        from open_webui.utils.vector_keys import knowledge_key
         from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
 
         user_id = __user__.get("id")
@@ -1615,32 +1616,34 @@ async def query_knowledge_bases(
 
             accessible_ids = [kb.id for kb in accessible_knowledge_bases.items]
 
-            search_results = VECTOR_DB_CLIENT.search(
-                collection_name=KNOWLEDGE_BASES_COLLECTION,
-                vectors=[query_embedding],
-                filter={"knowledge_base_id": {"$in": accessible_ids}},
-                limit=count,
-            )
+            # Each knowledge base indexes its own name and description, so this
+            # walks the ones the user can reach instead of one shared index.
+            for knowledge_base_id in accessible_ids:
+                if knowledge_base_id in seen_ids:
+                    continue
 
-            if search_results and search_results.ids and search_results.ids[0]:
-                result_ids = search_results.ids[0]
-                result_distances = (
-                    search_results.distances[0]
-                    if search_results.distances
-                    else [0] * len(result_ids)
+                collection_name = kb_meta_collection(knowledge_base_id)
+                if not VECTOR_DB_CLIENT.has_collection(collection_name=collection_name):
+                    continue
+
+                search_results = VECTOR_DB_CLIENT.search(
+                    collection_name=collection_name,
+                    vectors=[query_embedding],
+                    key=knowledge_key(knowledge_base_id, user_id),
+                    limit=1,
                 )
+                if not (search_results and search_results.ids and search_results.ids[0]):
+                    continue
 
-                for knowledge_base_id, distance in zip(result_ids, result_distances):
-                    if knowledge_base_id in seen_ids:
-                        continue
-                    seen_ids.add(knowledge_base_id)
+                distance = (
+                    search_results.distances[0][0] if search_results.distances else 0
+                )
+                seen_ids.add(knowledge_base_id)
 
-                    if len(top_results_heap) < count:
-                        heapq.heappush(top_results_heap, (distance, knowledge_base_id))
-                    elif distance > top_results_heap[0][0]:
-                        heapq.heapreplace(
-                            top_results_heap, (distance, knowledge_base_id)
-                        )
+                if len(top_results_heap) < count:
+                    heapq.heappush(top_results_heap, (distance, knowledge_base_id))
+                elif distance > top_results_heap[0][0]:
+                    heapq.heapreplace(top_results_heap, (distance, knowledge_base_id))
 
             page_offset += page_size
             if len(accessible_knowledge_bases.items) < page_size:

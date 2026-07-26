@@ -1,3 +1,10 @@
+"""Rotating vectors with a collection's key, so the stored geometry is not the
+embedding model's own.
+
+Which key protects which collection is decided by the caller, not here; see
+open_webui.utils.vector_keys.
+"""
+
 import hashlib
 import hmac
 import logging
@@ -7,11 +14,6 @@ from collections import OrderedDict
 from typing import Optional
 
 import numpy as np
-from sqlalchemy.orm import Session
-
-from open_webui.models.knowledge import KnowledgeKeys
-from open_webui.utils.crypto_context import get_cached_dek, get_current_user_id
-from open_webui.utils.knowledge_crypto import resolve_kdek
 
 try:
     from threadpoolctl import threadpool_limits
@@ -21,7 +23,6 @@ except Exception:
 log = logging.getLogger(__name__)
 
 _VEM_INFO = b"owui-vem-rotation-v1"
-_USER_COLLECTION_PREFIXES = ("file-",)
 
 _MATRIX_CACHE_MAX_BYTES = 1024 * 1024 * 1024  # 1 GB ceiling
 _matrix_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
@@ -98,54 +99,24 @@ def purge_expired_vems(now: float) -> None:
             _cache_bytes -= matrix.nbytes
 
 
-def _resolve_vem_key(
-    collection_name: str, user_id: Optional[str], db: Optional[Session] = None
-) -> Optional[bytes]:
-    # Shared knowledge collections are keyed by the per-knowledge KDEK.
-    if KnowledgeKeys.get_user_ids(collection_name, db=db):
-        if user_id is None:
-            return None
-        try:
-            return resolve_kdek(collection_name, user_id, db=db)
-        except Exception as e:
-            log.debug(f"VEM: could not resolve KDEK for {collection_name}: {e}")
-            return None
-    # User-specific collections are keyed by the owner's DEK.
-    if collection_name.startswith(_USER_COLLECTION_PREFIXES):
-        if user_id is None:
-            return None
-        return get_cached_dek(user_id)
-    return None
+def rotate_vectors(vectors: list, key: bytes) -> list:
+    """Rotate vectors into the key's frame of reference."""
+    if not vectors:
+        return vectors
+    matrix = _resolve_matrix(key, len(vectors[0]))
+    return (np.asarray(vectors, dtype=float) @ matrix.T).tolist()
 
 
-def rotate_items_for_collection(
-    collection_name: str,
-    user_id: Optional[str],
-    items: list[dict],
-    db: Optional[Session] = None,
-) -> None:
+def rotate_items(items: list[dict], key: bytes) -> None:
+    """Rotate each item's vector in place."""
     if not items:
         return
-    key = _resolve_vem_key(collection_name, user_id, db=db)
-    if key is None:
-        return
+
     vectors = [item.get("vector") for item in items]
-    if any(v is None for v in vectors):
-        return
-    matrix = _resolve_matrix(key, len(vectors[0]))
-    rotated = np.asarray(vectors, dtype=float) @ matrix.T
-    for item, row in zip(items, rotated):
-        item["vector"] = row.tolist()
+    if any(vector is None for vector in vectors):
+        raise ValueError("Cannot rotate items: some carry no vector.")
+
+    for item, rotated in zip(items, rotate_vectors(vectors, key)):
+        item["vector"] = rotated
 
 
-def rotate_query_for_collection(collection_name: str, query_embedding: list):
-    if not query_embedding:
-        return query_embedding
-    user_id = get_current_user_id()
-    if not user_id:
-        return query_embedding
-    key = _resolve_vem_key(collection_name, user_id)
-    if key is None:
-        return query_embedding
-    matrix = _resolve_matrix(key, len(query_embedding))
-    return (np.asarray(query_embedding, dtype=float) @ matrix.T).tolist()

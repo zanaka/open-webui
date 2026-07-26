@@ -10,7 +10,7 @@ from open_webui.models.files import File
 from open_webui.models.knowledge import Knowledge, KnowledgeFile, Knowledges
 from open_webui.models.users import User
 from open_webui.utils import crypto_context
-from open_webui.utils.crypto_context import cache_dek
+from open_webui.utils.crypto_context import cache_dek, set_current_user_id
 from open_webui.utils.crypto_utils import generate_dek
 
 # Ensure File ORM load/save operations transparently encrypt/decrypt columns.
@@ -37,9 +37,11 @@ def db(monkeypatch):
     SessionLocal = sessionmaker(bind=engine)
     session = SessionLocal()
     cache_dek(USER_ID, generate_dek(), jti="jti-1", expires_at=time.time() + 3600)
+    set_current_user_id(USER_ID)
     _insert_user(session)
     _insert_knowledge(session)
     yield session
+    set_current_user_id(None)
     session.close()
     engine.dispose()
     crypto_context._dek_cache.clear()

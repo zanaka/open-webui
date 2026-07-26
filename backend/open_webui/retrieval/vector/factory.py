@@ -1,3 +1,4 @@
+from open_webui.retrieval.vector.encrypting_client import EncryptingVectorClient
 from open_webui.retrieval.vector.main import VectorDBBase
 from open_webui.retrieval.vector.type import VectorType
 from open_webui.config import (
@@ -79,4 +80,6 @@ class Vector:
                 raise ValueError(f"Unsupported vector type: {vector_type}")
 
 
-VECTOR_DB_CLIENT = Vector.get_vector(VECTOR_DB)
+# Everything goes through the encrypting wrapper: the raw connector is never
+# handed out, so there is no way to reach storage without a key.
+VECTOR_DB_CLIENT = EncryptingVectorClient(Vector.get_vector(VECTOR_DB))

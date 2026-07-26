@@ -1,32 +1,17 @@
 import time
-from dataclasses import dataclass
 
 import numpy as np
 import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
 
-from open_webui.internal import db as internal_db
-from open_webui.internal.db import Base
-from open_webui.models.auths import Auth, Auths
-from open_webui.models.users import User
-from open_webui.models.knowledge import (
-    Knowledge,
-    KnowledgeForm,
-    KnowledgeKey,
-    Knowledges,
-)
 from open_webui.utils import vem_crypto
-from open_webui.utils.crypto_context import cache_dek, set_current_user_id
 from open_webui.utils.crypto_utils import generate_dek
-from open_webui.utils.knowledge_crypto import create_owner_kdek
 from open_webui.utils.vem_crypto import (
     _build_matrix,
     _resolve_matrix,
     _seed_from_key,
     purge_expired_vems,
-    rotate_items_for_collection,
-    rotate_query_for_collection,
+    rotate_items,
+    rotate_vectors,
 )
 
 
@@ -72,163 +57,61 @@ class TestMatrix:
         assert _resolve_matrix(key, 16) is _resolve_matrix(key, 16)
 
 
-@dataclass
-class Accounts:
-    session: object
-    a: str
-    b: str
-
-
-@pytest.fixture(scope="module")
-def accounts() -> Accounts:
-    mp = pytest.MonkeyPatch()
-    mp.setattr(internal_db, "DATABASE_ENABLE_SESSION_SHARING", True)
-
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(
-        engine,
-        tables=[
-            User.__table__,
-            Auth.__table__,
-            Knowledge.__table__,
-            KnowledgeKey.__table__,
-        ],
-    )
-    session = sessionmaker(bind=engine)()
-
-    ids = {}
-    for key, pw in (("a", "a-pass-aaa"), ("b", "b-pass-bbb")):
-        u = Auths.insert_new_auth(
-            email=f"{key}@example.com",
-            hashed_password=f"hashed::{key}",
-            name=key.upper(),
-            raw_password=pw,
-            role="user",
-            db=session,
-        )
-        cache_dek(u.user.id, u.dek, f"jti-{key}", time.time() + 3600)
-        ids[key] = u.user.id
-
-    yield Accounts(session=session, a=ids["a"], b=ids["b"])
-
-    session.close()
-    engine.dispose()
-    mp.undo()
-
-
-@pytest.fixture
-def knowledge(accounts):
-    k = Knowledges.insert_new_knowledge(
-        accounts.a,
-        KnowledgeForm(name="KB", description="d", access_control={}),
-        db=accounts.session,
-    )
-    kdek = create_owner_kdek(k.id, accounts.a, db=accounts.session)
-    return k.id, kdek
-
-
-def _sample_vectors(rng):
-    return [list(rng.standard_normal(8)) for _ in range(5)]
-
-
-class TestCollectionRotation:
-    def test_knowledge_rotation_preserves_distances(self, accounts, knowledge):
-        kid, _ = knowledge
-        rng = np.random.default_rng(0)
-        vectors = _sample_vectors(rng)
-        originals = [list(v) for v in vectors]
-        items = _items(vectors)
-
-        rotate_items_for_collection(kid, accounts.a, items, db=accounts.session)
-
-        # Vectors are actually rotated...
-        assert items[0]["vector"] != originals[0]
-        # ...but every pairwise distance is preserved (orthogonal rotation).
-        for i in range(len(items)):
-            for j in range(i + 1, len(items)):
-                assert _dist(items[i]["vector"], items[j]["vector"]) == pytest.approx(
-                    _dist(originals[i], originals[j]), abs=1e-4
-                )
-
-    def test_query_and_stored_rotated_same_matrix_keep_nn(self, accounts, knowledge):
-        kid, kdek = knowledge
-        rng = np.random.default_rng(1)
-        originals = _sample_vectors(rng)
-        query = list(rng.standard_normal(8))
-        items = _items([list(v) for v in originals])
-
-        rotate_items_for_collection(kid, accounts.a, items, db=accounts.session)
-        q_matrix = _build_matrix(_seed_from_key(kdek), 8)
-        rotated_query = (np.asarray(query) @ q_matrix.T).tolist()
-
-        plain_nn = sorted(range(len(originals)), key=lambda i: _dist(originals[i], query))
-        rot_nn = sorted(
-            range(len(items)),
-            key=lambda i: _dist(items[i]["vector"], rotated_query),
-        )
-        assert plain_nn == rot_nn
-
-    def test_user_file_collection_rotates_with_dek(self, accounts):
-        rng = np.random.default_rng(2)
-        vectors = _sample_vectors(rng)
-        originals = [list(v) for v in vectors]
-        items = _items(vectors)
-
-        rotate_items_for_collection(
-            "file-abc", accounts.a, items, db=accounts.session
-        )
-        assert items[0]["vector"] != originals[0]
-        assert _dist(items[0]["vector"], items[1]["vector"]) == pytest.approx(
-            _dist(originals[0], originals[1]), abs=1e-4
-        )
-
-    def test_non_vem_collection_is_passthrough(self, accounts):
-        rng = np.random.default_rng(3)
-        vectors = _sample_vectors(rng)
-        originals = [list(v) for v in vectors]
-        items = _items(vectors)
-
-        rotate_items_for_collection(
-            "web-search-xyz", accounts.a, items, db=accounts.session
-        )
-        assert items[0]["vector"] == originals[0]
-
-
-class TestQueryRotation:
-    def test_no_current_user_passes_through(self):
-        set_current_user_id(None)
-        q = [0.1, 0.2, 0.3]
-        assert rotate_query_for_collection("kid", q) == q
-
-    def test_no_key_passes_through(self, monkeypatch):
-        monkeypatch.setattr(vem_crypto, "_resolve_vem_key", lambda c, u, db=None: None)
-        set_current_user_id("u1")
-        try:
-            q = [0.1, 0.2, 0.3]
-            assert rotate_query_for_collection("kid", q) == q
-        finally:
-            set_current_user_id(None)
-
-    def test_rotates_consistently_with_key(self, monkeypatch):
+class TestRotation:
+    def test_rotation_preserves_distances(self):
         key = generate_dek()
-        monkeypatch.setattr(vem_crypto, "_resolve_vem_key", lambda c, u, db=None: key)
-        set_current_user_id("u1")
-        try:
-            q = list(np.random.default_rng(4).standard_normal(8))
-            out = rotate_query_for_collection("kid", q)
-            expected = (np.asarray(q) @ _build_matrix(_seed_from_key(key), 8).T).tolist()
-            assert out != q
-            assert np.allclose(out, expected)
-        finally:
-            set_current_user_id(None)
+        a, b = list(np.random.rand(8)), list(np.random.rand(8))
+
+        rotated_a, rotated_b = rotate_vectors([a, b], key)
+
+        assert _dist(rotated_a, rotated_b) == pytest.approx(_dist(a, b), abs=1e-4)
+
+    def test_query_and_stored_use_the_same_matrix(self):
+        key = generate_dek()
+        near = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80]
+        far = [0.90, 0.10, 0.90, 0.10, 0.90, 0.10, 0.90, 0.10]
+        query = [0.11, 0.21, 0.31, 0.41, 0.51, 0.61, 0.71, 0.81]
+
+        rotated_near, rotated_far = rotate_vectors([near, far], key)
+        (rotated_query,) = rotate_vectors([query], key)
+
+        # The nearest neighbour is still the nearest neighbour after rotation.
+        assert _dist(rotated_query, rotated_near) < _dist(rotated_query, rotated_far)
+
+    def test_different_keys_land_elsewhere(self):
+        vector = [0.1] * 8
+
+        (mine,) = rotate_vectors([vector], generate_dek())
+        (theirs,) = rotate_vectors([vector], generate_dek())
+
+        assert not np.allclose(mine, theirs)
+
+    def test_items_are_rotated_in_place(self):
+        key = generate_dek()
+        items = _items([[0.1] * 8])
+        original = list(items[0]["vector"])
+
+        rotate_items(items, key)
+
+        assert items[0]["vector"] != original
+
+    def test_items_without_vectors_are_refused(self):
+        items = [{"id": "c0", "text": "t", "metadata": {}}]
+
+        with pytest.raises(ValueError):
+            rotate_items(items, generate_dek())
+
+    def test_empty_input_is_left_alone(self):
+        key = generate_dek()
+        assert rotate_vectors([], key) == []
+        rotate_items([], key)  # must not raise
 
 
 class TestCache:
-    def test_same_key_collapses_to_one_entry(self, accounts):
-        for name in ("file-a", "file-b", "file-c"):
-            rotate_items_for_collection(
-                name, accounts.a, _items([[0.1] * 8]), db=accounts.session
-            )
+    def test_same_key_collapses_to_one_entry(self):
+        key = generate_dek()
+        for _ in range(3):
+            rotate_items(_items([[0.1] * 8]), key)
         assert len(vem_crypto._matrix_cache) == 1
 
     def test_byte_cap_bounds_size(self, monkeypatch):
