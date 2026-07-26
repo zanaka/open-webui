@@ -1443,8 +1443,9 @@ async def query_knowledge_files(
         from open_webui.models.knowledge import Knowledges
         from open_webui.models.files import Files
         from open_webui.models.notes import Notes
-        from open_webui.retrieval.utils import query_collection
+        from open_webui.retrieval.utils import KeyedCollection, query_collection
         from open_webui.utils.access_control import has_access
+        from open_webui.utils.vector_keys import knowledge_key, owner_key
 
         user_id = __user__.get("id")
         user_role = __user__.get("role", "user")
@@ -1454,7 +1455,7 @@ async def query_knowledge_files(
         if not embedding_function:
             return json.dumps({"error": "Embedding function not configured"})
 
-        collection_names = []
+        collections = []
         note_results = []  # Notes aren't vectorized, handle separately
 
         # If model has attached knowledge, use those
@@ -1473,13 +1474,17 @@ async def query_knowledge_files(
                             user_id, "read", knowledge.access_control, user_group_ids
                         )
                     ):
-                        collection_names.append(item_id)
+                        collections.append(
+                            KeyedCollection(item_id, knowledge_key(item_id, user_id))
+                        )
 
                 elif item_type == "file":
                     # Individual file - use file-{id} as collection name
                     file = Files.get_file_by_id(item_id)
                     if file and (user_role == "admin" or file.user_id == user_id):
-                        collection_names.append(f"file-{item_id}")
+                        collections.append(
+                            KeyedCollection(f"file-{item_id}", owner_key(user_id))
+                        )
 
                 elif item_type == "note":
                     # Note - always return full content as context
@@ -1510,7 +1515,11 @@ async def query_knowledge_files(
                         user_id, "read", knowledge.access_control, user_group_ids
                     )
                 ):
-                    collection_names.append(knowledge_id)
+                    collections.append(
+                        KeyedCollection(
+                            knowledge_id, knowledge_key(knowledge_id, user_id)
+                        )
+                    )
         else:
             # No model knowledge and no specific IDs - search all accessible KBs
             result = Knowledges.search_knowledge_bases(
@@ -1523,7 +1532,12 @@ async def query_knowledge_files(
                 skip=0,
                 limit=50,
             )
-            collection_names = [knowledge_base.id for knowledge_base in result.items]
+            collections = [
+                KeyedCollection(
+                    knowledge_base.id, knowledge_key(knowledge_base.id, user_id)
+                )
+                for knowledge_base in result.items
+            ]
 
         chunks = []
 
@@ -1531,9 +1545,9 @@ async def query_knowledge_files(
         chunks.extend(note_results)
 
         # Query vector collections if any
-        if collection_names:
+        if collections:
             query_results = await query_collection(
-                collection_names=collection_names,
+                collections=collections,
                 queries=[query],
                 embedding_function=embedding_function,
                 k=count,
