@@ -40,16 +40,24 @@ def db(monkeypatch):
     engine.dispose()
 
 
-def _add(db, knowledge_id, name, description="", ts=None):
+def _add(
+    db,
+    knowledge_id,
+    name,
+    description="",
+    ts=None,
+    owner=USER_ID,
+    access_control=None,
+):
     now = ts if ts is not None else int(time.time())
     db.add(
         Knowledge(
             id=knowledge_id,
-            user_id=USER_ID,
+            user_id=owner,
             name=name,
             description=description,
             meta=None,
-            access_control={},
+            access_control={} if access_control is None else access_control,
             created_at=now,
             updated_at=now,
         )
@@ -118,6 +126,32 @@ class TestSearch:
         assert len(result.items) == 1
         # Ordered by updated_at desc, so skipping one lands on the middle entry.
         assert result.items[0].id == "k2"
+
+    def test_a_knowledge_base_shared_with_me_by_name_is_listed(self, db):
+        """Named sharing is the only kind allowed for encrypted knowledge, so it
+        has to be the kind the listing can find."""
+        _add(
+            db,
+            "k1",
+            "Their Falcon",
+            owner="someone-else",
+            access_control={"read": {"user_ids": [USER_ID], "group_ids": []}},
+        )
+
+        result = Knowledges.search_knowledge_bases(
+            USER_ID, filter={"user_id": USER_ID}, db=db
+        )
+
+        assert [item.id for item in result.items] == ["k1"]
+
+    def test_someone_elses_private_knowledge_base_is_not_listed(self, db):
+        _add(db, "k1", "Their Falcon", owner="someone-else", access_control={})
+
+        result = Knowledges.search_knowledge_bases(
+            USER_ID, filter={"user_id": USER_ID}, db=db
+        )
+
+        assert result.items == []
 
     def test_no_query_returns_everything(self, db):
         _add(db, "k1", "Project Falcon")
