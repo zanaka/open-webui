@@ -12,7 +12,13 @@ from open_webui.models.memories import Memory
 from open_webui.utils import crypto_context
 from open_webui.utils.crypto_context import cache_dek, set_current_user_id
 from open_webui.utils.crypto_utils import generate_dek
-from open_webui.utils.encrypted_models import ENCRYPTED_MODELS, install
+from open_webui.utils import encrypted_models
+from open_webui.utils.encrypted_models import (
+    ENCRYPTED_MODELS,
+    UnclassifiedModelError,
+    assert_models_are_covered,
+    install,
+)
 
 install()
 
@@ -154,6 +160,45 @@ class TestRegisteredModels:
         assert MARKER not in _raw(db, model, [column])
         db.expire_all()
         assert getattr(db.query(model).one(), column) == f"{MARKER} changed"
+
+
+class TestCoverage:
+    @staticmethod
+    def _import_every_model():
+        """The check only sees models that have been imported."""
+        import importlib
+        import pkgutil
+
+        import open_webui.config  # noqa: F401  (defines the Config model)
+        import open_webui.models as models
+
+        for module in pkgutil.iter_modules(models.__path__):
+            importlib.import_module(f"open_webui.models.{module.name}")
+
+    def test_every_model_in_the_schema_is_classified(self):
+        self._import_every_model()
+        assert_models_are_covered()
+
+    def test_an_unclassified_model_stops_startup(self, monkeypatch):
+        self._import_every_model()
+        without_note = {
+            name: reason
+            for name, reason in encrypted_models.NOT_ENCRYPTED.items()
+            if name != "Note"
+        }
+        monkeypatch.setattr(encrypted_models, "NOT_ENCRYPTED", without_note)
+
+        with pytest.raises(UnclassifiedModelError, match="Note"):
+            assert_models_are_covered()
+
+    def test_encrypted_and_exempt_do_not_overlap(self):
+        encrypted = {model.__name__ for model in ENCRYPTED_MODELS}
+        assert encrypted.isdisjoint(encrypted_models.NOT_ENCRYPTED)
+
+    def test_every_exemption_states_a_reason(self):
+        assert all(
+            reason.strip() for reason in encrypted_models.NOT_ENCRYPTED.values()
+        )
 
 
 def test_install_is_idempotent(db):
