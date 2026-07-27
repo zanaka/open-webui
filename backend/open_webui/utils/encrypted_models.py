@@ -17,6 +17,7 @@ from sqlalchemy import event
 from open_webui.internal.db import Base
 from open_webui.models.chats import Chat
 from open_webui.models.files import File
+from open_webui.models.folders import Folder
 from open_webui.models.memories import Memory
 from open_webui.utils.crypto_context import require_current_user_dek
 from open_webui.utils.crypto_utils import (
@@ -48,6 +49,9 @@ ENCRYPTED_MODELS: dict[type, EncryptionPolicy] = {
     Chat: EncryptionPolicy(owner="user_id", text=("title",), json=("chat",)),
     File: EncryptionPolicy(owner="user_id", text=("filename",), json=("data", "meta")),
     Memory: EncryptionPolicy(owner="user_id", text=("content",)),
+    Folder: EncryptionPolicy(
+        owner="user_id", text=("name",), json=("items", "meta", "data")
+    ),
 }
 
 
@@ -143,7 +147,6 @@ NOT_ENCRYPTED: dict[str, str] = {
     "Note": "TODO: user content; search filters on the data JSON in SQL",
     "Feedback": "TODO: user content; snapshot embeds the conversation",
     "Prompt": "TODO: user content; looked up by command",
-    "Folder": "TODO: user content; names are matched in SQL during chat search",
     "Tag": "TODO: user content; tags are matched in SQL during chat search",
     "Knowledge": "TODO: name and description; searched in SQL and shared across users",
     "Channel": "TODO: user content; channels are disabled in this deployment",

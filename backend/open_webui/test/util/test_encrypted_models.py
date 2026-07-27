@@ -8,6 +8,7 @@ from open_webui.crypto_exceptions import EncryptedDataAccessDeniedError
 from open_webui.internal.db import Base
 from open_webui.models.chats import Chat
 from open_webui.models.files import File
+from open_webui.models.folders import Folder
 from open_webui.models.memories import Memory
 from open_webui.utils import crypto_context
 from open_webui.utils.crypto_context import cache_dek, set_current_user_id
@@ -50,6 +51,17 @@ BUILDERS = {
         path="/uploads/f1",
         data={"content": f"{MARKER} contents"},
         meta={"name": f"{MARKER}.txt"},
+        created_at=_now(),
+        updated_at=_now(),
+    ),
+    Folder: lambda: Folder(
+        id="fo1",
+        parent_id=None,
+        user_id=OWNER,
+        name=f"{MARKER} folder",
+        items={"chat_ids": [f"{MARKER}-chat"]},
+        meta={"icon": MARKER},
+        data={"note": f"{MARKER} data"},
         created_at=_now(),
         updated_at=_now(),
     ),
