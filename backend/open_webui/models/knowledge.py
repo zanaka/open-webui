@@ -223,15 +223,9 @@ class KnowledgeTable:
                     User, User.id == Knowledge.user_id
                 )
 
+                query_key = None
                 if filter:
                     query_key = filter.get("query")
-                    if query_key:
-                        query = query.filter(
-                            or_(
-                                Knowledge.name.ilike(f"%{query_key}%"),
-                                Knowledge.description.ilike(f"%{query_key}%"),
-                            )
-                        )
 
                     view_option = filter.get("view_option")
                     if view_option == "created":
@@ -243,13 +237,24 @@ class KnowledgeTable:
 
                 query = query.order_by(Knowledge.updated_at.desc())
 
-                total = query.count()
-                if skip:
-                    query = query.offset(skip)
-                if limit:
-                    query = query.limit(limit)
-
                 items = query.all()
+
+                if query_key:
+                    # name and description are matched after they are read, so
+                    # that this keeps working once they are encrypted at rest.
+                    needle = query_key.lower()
+                    items = [
+                        (knowledge_base, user)
+                        for knowledge_base, user in items
+                        if needle in (knowledge_base.name or "").lower()
+                        or needle in (knowledge_base.description or "").lower()
+                    ]
+
+                total = len(items)
+                if skip:
+                    items = items[skip:]
+                if limit:
+                    items = items[:limit]
 
                 knowledge_bases = []
                 for knowledge_base, user in items:
