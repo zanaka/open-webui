@@ -149,11 +149,16 @@ NOT_ENCRYPTED: dict[str, str] = {
     "Prompt": "TODO: user content; looked up by command",
     "Tag": "TODO: user content; tags are matched in SQL during chat search",
     "Knowledge": "TODO: name and description; searched in SQL and shared across users",
-    "Channel": "TODO: user content; channels are disabled in this deployment",
-    "ChannelMember": "TODO: user content; channels are disabled in this deployment",
-    "ChannelWebhook": "TODO: holds a bearer token; channels are disabled here",
-    "Message": "TODO: user content; channels are disabled in this deployment",
-    "MessageReaction": "TODO: emoji names; channels are disabled in this deployment",
+    # The channel feature is closed here rather than encrypted: a channel has
+    # many readers, a public one has no bounded member set, and its inbound
+    # webhook writes messages with no user at all, so no per-user key can cover
+    # it. Every endpoint returns 501 (see routers/channels.py), so these tables
+    # stay empty. Reopening channels means building a per-channel key first.
+    "Channel": "channels are closed; a channel key would be needed, not a user key",
+    "ChannelMember": "channels are closed; membership rows only",
+    "ChannelWebhook": "channels are closed; the token is compared by value anyway",
+    "Message": "channels are closed; messages have many readers and no single owner",
+    "MessageReaction": "channels are closed; emoji names",
 }
 
 
