@@ -11,6 +11,7 @@ from open_webui.models.users import User
 from open_webui.utils import crypto_context
 from open_webui.utils.crypto_context import cache_dek, set_current_user_id
 from open_webui.utils.crypto_utils import generate_dek
+from open_webui.utils.tag_tokens import tag_id
 
 # Ensure Chat ORM load/save operations transparently encrypt/decrypt columns.
 from open_webui.utils.encrypted_models import install as install_column_encryption
@@ -97,7 +98,8 @@ def _insert_chat(
             user_id=USER_ID,
             title=title,
             chat=_chat_json(turns or [("user", "hello")]),
-            meta={"tags": tags or []},
+            # Chats carry tag tokens, not tag names.
+            meta={"tags": [tag_id(name, USER_ID) for name in (tags or [])]},
             pinned=pinned,
             archived=archived,
             created_at=now,
