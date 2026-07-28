@@ -95,8 +95,7 @@ from open_webui.utils.misc import (
 )
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.access_control import has_permission
-from open_webui.utils.rag_crypto import encrypt_items_for_collection
-from open_webui.utils.vem_crypto import rotate_items_for_collection
+from open_webui.utils.vector_keys import knowledge_key, owner_key
 
 from open_webui.config import (
     ENV,
@@ -1380,10 +1379,145 @@ def merge_docs_to_target_size(
     return processed_chunks
 
 
+def split_docs(request: Request, docs: list[Document]) -> list[Document]:
+    """Chunk documents the way the configured splitter is set up to."""
+    if request.app.state.config.ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER:
+        log.info("Using markdown header text splitter")
+        # Define headers to split on - covering most common markdown header levels
+        markdown_splitter = MarkdownHeaderTextSplitter(
+            headers_to_split_on=[
+                ("#", "Header 1"),
+                ("##", "Header 2"),
+                ("###", "Header 3"),
+                ("####", "Header 4"),
+                ("#####", "Header 5"),
+                ("######", "Header 6"),
+            ],
+            strip_headers=False,  # Keep headers in content for context
+        )
+
+        markdown_docs = []
+        for doc in docs:
+            markdown_docs.extend(
+                [
+                    Document(
+                        page_content=split_chunk.page_content,
+                        metadata={**doc.metadata},
+                    )
+                    for split_chunk in markdown_splitter.split_text(doc.page_content)
+                ]
+            )
+
+        docs = markdown_docs
+        if request.app.state.config.CHUNK_MIN_SIZE_TARGET > 0:
+            docs = merge_docs_to_target_size(request, docs)
+
+    if request.app.state.config.TEXT_SPLITTER in ["", "character"]:
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=request.app.state.config.CHUNK_SIZE,
+            chunk_overlap=request.app.state.config.CHUNK_OVERLAP,
+            add_start_index=True,
+        )
+        return text_splitter.split_documents(docs)
+
+    if request.app.state.config.TEXT_SPLITTER == "token":
+        log.info(
+            f"Using token text splitter: {request.app.state.config.TIKTOKEN_ENCODING_NAME}"
+        )
+
+        tiktoken.get_encoding(str(request.app.state.config.TIKTOKEN_ENCODING_NAME))
+        text_splitter = TokenTextSplitter(
+            encoding_name=str(request.app.state.config.TIKTOKEN_ENCODING_NAME),
+            chunk_size=request.app.state.config.CHUNK_SIZE,
+            chunk_overlap=request.app.state.config.CHUNK_OVERLAP,
+            add_start_index=True,
+        )
+        return text_splitter.split_documents(docs)
+
+    raise ValueError(ERROR_MESSAGES.DEFAULT("Invalid text splitter"))
+
+
+def build_embedding_function(request: Request):
+    return get_embedding_function(
+        request.app.state.config.RAG_EMBEDDING_ENGINE,
+        request.app.state.config.RAG_EMBEDDING_MODEL,
+        request.app.state.ef,
+        (
+            request.app.state.config.RAG_OPENAI_API_BASE_URL
+            if request.app.state.config.RAG_EMBEDDING_ENGINE == "openai"
+            else (
+                request.app.state.config.RAG_OLLAMA_BASE_URL
+                if request.app.state.config.RAG_EMBEDDING_ENGINE == "ollama"
+                else request.app.state.config.RAG_AZURE_OPENAI_BASE_URL
+            )
+        ),
+        (
+            request.app.state.config.RAG_OPENAI_API_KEY
+            if request.app.state.config.RAG_EMBEDDING_ENGINE == "openai"
+            else (
+                request.app.state.config.RAG_OLLAMA_API_KEY
+                if request.app.state.config.RAG_EMBEDDING_ENGINE == "ollama"
+                else request.app.state.config.RAG_AZURE_OPENAI_API_KEY
+            )
+        ),
+        request.app.state.config.RAG_EMBEDDING_BATCH_SIZE,
+        azure_api_version=(
+            request.app.state.config.RAG_AZURE_OPENAI_API_VERSION
+            if request.app.state.config.RAG_EMBEDDING_ENGINE == "azure_openai"
+            else None
+        ),
+        enable_async=request.app.state.config.ENABLE_ASYNC_EMBEDDING,
+    )
+
+
+def rank_docs_in_memory(
+    request: Request, docs: list[Document], queries: list[str], user=None
+) -> list[Document]:
+    """Pick the chunks most relevant to the queries, without storing anything.
+
+    Web results belong to one request and are never looked at again, so they are
+    chunked and ranked here in RAM and then dropped. Nothing reaches the vector
+    store, which also means no two users can ever land in the same collection.
+    """
+    import numpy as np
+
+    from open_webui.config import RAG_EMBEDDING_QUERY_PREFIX
+
+    docs = split_docs(request, docs)
+    k = request.app.state.config.TOP_K
+    if len(docs) <= k or not queries:
+        return docs
+
+    embedding_function = build_embedding_function(request)
+    doc_vectors = asyncio.run(
+        embedding_function(
+            [doc.page_content.replace("\n", " ") for doc in docs],
+            prefix=RAG_EMBEDDING_CONTENT_PREFIX,
+            user=user,
+        )
+    )
+    query_vectors = asyncio.run(
+        embedding_function(queries, prefix=RAG_EMBEDDING_QUERY_PREFIX, user=user)
+    )
+
+    documents = np.asarray(doc_vectors, dtype=float)
+    searches = np.asarray(query_vectors, dtype=float)
+    documents /= np.linalg.norm(documents, axis=1, keepdims=True) + 1e-12
+    searches /= np.linalg.norm(searches, axis=1, keepdims=True) + 1e-12
+
+    # Best score across the queries, so a chunk matching any one of them survives.
+    scores = (searches @ documents.T).max(axis=0)
+    keep = sorted(np.argsort(-scores)[:k].tolist())
+    log.info(f"ranked {len(docs)} web chunks in memory, keeping {len(keep)}")
+    return [docs[idx] for idx in keep]
+
+
 def save_docs_to_vector_db(
     request: Request,
     docs,
     collection_name,
+    *,
+    key: bytes,
     metadata: Optional[dict] = None,
     overwrite: bool = False,
     split: bool = True,
@@ -1415,6 +1549,7 @@ def save_docs_to_vector_db(
         result = VECTOR_DB_CLIENT.query(
             collection_name=collection_name,
             filter={"hash": metadata["hash"]},
+            key=key,
         )
 
         if result is not None and result.ids and len(result.ids) > 0:
@@ -1424,61 +1559,7 @@ def save_docs_to_vector_db(
                 raise ValueError(ERROR_MESSAGES.DUPLICATE_CONTENT)
 
     if split:
-        if request.app.state.config.ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER:
-            log.info("Using markdown header text splitter")
-            # Define headers to split on - covering most common markdown header levels
-            markdown_splitter = MarkdownHeaderTextSplitter(
-                headers_to_split_on=[
-                    ("#", "Header 1"),
-                    ("##", "Header 2"),
-                    ("###", "Header 3"),
-                    ("####", "Header 4"),
-                    ("#####", "Header 5"),
-                    ("######", "Header 6"),
-                ],
-                strip_headers=False,  # Keep headers in content for context
-            )
-
-            split_docs = []
-            for doc in docs:
-                split_docs.extend(
-                    [
-                        Document(
-                            page_content=split_chunk.page_content,
-                            metadata={**doc.metadata},
-                        )
-                        for split_chunk in markdown_splitter.split_text(
-                            doc.page_content
-                        )
-                    ]
-                )
-
-            docs = split_docs
-            if request.app.state.config.CHUNK_MIN_SIZE_TARGET > 0:
-                docs = merge_docs_to_target_size(request, docs)
-
-        if request.app.state.config.TEXT_SPLITTER in ["", "character"]:
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=request.app.state.config.CHUNK_SIZE,
-                chunk_overlap=request.app.state.config.CHUNK_OVERLAP,
-                add_start_index=True,
-            )
-            docs = text_splitter.split_documents(docs)
-        elif request.app.state.config.TEXT_SPLITTER == "token":
-            log.info(
-                f"Using token text splitter: {request.app.state.config.TIKTOKEN_ENCODING_NAME}"
-            )
-
-            tiktoken.get_encoding(str(request.app.state.config.TIKTOKEN_ENCODING_NAME))
-            text_splitter = TokenTextSplitter(
-                encoding_name=str(request.app.state.config.TIKTOKEN_ENCODING_NAME),
-                chunk_size=request.app.state.config.CHUNK_SIZE,
-                chunk_overlap=request.app.state.config.CHUNK_OVERLAP,
-                add_start_index=True,
-            )
-            docs = text_splitter.split_documents(docs)
-        else:
-            raise ValueError(ERROR_MESSAGES.DEFAULT("Invalid text splitter"))
+        docs = split_docs(request, docs)
 
     if len(docs) == 0:
         raise ValueError(ERROR_MESSAGES.EMPTY_CONTENT)
@@ -1510,36 +1591,7 @@ def save_docs_to_vector_db(
                 return True
 
         log.info(f"generating embeddings for {collection_name}")
-        embedding_function = get_embedding_function(
-            request.app.state.config.RAG_EMBEDDING_ENGINE,
-            request.app.state.config.RAG_EMBEDDING_MODEL,
-            request.app.state.ef,
-            (
-                request.app.state.config.RAG_OPENAI_API_BASE_URL
-                if request.app.state.config.RAG_EMBEDDING_ENGINE == "openai"
-                else (
-                    request.app.state.config.RAG_OLLAMA_BASE_URL
-                    if request.app.state.config.RAG_EMBEDDING_ENGINE == "ollama"
-                    else request.app.state.config.RAG_AZURE_OPENAI_BASE_URL
-                )
-            ),
-            (
-                request.app.state.config.RAG_OPENAI_API_KEY
-                if request.app.state.config.RAG_EMBEDDING_ENGINE == "openai"
-                else (
-                    request.app.state.config.RAG_OLLAMA_API_KEY
-                    if request.app.state.config.RAG_EMBEDDING_ENGINE == "ollama"
-                    else request.app.state.config.RAG_AZURE_OPENAI_API_KEY
-                )
-            ),
-            request.app.state.config.RAG_EMBEDDING_BATCH_SIZE,
-            azure_api_version=(
-                request.app.state.config.RAG_AZURE_OPENAI_API_VERSION
-                if request.app.state.config.RAG_EMBEDDING_ENGINE == "azure_openai"
-                else None
-            ),
-            enable_async=request.app.state.config.ENABLE_ASYNC_EMBEDDING,
-        )
+        embedding_function = build_embedding_function(request)
 
         # Run async embedding in sync context
         embeddings = asyncio.run(
@@ -1561,17 +1613,11 @@ def save_docs_to_vector_db(
             for idx, text in enumerate(texts)
         ]
 
-        encrypt_items_for_collection(
-            collection_name, user.id if user is not None else None, items
-        )
-        rotate_items_for_collection(
-            collection_name, user.id if user is not None else None, items
-        )
-
         log.info(f"adding to collection {collection_name}")
         VECTOR_DB_CLIENT.insert(
             collection_name=collection_name,
             items=items,
+            key=key,
         )
 
         log.info(f"added {len(items)} items to collection {collection_name}")
@@ -1605,7 +1651,12 @@ def process_file(
             collection_name = form_data.collection_name
 
             if collection_name is None:
+                # The file's own chunks, kept under its owner's key.
                 collection_name = f"file-{file.id}"
+                collection_key = owner_key(user.id)
+            else:
+                # Going into a knowledge base, so keyed by that knowledge base.
+                collection_key = knowledge_key(collection_name, user.id, db=db)
 
             if form_data.content:
                 # Update the content in the file
@@ -1638,8 +1689,12 @@ def process_file(
                 # Check if the file has already been processed and save the content
                 # Usage: /knowledge/{id}/file/add, /knowledge/{id}/file/update
 
+                # Read back under the file's own key; the chunks are re-encrypted
+                # under the knowledge base's key when they are inserted below.
                 result = VECTOR_DB_CLIENT.query(
-                    collection_name=f"file-{file.id}", filter={"file_id": file.id}
+                    collection_name=f"file-{file.id}",
+                    filter={"file_id": file.id},
+                    key=owner_key(user.id),
                 )
 
                 if result is not None and len(result.ids[0]) > 0:
@@ -1758,6 +1813,7 @@ def process_file(
                         request,
                         docs=docs,
                         collection_name=collection_name,
+                        key=collection_key,
                         metadata={
                             "file_id": file.id,
                             "name": file.filename,
@@ -1839,9 +1895,9 @@ async def process_text(
     form_data: ProcessTextForm,
     user=Depends(get_verified_user),
 ):
-    collection_name = form_data.collection_name
-    if collection_name is None:
-        collection_name = calculate_sha256_string(form_data.content)
+    # Derived from the owner as well as the content, so two users pasting the same
+    # text never end up sharing one collection encrypted under two different keys.
+    collection_name = calculate_sha256_string(f"{user.id}:{form_data.content}")
 
     docs = [
         Document(
@@ -1853,7 +1909,12 @@ async def process_text(
     log.debug(f"text_content: {text_content}")
 
     result = await run_in_threadpool(
-        save_docs_to_vector_db, request, docs, collection_name, user=user
+        save_docs_to_vector_db,
+        request,
+        docs,
+        collection_name,
+        key=owner_key(user.id),
+        user=user,
     )
     if result:
         return {
@@ -1883,9 +1944,9 @@ async def process_web(
         log.debug(f"text_content: {content}")
 
         if process:
-            collection_name = form_data.collection_name
-            if not collection_name:
-                collection_name = calculate_sha256_string(form_data.url)[:63]
+            # Derived from the owner as well as the URL, so two users reading the
+            # same page never share one collection encrypted under two keys.
+            collection_name = calculate_sha256_string(f"{user.id}:{form_data.url}")[:63]
 
             if not request.app.state.config.BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL:
                 await run_in_threadpool(
@@ -1893,6 +1954,7 @@ async def process_web(
                     request,
                     docs,
                     collection_name,
+                    key=owner_key(user.id),
                     overwrite=True,
                     user=user,
                 )
@@ -2358,30 +2420,24 @@ async def process_web_search(
                 "loaded_count": len(docs),
             }
         else:
-            # Create a single collection for all documents
-            collection_name = (
-                f"web-search-{calculate_sha256_string('-'.join(form_data.queries))}"[
-                    :63
-                ]
+            # Web results serve this one request, so they are ranked in memory and
+            # dropped. Nothing is stored, so two users can never share a collection.
+            docs = await run_in_threadpool(
+                rank_docs_in_memory, request, docs, form_data.queries, user
             )
-
-            try:
-                await run_in_threadpool(
-                    save_docs_to_vector_db,
-                    request,
-                    docs,
-                    collection_name,
-                    overwrite=True,
-                    user=user,
-                )
-            except Exception as e:
-                log.debug(f"error saving docs: {e}")
 
             return {
                 "status": True,
-                "collection_names": [collection_name],
+                "collection_name": None,
                 "items": result_items,
                 "filenames": urls,
+                "docs": [
+                    {
+                        "content": doc.page_content,
+                        "metadata": doc.metadata,
+                    }
+                    for doc in docs
+                ],
                 "loaded_count": len(docs),
             }
     except Exception as e:
@@ -2407,61 +2463,12 @@ async def query_doc_handler(
     form_data: QueryDocForm,
     user=Depends(get_verified_user),
 ):
-    try:
-        if request.app.state.config.ENABLE_RAG_HYBRID_SEARCH and (
-            form_data.hybrid is None or form_data.hybrid
-        ):
-            collection_results = {}
-            collection_results[form_data.collection_name] = VECTOR_DB_CLIENT.get(
-                collection_name=form_data.collection_name
-            )
-            return await query_doc_with_hybrid_search(
-                collection_name=form_data.collection_name,
-                collection_result=collection_results[form_data.collection_name],
-                query=form_data.query,
-                embedding_function=lambda query, prefix: request.app.state.EMBEDDING_FUNCTION(
-                    query, prefix=prefix, user=user
-                ),
-                k=form_data.k if form_data.k else request.app.state.config.TOP_K,
-                reranking_function=(
-                    (
-                        lambda query, documents: request.app.state.RERANKING_FUNCTION(
-                            query, documents, user=user
-                        )
-                    )
-                    if request.app.state.RERANKING_FUNCTION
-                    else None
-                ),
-                k_reranker=form_data.k_reranker
-                or request.app.state.config.TOP_K_RERANKER,
-                r=(
-                    form_data.r
-                    if form_data.r
-                    else request.app.state.config.RELEVANCE_THRESHOLD
-                ),
-                hybrid_bm25_weight=(
-                    form_data.hybrid_bm25_weight
-                    if form_data.hybrid_bm25_weight
-                    else request.app.state.config.HYBRID_BM25_WEIGHT
-                ),
-                user=user,
-            )
-        else:
-            query_embedding = await request.app.state.EMBEDDING_FUNCTION(
-                form_data.query, prefix=RAG_EMBEDDING_QUERY_PREFIX, user=user
-            )
-            return query_doc(
-                collection_name=form_data.collection_name,
-                query_embedding=query_embedding,
-                k=form_data.k if form_data.k else request.app.state.config.TOP_K,
-                user=user,
-            )
-    except Exception as e:
-        log.exception(e)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=ERROR_MESSAGES.DEFAULT(e),
-        )
+    # Naming an arbitrary collection says nothing about whose data it holds, so
+    # there is no key to open it with. Nothing in the UI calls this.
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail="Querying a collection by name is unavailable: the request does not say which key protects it.",
+    )
 
 
 class QueryCollectionsForm(BaseModel):
@@ -2481,60 +2488,12 @@ async def query_collection_handler(
     form_data: QueryCollectionsForm,
     user=Depends(get_verified_user),
 ):
-    try:
-        if request.app.state.config.ENABLE_RAG_HYBRID_SEARCH and (
-            form_data.hybrid is None or form_data.hybrid
-        ):
-            return await query_collection_with_hybrid_search(
-                collection_names=form_data.collection_names,
-                queries=[form_data.query],
-                embedding_function=lambda query, prefix: request.app.state.EMBEDDING_FUNCTION(
-                    query, prefix=prefix, user=user
-                ),
-                k=form_data.k if form_data.k else request.app.state.config.TOP_K,
-                reranking_function=(
-                    (
-                        lambda query, documents: request.app.state.RERANKING_FUNCTION(
-                            query, documents, user=user
-                        )
-                    )
-                    if request.app.state.RERANKING_FUNCTION
-                    else None
-                ),
-                k_reranker=form_data.k_reranker
-                or request.app.state.config.TOP_K_RERANKER,
-                r=(
-                    form_data.r
-                    if form_data.r
-                    else request.app.state.config.RELEVANCE_THRESHOLD
-                ),
-                hybrid_bm25_weight=(
-                    form_data.hybrid_bm25_weight
-                    if form_data.hybrid_bm25_weight
-                    else request.app.state.config.HYBRID_BM25_WEIGHT
-                ),
-                enable_enriched_texts=(
-                    form_data.enable_enriched_texts
-                    if form_data.enable_enriched_texts is not None
-                    else request.app.state.config.ENABLE_RAG_HYBRID_SEARCH_ENRICHED_TEXTS
-                ),
-            )
-        else:
-            return await query_collection(
-                collection_names=form_data.collection_names,
-                queries=[form_data.query],
-                embedding_function=lambda query, prefix: request.app.state.EMBEDDING_FUNCTION(
-                    query, prefix=prefix, user=user
-                ),
-                k=form_data.k if form_data.k else request.app.state.config.TOP_K,
-            )
-
-    except Exception as e:
-        log.exception(e)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=ERROR_MESSAGES.DEFAULT(e),
-        )
+    # Same as /query/doc: a list of collection names carries no indication of which
+    # key opens them. Nothing in the UI calls this.
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail="Querying collections by name is unavailable: the request does not say which key protects them.",
+    )
 
 
 ####################################
@@ -2566,7 +2525,7 @@ def delete_entries_from_collection(
 
             VECTOR_DB_CLIENT.delete(
                 collection_name=form_data.collection_name,
-                metadata={"hash": hash},
+                filter={"hash": hash},
             )
             return {"status": True}
         else:
@@ -2695,6 +2654,7 @@ async def process_files_batch(
                 request,
                 all_docs,
                 collection_name,
+                key=knowledge_key(collection_name, user.id, db=db),
                 add=True,
                 user=user,
             )

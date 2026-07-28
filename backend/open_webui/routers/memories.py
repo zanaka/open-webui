@@ -11,26 +11,12 @@ from open_webui.internal.db import get_session
 from sqlalchemy.orm import Session
 
 from open_webui.utils.access_control import has_permission
-from open_webui.utils.crypto_context import get_cached_dek, require_current_user_dek
-from open_webui.utils.rag_crypto import decrypt_result, encrypt_items
+from open_webui.utils.vector_keys import owner_key
 from open_webui.constants import ERROR_MESSAGES
 
 log = logging.getLogger(__name__)
 
 router = APIRouter()
-
-
-def _encrypt_memory_items(items, user_id):
-    if not items:
-        return
-    encrypt_items(items, require_current_user_dek(user_id))
-
-
-def _decrypt_memory_results(results, user_id):
-    dek = get_cached_dek(user_id)
-    if dek is not None:
-        decrypt_result(results, dek)
-    return results
 
 
 @router.get("/ef")
@@ -112,8 +98,9 @@ async def add_memory(
             "metadata": {"created_at": memory.created_at},
         }
     ]
-    _encrypt_memory_items(items, user.id)
-    VECTOR_DB_CLIENT.upsert(collection_name=f"user-memory-{user.id}", items=items)
+    VECTOR_DB_CLIENT.upsert(
+        collection_name=f"user-memory-{user.id}", items=items, key=owner_key(user.id)
+    )
 
     return memory
 
@@ -155,13 +142,12 @@ async def query_memory(
 
     vector = await request.app.state.EMBEDDING_FUNCTION(form_data.content, user=user)
 
-    results = VECTOR_DB_CLIENT.search(
+    return VECTOR_DB_CLIENT.search(
         collection_name=f"user-memory-{user.id}",
         vectors=[vector],
+        key=owner_key(user.id),
         limit=form_data.k,
     )
-
-    return _decrypt_memory_results(results, user.id)
 
 
 ############################
@@ -211,8 +197,9 @@ async def reset_memory_from_vector_db(
         }
         for idx, memory in enumerate(memories)
     ]
-    _encrypt_memory_items(items, user.id)
-    VECTOR_DB_CLIENT.upsert(collection_name=f"user-memory-{user.id}", items=items)
+    VECTOR_DB_CLIENT.upsert(
+        collection_name=f"user-memory-{user.id}", items=items, key=owner_key(user.id)
+    )
 
     return True
 
@@ -301,8 +288,11 @@ async def update_memory_by_id(
                 },
             }
         ]
-        _encrypt_memory_items(items, user.id)
-        VECTOR_DB_CLIENT.upsert(collection_name=f"user-memory-{user.id}", items=items)
+        VECTOR_DB_CLIENT.upsert(
+            collection_name=f"user-memory-{user.id}",
+            items=items,
+            key=owner_key(user.id),
+        )
 
     return memory
 

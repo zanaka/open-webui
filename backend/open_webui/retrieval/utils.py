@@ -1,12 +1,13 @@
 import logging
 import os
-from typing import Awaitable, Optional, Union
+from typing import Awaitable, NamedTuple, Optional, Union
 
 import requests
 import aiohttp
 import asyncio
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 import time
 import re
 
@@ -21,11 +22,15 @@ from langchain_core.documents import Document
 
 from open_webui.config import VECTOR_DB
 from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
-from open_webui.utils.rag_crypto import (
-    decrypt_result_for_collection,
-    redact_metadatas_for_log,
-)
-from open_webui.utils.vem_crypto import rotate_query_for_collection
+from open_webui.utils.rag_crypto import redact_metadatas_for_log
+from open_webui.utils.vector_keys import knowledge_key, owner_key
+
+
+class KeyedCollection(NamedTuple):
+    """A collection together with the key that opens it."""
+
+    name: str
+    key: bytes
 
 
 from open_webui.models.users import UserModel
@@ -95,6 +100,7 @@ def get_content_from_url(request, url: str) -> str:
 
 class VectorSearchRetriever(BaseRetriever):
     collection_name: Any
+    collection_key: Any
     embedding_function: Any
     top_k: int
 
@@ -119,13 +125,12 @@ class VectorSearchRetriever(BaseRetriever):
         run_manager: CallbackManagerForRetrieverRun,
     ) -> list[Document]:
         embedding = await self.embedding_function(query, RAG_EMBEDDING_QUERY_PREFIX)
-        embedding = rotate_query_for_collection(self.collection_name, embedding)
         result = VECTOR_DB_CLIENT.search(
             collection_name=self.collection_name,
             vectors=[embedding],
+            key=self.collection_key,
             limit=self.top_k,
         )
-        result = decrypt_result_for_collection(self.collection_name, result)
 
         ids = result.ids[0]
         metadatas = result.metadatas[0]
@@ -143,37 +148,44 @@ class VectorSearchRetriever(BaseRetriever):
 
 
 def query_doc(
-    collection_name: str, query_embedding: list[float], k: int, user: UserModel = None
+    collection: KeyedCollection,
+    query_embedding: list[float],
+    k: int,
+    user: UserModel = None,
 ):
     try:
-        log.debug(f"query_doc:doc {collection_name}")
-        query_embedding = rotate_query_for_collection(collection_name, query_embedding)
+        log.debug(f"query_doc:doc {collection.name}")
         result = VECTOR_DB_CLIENT.search(
-            collection_name=collection_name,
+            collection_name=collection.name,
             vectors=[query_embedding],
+            key=collection.key,
             limit=k,
         )
 
         if result:
-            log.info(f"query_doc:result {result.ids} {result.metadatas}")
+            log.info(
+                f"query_doc:result {result.ids} {redact_metadatas_for_log(result.metadatas)}"
+            )
 
-        return decrypt_result_for_collection(collection_name, result)
+        return result
     except Exception as e:
-        log.exception(f"Error querying doc {collection_name} with limit {k}: {e}")
+        log.exception(f"Error querying doc {collection.name} with limit {k}: {e}")
         raise e
 
 
-def get_doc(collection_name: str, user: UserModel = None):
+def get_doc(collection: KeyedCollection, user: UserModel = None):
     try:
-        log.debug(f"get_doc:doc {collection_name}")
-        result = VECTOR_DB_CLIENT.get(collection_name=collection_name)
+        log.debug(f"get_doc:doc {collection.name}")
+        result = VECTOR_DB_CLIENT.get(collection_name=collection.name, key=collection.key)
 
         if result:
-            log.info(f"query_doc:result {result.ids} {result.metadatas}")
+            log.info(
+                f"get_doc:result {result.ids} {redact_metadatas_for_log(result.metadatas)}"
+            )
 
-        return decrypt_result_for_collection(collection_name, result)
+        return result
     except Exception as e:
-        log.exception(f"Error getting doc {collection_name}: {e}")
+        log.exception(f"Error getting doc {collection.name}: {e}")
         raise e
 
 
@@ -216,7 +228,7 @@ def get_enriched_texts(collection_result: GetResult) -> list[str]:
 
 
 async def query_doc_with_hybrid_search(
-    collection_name: str,
+    collection: KeyedCollection,
     collection_result: GetResult,
     query: str,
     embedding_function,
@@ -234,7 +246,7 @@ async def query_doc_with_hybrid_search(
             or not hasattr(collection_result, "documents")
             or not hasattr(collection_result, "metadatas")
         ):
-            log.warning(f"query_doc_with_hybrid_search:no_docs {collection_name}")
+            log.warning(f"query_doc_with_hybrid_search:no_docs {collection.name}")
             return {"documents": [], "metadatas": [], "distances": []}
 
         # Now safely check the documents content after confirming attributes exist
@@ -243,10 +255,10 @@ async def query_doc_with_hybrid_search(
             or len(collection_result.documents) == 0
             or not collection_result.documents[0]
         ):
-            log.warning(f"query_doc_with_hybrid_search:no_docs {collection_name}")
+            log.warning(f"query_doc_with_hybrid_search:no_docs {collection.name}")
             return {"documents": [], "metadatas": [], "distances": []}
 
-        log.debug(f"query_doc_with_hybrid_search:doc {collection_name}")
+        log.debug(f"query_doc_with_hybrid_search:doc {collection.name}")
 
         bm25_texts = (
             get_enriched_texts(collection_result)
@@ -261,7 +273,8 @@ async def query_doc_with_hybrid_search(
         bm25_retriever.k = k
 
         vector_search_retriever = VectorSearchRetriever(
-            collection_name=collection_name,
+            collection_name=collection.name,
+            collection_key=collection.key,
             embedding_function=embedding_function,
             top_k=k,
         )
@@ -321,7 +334,7 @@ async def query_doc_with_hybrid_search(
         )
         return result
     except Exception as e:
-        log.exception(f"Error querying doc {collection_name} with hybrid search: {e}")
+        log.exception(f"Error querying doc {collection.name} with hybrid search: {e}")
         raise e
 
 
@@ -393,13 +406,13 @@ def merge_and_sort_query_results(query_results: list[dict], k: int) -> dict:
     }
 
 
-def get_all_items_from_collections(collection_names: list[str]) -> dict:
+def get_all_items_from_collections(collections: list[KeyedCollection]) -> dict:
     results = []
 
-    for collection_name in collection_names:
-        if collection_name:
+    for collection in collections:
+        if collection.name:
             try:
-                result = get_doc(collection_name=collection_name)
+                result = get_doc(collection=collection)
                 if result is not None:
                     results.append(result.model_dump())
             except Exception as e:
@@ -411,7 +424,7 @@ def get_all_items_from_collections(collection_names: list[str]) -> dict:
 
 
 async def query_collection(
-    collection_names: list[str],
+    collections: list[KeyedCollection],
     queries: list[str],
     embedding_function,
     k: int,
@@ -419,11 +432,11 @@ async def query_collection(
     results = []
     error = False
 
-    def process_query_collection(collection_name, query_embedding):
+    def process_query_collection(collection, query_embedding):
         try:
-            if collection_name:
+            if collection.name:
                 result = query_doc(
-                    collection_name=collection_name,
+                    collection=collection,
                     k=k,
                     query_embedding=query_embedding,
                 )
@@ -439,15 +452,20 @@ async def query_collection(
         queries, prefix=RAG_EMBEDDING_QUERY_PREFIX
     )
     log.debug(
-        f"query_collection: processing {len(queries)} queries across {len(collection_names)} collections"
+        f"query_collection: processing {len(queries)} queries across {len(collections)} collections"
     )
 
     with ThreadPoolExecutor() as executor:
         future_results = []
         for query_embedding in query_embeddings:
-            for collection_name in collection_names:
+            for collection in collections:
+                # A fresh context copy per task: worker threads start with an
+                # empty context, which would drop the current user id.
                 result = executor.submit(
-                    process_query_collection, collection_name, query_embedding
+                    copy_context().run,
+                    process_query_collection,
+                    collection,
+                    query_embedding,
                 )
                 future_results.append(result)
         task_results = [future.result() for future in future_results]
@@ -465,7 +483,7 @@ async def query_collection(
 
 
 async def query_collection_with_hybrid_search(
-    collection_names: list[str],
+    collections: list[KeyedCollection],
     queries: list[str],
     embedding_function,
     k: int,
@@ -480,28 +498,27 @@ async def query_collection_with_hybrid_search(
     # Fetch collection data once per collection sequentially
     # Avoid fetching the same data multiple times later
     collection_results = {}
-    for collection_name in collection_names:
+    for collection in collections:
         try:
             log.debug(
-                f"query_collection_with_hybrid_search:VECTOR_DB_CLIENT.get:collection {collection_name}"
+                f"query_collection_with_hybrid_search:VECTOR_DB_CLIENT.get:collection {collection.name}"
             )
-            collection_results[collection_name] = decrypt_result_for_collection(
-                collection_name,
-                VECTOR_DB_CLIENT.get(collection_name=collection_name),
+            collection_results[collection.name] = VECTOR_DB_CLIENT.get(
+                collection_name=collection.name, key=collection.key
             )
         except Exception as e:
-            log.exception(f"Failed to fetch collection {collection_name}: {e}")
-            collection_results[collection_name] = None
+            log.exception(f"Failed to fetch collection {collection.name}: {e}")
+            collection_results[collection.name] = None
 
     log.info(
-        f"Starting hybrid search for {len(queries)} queries in {len(collection_names)} collections..."
+        f"Starting hybrid search for {len(queries)} queries in {len(collections)} collections..."
     )
 
-    async def process_query(collection_name, query):
+    async def process_query(collection, query):
         try:
             result = await query_doc_with_hybrid_search(
-                collection_name=collection_name,
-                collection_result=collection_results[collection_name],
+                collection=collection,
+                collection_result=collection_results[collection.name],
                 query=query,
                 embedding_function=embedding_function,
                 k=k,
@@ -519,15 +536,15 @@ async def query_collection_with_hybrid_search(
     # Prepare tasks for all collections and queries
     # Avoid running any tasks for collections that failed to fetch data (have assigned None)
     tasks = [
-        (collection_name, query)
-        for collection_name in collection_names
-        if collection_results[collection_name] is not None
+        (collection, query)
+        for collection in collections
+        if collection_results[collection.name] is not None
         for query in queries
     ]
 
     # Run all queries in parallel using asyncio.gather
     task_results = await asyncio.gather(
-        *[process_query(collection_name, query) for collection_name, query in tasks]
+        *[process_query(collection, query) for collection, query in tasks]
     )
 
     for result, err in task_results:
@@ -963,7 +980,7 @@ async def get_sources_from_items(
 
     for item in items:
         query_result = None
-        collection_names = []
+        collections = []
 
         if item.get("type") == "text":
             # Raw Text
@@ -982,8 +999,10 @@ async def get_sources_from_items(
             if query_result is None:
                 # Fallback
                 if item.get("collection_name"):
-                    # If item has a collection name, use it
-                    collection_names.append(item.get("collection_name"))
+                    # A URL or pasted text the user brought in, keyed by that user.
+                    collections.append(
+                        KeyedCollection(item["collection_name"], owner_key(user.id))
+                    )
                 elif item.get("file"):
                     # If item has file data, use it
                     query_result = {
@@ -1087,11 +1106,11 @@ async def get_sources_from_items(
                             ],
                         }
             else:
-                # Fallback to collection names
-                if item.get("legacy"):
-                    collection_names.append(f"{item['id']}")
-                else:
-                    collection_names.append(f"file-{item['id']}")
+                # A file's chunks are keyed by its owner, who is the only one who
+                # can be asking for them.
+                collections.append(
+                    KeyedCollection(f"file-{item['id']}", owner_key(user.id))
+                )
 
         elif item.get("type") == "collection":
             # Manual Full Mode Toggle for Collection
@@ -1130,42 +1149,52 @@ async def get_sources_from_items(
                             "metadatas": [metadatas],
                         }
                 else:
-                    # Fallback to collection names
-                    if item.get("legacy"):
-                        collection_names = item.get("collection_names", [])
-                    else:
-                        collection_names.append(item["id"])
+                    # A knowledge base is keyed by the key shared with everyone it
+                    # is shared with.
+                    collections.append(
+                        KeyedCollection(
+                            item["id"], knowledge_key(item["id"], user.id)
+                        )
+                    )
 
         elif item.get("docs"):
-            # BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL
+            # Web results, already ranked in memory and never stored.
             query_result = {
                 "documents": [[doc.get("content") for doc in item.get("docs")]],
                 "metadatas": [[doc.get("metadata") for doc in item.get("docs")]],
             }
         elif item.get("collection_name"):
-            # Direct Collection Name
-            collection_names.append(item["collection_name"])
+            # A URL or pasted text the user brought in, keyed by that user.
+            collections.append(
+                KeyedCollection(item["collection_name"], owner_key(user.id))
+            )
         elif item.get("collection_names"):
-            # Collection Names List
-            collection_names.extend(item["collection_names"])
+            collections.extend(
+                KeyedCollection(name, owner_key(user.id))
+                for name in item["collection_names"]
+            )
 
         # If query_result is None
         # Fallback to collection names and vector search the collections
-        if query_result is None and collection_names:
-            collection_names = set(collection_names).difference(extracted_collections)
-            if not collection_names:
+        if query_result is None and collections:
+            collections = [
+                collection
+                for collection in collections
+                if collection.name not in extracted_collections
+            ]
+            if not collections:
                 log.debug(f"skipping {item} as it has already been extracted")
                 continue
 
             try:
                 if full_context:
-                    query_result = get_all_items_from_collections(collection_names)
+                    query_result = get_all_items_from_collections(collections)
                 else:
                     query_result = None  # Initialize to None
                     if hybrid_search:
                         try:
                             query_result = await query_collection_with_hybrid_search(
-                                collection_names=collection_names,
+                                collections=collections,
                                 queries=queries,
                                 embedding_function=embedding_function,
                                 k=k,
@@ -1183,7 +1212,7 @@ async def get_sources_from_items(
                     # fallback to non-hybrid search
                     if not hybrid_search and query_result is None:
                         query_result = await query_collection(
-                            collection_names=collection_names,
+                            collections=collections,
                             queries=queries,
                             embedding_function=embedding_function,
                             k=k,
@@ -1191,7 +1220,9 @@ async def get_sources_from_items(
             except Exception as e:
                 log.exception(e)
 
-            extracted_collections.extend(collection_names)
+            extracted_collections.extend(
+                collection.name for collection in collections
+            )
 
         if query_result:
             if "data" in item:

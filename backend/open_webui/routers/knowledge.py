@@ -36,6 +36,7 @@ from open_webui.utils.knowledge_crypto import (
     sync_shared_keys,
     KdekAccessError,
 )
+from open_webui.utils.vector_keys import knowledge_key
 
 
 from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL
@@ -70,7 +71,13 @@ PAGE_ITEM_COUNT = 30
 # Knowledge Base Embedding
 ############################
 
-KNOWLEDGE_BASES_COLLECTION = "knowledge-bases"
+def kb_meta_collection(knowledge_base_id: str) -> str:
+    """Where a knowledge base's own name and description are indexed.
+
+    One collection per knowledge base rather than a single shared index, so it
+    can be protected by that knowledge base's key like the rest of its content.
+    """
+    return f"kbmeta-{knowledge_base_id}"
 
 
 async def embed_knowledge_base_metadata(
@@ -78,13 +85,15 @@ async def embed_knowledge_base_metadata(
     knowledge_base_id: str,
     name: str,
     description: str,
+    user_id: str,
 ) -> bool:
     """Generate and store embedding for knowledge base."""
     try:
         content = f"{name}\n\n{description}" if description else name
         embedding = await request.app.state.EMBEDDING_FUNCTION(content)
         VECTOR_DB_CLIENT.upsert(
-            collection_name=KNOWLEDGE_BASES_COLLECTION,
+            collection_name=kb_meta_collection(knowledge_base_id),
+            key=knowledge_key(knowledge_base_id, user_id),
             items=[
                 {
                     "id": knowledge_base_id,
@@ -105,10 +114,9 @@ async def embed_knowledge_base_metadata(
 def remove_knowledge_base_metadata_embedding(knowledge_base_id: str) -> bool:
     """Remove knowledge base embedding."""
     try:
-        VECTOR_DB_CLIENT.delete(
-            collection_name=KNOWLEDGE_BASES_COLLECTION,
-            ids=[knowledge_base_id],
-        )
+        collection_name = kb_meta_collection(knowledge_base_id)
+        if VECTOR_DB_CLIENT.has_collection(collection_name=collection_name):
+            VECTOR_DB_CLIENT.delete_collection(collection_name=collection_name)
         return True
     except Exception as e:
         log.debug(f"Failed to remove embedding for {knowledge_base_id}: {e}")
@@ -285,6 +293,7 @@ async def create_new_knowledge(
             knowledge.id,
             knowledge.name,
             knowledge.description,
+            user.id,
         )
         return knowledge
     else:
@@ -379,7 +388,11 @@ async def reindex_knowledge_base_metadata_embeddings(
 
     success_count = 0
     for kb in knowledge_bases:
-        if await embed_knowledge_base_metadata(request, kb.id, kb.name, kb.description):
+        # Only knowledge bases whose key this admin holds can be re-embedded; the
+        # rest are counted as failures rather than silently indexed in the clear.
+        if await embed_knowledge_base_metadata(
+            request, kb.id, kb.name, kb.description, user.id
+        ):
             success_count += 1
 
     log.info(f"Embedding reindex complete: {success_count}/{len(knowledge_bases)}")
@@ -493,6 +506,7 @@ async def update_knowledge_by_id(
             knowledge.id,
             knowledge.name,
             knowledge.description,
+            user.id,
         )
         return KnowledgeFilesResponse(
             **knowledge.model_dump(),

@@ -871,23 +871,12 @@ async def unarchive_all_chats(
 async def get_shared_chat_by_id(
     share_id: str, user=Depends(get_verified_user), db: Session = Depends(get_session)
 ):
-    if user.role == "pending":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.NOT_FOUND
-        )
-
-    if user.role == "user" or (user.role == "admin" and not ENABLE_ADMIN_CHAT_ACCESS):
-        chat = Chats.get_chat_by_share_id(share_id, db=db)
-    elif user.role == "admin" and ENABLE_ADMIN_CHAT_ACCESS:
-        chat = Chats.get_chat_by_id(share_id, db=db)
-
-    if chat:
-        return ChatResponse(**chat.model_dump())
-
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.NOT_FOUND
-        )
+    # Counterpart of share_chat_by_id: no share can be created, and this path
+    # loaded the owner's own chat row, decrypting it for whoever held the link.
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail="Chat sharing is unavailable: a share link has no named recipient whose key could wrap the chat's data encryption key.",
+    )
 
 
 ############################
@@ -1313,36 +1302,13 @@ async def share_chat_by_id(
     user=Depends(get_verified_user),
     db: Session = Depends(get_session),
 ):
-    if (user.role != "admin") and (
-        not has_permission(
-            user.id, "chat.share", request.app.state.config.USER_PERMISSIONS
-        )
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
-        )
-
-    chat = Chats.get_chat_by_id_and_user_id(id, user.id, db=db)
-
-    if chat:
-        if chat.share_id:
-            shared_chat = Chats.update_shared_chat_by_chat_id(chat.id, db=db)
-            return ChatResponse(**shared_chat.model_dump())
-
-        shared_chat = Chats.insert_shared_chat_by_chat_id(chat.id, db=db)
-        if not shared_chat:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=ERROR_MESSAGES.DEFAULT(),
-            )
-        return ChatResponse(**shared_chat.model_dump())
-
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
-        )
+    # A share link has no named recipient, so there is no public key to wrap the
+    # chat's encryption key with. Encrypted knowledge sharing is named-recipient
+    # only for the same reason (see validate_encryptable_access_control).
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail="Chat sharing is unavailable: a share link has no named recipient whose key could wrap the chat's data encryption key.",
+    )
 
 
 ############################

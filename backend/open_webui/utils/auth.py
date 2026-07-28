@@ -303,6 +303,7 @@ async def get_current_user(
     # auth by api key
     if token.startswith("sk-"):
         user = get_current_user_by_api_key(request, token)
+        set_current_user_id(user.id)
 
         # Add user info to current span
         current_span = trace.get_current_span()
