@@ -335,7 +335,13 @@ NOT_ENCRYPTED: dict[str, str] = {
     # Known gaps: user content that is still stored in the clear. Each needs its
     # query paths rewritten before it can be encrypted, so they are listed here
     # deliberately rather than left to be discovered.
-    "Feedback": "TODO: user content; snapshot embeds the conversation",
+    # Response rating is closed here rather than encrypted: the leaderboard has
+    # to read every user's rating to score a model, which no per-user key can
+    # open, while the same row's snapshot holds the conversation itself and so
+    # cannot be left readable. Every endpoint returns 501 (see
+    # routers/evaluations.py), so this table stays empty. Reopening it means
+    # deciding which parts of a feedback row may be read across users.
+    "Feedback": "response rating is closed; the leaderboard reads every user's ratings",
     # The channel feature is closed here rather than encrypted: a channel has
     # many readers, a public one has no bounded member set, and its inbound
     # webhook writes messages with no user at all, so no per-user key can cover
