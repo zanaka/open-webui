@@ -4,6 +4,8 @@
 	const i18n = getContext('i18n');
 
 	import { getGroups } from '$lib/apis/groups';
+	import { getUserById, searchUsers } from '$lib/apis/users';
+	import { config } from '$lib/stores';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import Plus from '$lib/components/icons/Plus.svelte';
 	import UserCircleSolid from '$lib/components/icons/UserCircleSolid.svelte';
@@ -18,15 +20,28 @@
 	export let share = true;
 	export let sharePublic = true;
 
+	// Which model this resource is, as the server names it. The server says
+	// which of those can only be shared with people named one by one, so this
+	// only offers audiences that will actually be accepted.
+	export let resourceType: string | null = null;
+
+	$: namedOnly = (($config?.sharing?.named_recipients_only ?? []) as string[]).includes(
+		resourceType ?? ''
+	);
+
 	let selectedGroupId = '';
 	let groups = [];
 
-	$: if (!sharePublic && accessControl === null) {
+	let userQuery = '';
+	let userResults = [];
+	let knownUsers: Record<string, { id: string; name: string; email: string }> = {};
+
+	$: if ((!sharePublic || namedOnly) && accessControl === null) {
 		initPublicAccess();
 	}
 
 	const initPublicAccess = () => {
-		if (!sharePublic && accessControl === null) {
+		if ((!sharePublic || namedOnly) && accessControl === null) {
 			accessControl = {
 				read: {
 					group_ids: [],
@@ -39,6 +54,44 @@
 			};
 			onChange(accessControl);
 		}
+	};
+
+	const rememberUser = async (userId: string) => {
+		if (knownUsers[userId]) {
+			return;
+		}
+		const user = await getUserById(localStorage.token, userId).catch(() => null);
+		if (user) {
+			knownUsers = { ...knownUsers, [userId]: user };
+		}
+	};
+
+	const findUsers = async () => {
+		if (userQuery.trim() === '') {
+			userResults = [];
+			return;
+		}
+		const res = await searchUsers(localStorage.token, userQuery).catch(() => null);
+		userResults = res?.users ?? [];
+	};
+
+	const addUser = async (user) => {
+		accessControl.read.user_ids = [...(accessControl?.read?.user_ids ?? []), user.id];
+		knownUsers = { ...knownUsers, [user.id]: user };
+
+		userQuery = '';
+		userResults = [];
+		onChange(accessControl);
+	};
+
+	const removeUser = (userId: string) => {
+		accessControl.read.user_ids = (accessControl?.read?.user_ids ?? []).filter(
+			(id) => id !== userId
+		);
+		accessControl.write.user_ids = (accessControl?.write?.user_ids ?? []).filter(
+			(id) => id !== userId
+		);
+		onChange(accessControl);
 	};
 
 	onMount(async () => {
@@ -57,6 +110,13 @@
 					user_ids: accessControl?.write?.user_ids ?? []
 				}
 			};
+
+			for (const userId of [
+				...(accessControl?.read?.user_ids ?? []),
+				...(accessControl?.write?.user_ids ?? [])
+			]) {
+				rememberUser(userId);
+			}
 		}
 	});
 </script>
@@ -126,13 +186,15 @@
 					}}
 				>
 					<option class=" text-gray-700" value="private" selected>{$i18n.t('Private')}</option>
-					{#if share && sharePublic}
+					{#if share && sharePublic && !namedOnly}
 						<option class=" text-gray-700" value="public" selected>{$i18n.t('Public')}</option>
 					{/if}
 				</select>
 
 				<div class=" text-xs text-gray-400 font-medium">
-					{#if accessControl !== null}
+					{#if namedOnly}
+						{$i18n.t('Encrypted content can only be shared with people you name')}
+					{:else if accessControl !== null}
 						{$i18n.t('Only select users and groups with permission can access')}
 					{:else}
 						{$i18n.t('Accessible to all users')}
@@ -142,7 +204,94 @@
 		</div>
 	</div>
 
-	{#if share}
+	{#if share && namedOnly && accessControl !== null}
+		{@const memberIds = accessControl?.read?.user_ids ?? []}
+		<div>
+			<div class="flex justify-between mb-2.5">
+				<div class="text-xs font-medium text-gray-500">
+					{$i18n.t('People')}
+				</div>
+			</div>
+
+			{#if memberIds.length > 0}
+				<div class="flex flex-col gap-1.5 mb-2 px-0.5 mx-0.5">
+					{#each memberIds as userId}
+						<div class="flex items-center gap-3 justify-between text-sm w-full transition">
+							<div class="flex items-center gap-1.5 w-full">
+								<div>
+									{knownUsers[userId]?.name ?? userId}
+									<span class="text-xs text-gray-500">{knownUsers[userId]?.email ?? ''}</span>
+								</div>
+							</div>
+
+							<div class="w-full flex justify-end items-center gap-0.5">
+								<button
+									class=""
+									type="button"
+									on:click={() => {
+										if (accessRoles.includes('write')) {
+											if ((accessControl?.write?.user_ids ?? []).includes(userId)) {
+												accessControl.write.user_ids = (
+													accessControl?.write?.user_ids ?? []
+												).filter((id) => id !== userId);
+											} else {
+												accessControl.write.user_ids = [
+													...(accessControl?.write?.user_ids ?? []),
+													userId
+												];
+											}
+											onChange(accessControl);
+										}
+									}}
+								>
+									{#if (accessControl?.write?.user_ids ?? []).includes(userId)}
+										<Badge type={'success'} content={$i18n.t('Write')} />
+									{:else}
+										<Badge type={'info'} content={$i18n.t('Read')} />
+									{/if}
+								</button>
+
+								<button
+									class=" rounded-full p-1 hover:bg-gray-100 dark:hover:bg-gray-850 transition"
+									type="button"
+									on:click={() => removeUser(userId)}
+								>
+									<XMark />
+								</button>
+							</div>
+						</div>
+					{/each}
+				</div>
+			{/if}
+
+			<div class="mb-1 px-0.5">
+				<input
+					class="w-full text-sm bg-transparent outline-hidden dark:placeholder-gray-500"
+					placeholder={$i18n.t('Search for a person to share with')}
+					bind:value={userQuery}
+					on:input={findUsers}
+				/>
+
+				{#if userResults.length > 0}
+					<div class="flex flex-col gap-1 mt-2">
+						{#each userResults.filter((user) => !memberIds.includes(user.id)) as user}
+							<button
+								class="flex items-center gap-1.5 text-sm text-left px-1 py-1 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-850 transition"
+								type="button"
+								on:click={() => addUser(user)}
+							>
+								<Plus className="size-3" />
+								<span>{user.name}</span>
+								<span class="text-xs text-gray-500">{user.email}</span>
+							</button>
+						{/each}
+					</div>
+				{/if}
+			</div>
+		</div>
+	{/if}
+
+	{#if share && !namedOnly}
 		{#if accessControl !== null}
 			{@const accessGroups = groups.filter((group) =>
 				(accessControl?.read?.group_ids ?? []).includes(group.id)

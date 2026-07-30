@@ -12,6 +12,7 @@
 
 	export let share = true;
 	export let sharePublic = true;
+	export let resourceType = null;
 
 	export let onChange = () => {};
 </script>
@@ -33,7 +34,14 @@
 		</div>
 
 		<div class="w-full px-5 pb-4 dark:text-white">
-			<AccessControl bind:accessControl {onChange} {accessRoles} {share} {sharePublic} />
+			<AccessControl
+				bind:accessControl
+				{onChange}
+				{accessRoles}
+				{share}
+				{sharePublic}
+				{resourceType}
+			/>
 		</div>
 	</div>
 </Modal>

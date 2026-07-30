@@ -153,6 +153,18 @@ def _provision_resource_keys(session, flush_context, instances) -> None:
         ).delete(synchronize_session=False)
 
 
+def named_recipient_resources() -> list[str]:
+    """The resources that can only be shared with people named one by one.
+
+    Handed to the interface so it can offer the audiences that will actually
+    work. Read off the registry rather than written out again, so encrypting a
+    new model changes what is offered without anyone remembering to.
+    """
+    return sorted(
+        model.__name__ for model, policy in ENCRYPTED_MODELS.items() if policy.shared
+    )
+
+
 def read_without_decrypting(session, model: type, id: str, *columns: str):
     """Read columns that carry no user content, leaving the row encrypted.
 
