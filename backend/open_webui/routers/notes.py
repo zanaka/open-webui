@@ -24,6 +24,7 @@ from open_webui.config import (
     ENABLE_ADMIN_EXPORT,
 )
 from open_webui.constants import ERROR_MESSAGES
+from open_webui.crypto_exceptions import CryptoPolicyError
 
 
 from open_webui.utils.auth import get_admin_user, get_verified_user
@@ -160,6 +161,10 @@ async def create_new_note(
     try:
         note = Notes.insert_new_note(user.id, form_data, db=db)
         return note
+    except CryptoPolicyError:
+        # A refused audience carries its own message and status; flattening it
+        # into a generic 400 here would hide why the save did not happen.
+        raise
     except Exception as e:
         log.exception(e)
         raise HTTPException(
@@ -283,6 +288,8 @@ async def update_note_by_id(
         )
 
         return note
+    except CryptoPolicyError:
+        raise
     except Exception as e:
         log.exception(e)
         raise HTTPException(

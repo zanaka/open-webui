@@ -21,6 +21,7 @@ from open_webui.models.files import File
 from open_webui.models.folders import Folder
 from open_webui.models.knowledge import Knowledge
 from open_webui.models.memories import Memory
+from open_webui.models.notes import Note
 from open_webui.models.resource_keys import ResourceKey
 from open_webui.models.tags import Tag
 from open_webui.crypto_exceptions import EncryptedDataAccessDeniedError
@@ -78,6 +79,12 @@ ENCRYPTED_MODELS: dict[type, EncryptionPolicy] = {
         owner="user_id",
         text=("name", "description"),
         json=("meta",),
+        shared=True,
+    ),
+    Note: EncryptionPolicy(
+        owner="user_id",
+        text=("title",),
+        json=("data", "meta"),
         shared=True,
     ),
 }
@@ -304,7 +311,6 @@ NOT_ENCRYPTED: dict[str, str] = {
     # Known gaps: user content that is still stored in the clear. Each needs its
     # query paths rewritten before it can be encrypted, so they are listed here
     # deliberately rather than left to be discovered.
-    "Note": "TODO: user content; search filters on the data JSON in SQL",
     "Feedback": "TODO: user content; snapshot embeds the conversation",
     "Prompt": "TODO: user content; looked up by command",
     # The channel feature is closed here rather than encrypted: a channel has
