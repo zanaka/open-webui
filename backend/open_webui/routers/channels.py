@@ -72,21 +72,37 @@ from sqlalchemy.orm import Session
 
 log = logging.getLogger(__name__)
 
-router = APIRouter()
-
-
 ############################
 # Channels Enabled Dependency
 ############################
 
 
+CHANNELS_UNAVAILABLE = (
+    "Channels are unavailable in this deployment: their messages have many "
+    "readers and are written by unauthenticated webhooks, which the per-user "
+    "encryption model cannot express."
+)
+
+
 def check_channels_access(request: Request):
-    """Dependency to ensure channels are globally enabled."""
-    if not request.app.state.config.ENABLE_CHANNELS:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Channels are not enabled",
-        )
+    """Channels are closed here, whatever the configuration says.
+
+    Every reader of a channel would need the key, the member set of a public
+    channel is everyone who ever signs up, and the inbound webhook writes
+    messages with no user at all. None of that fits a per-user key, so the
+    feature stays shut rather than accumulating conversation in the clear.
+    The setting is left in place so the admin screen keeps working, but it no
+    longer opens anything.
+    """
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail=CHANNELS_UNAVAILABLE,
+    )
+
+
+# Declared on the router rather than in each handler, so a route added later is
+# closed too.
+router = APIRouter(dependencies=[Depends(check_channels_access)])
 
 
 ############################

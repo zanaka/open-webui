@@ -455,16 +455,8 @@ def get_builtin_tools(
             [search_notes, view_note, write_note, replace_note_content]
         )
 
-    # Channels tools - search channels and messages (if channels enabled globally)
-    if getattr(request.app.state.config, "ENABLE_CHANNELS", False):
-        builtin_functions.extend(
-            [
-                search_channels,
-                search_channel_messages,
-                view_channel_thread,
-                view_channel_message,
-            ]
-        )
+    # Channels are closed in this deployment (see routers/channels.py), so the
+    # tools that read them are not offered to the model.
 
     for func in builtin_functions:
         callable = get_async_tool_function_and_apply_extra_params(

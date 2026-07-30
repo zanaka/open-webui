@@ -1946,7 +1946,8 @@ async def get_app_config(request: Request):
                     "enable_direct_connections": app.state.config.ENABLE_DIRECT_CONNECTIONS,
                     "enable_folders": app.state.config.ENABLE_FOLDERS,
                     "folder_max_file_count": app.state.config.FOLDER_MAX_FILE_COUNT,
-                    "enable_channels": app.state.config.ENABLE_CHANNELS,
+                    # Closed regardless of the setting; see check_channels_access.
+                    "enable_channels": False,
                     "enable_notes": app.state.config.ENABLE_NOTES,
                     "enable_web_search": app.state.config.ENABLE_WEB_SEARCH,
                     "enable_code_execution": app.state.config.ENABLE_CODE_EXECUTION,
