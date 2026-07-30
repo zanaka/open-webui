@@ -22,6 +22,7 @@ from open_webui.models.folders import Folder
 from open_webui.models.knowledge import Knowledge
 from open_webui.models.memories import Memory
 from open_webui.models.notes import Note
+from open_webui.models.prompts import Prompt
 from open_webui.models.resource_keys import ResourceKey
 from open_webui.models.tags import Tag
 from open_webui.crypto_exceptions import EncryptedDataAccessDeniedError
@@ -61,6 +62,9 @@ class EncryptionPolicy:
     text: tuple[str, ...] = ()
     json: tuple[str, ...] = ()
     shared: bool = False
+    # The column that names a row. Not every table calls it "id"; a prompt is
+    # identified by the command a person types to reach it.
+    identity: str = "id"
 
     @property
     def columns(self) -> tuple[str, ...]:
@@ -87,6 +91,16 @@ ENCRYPTED_MODELS: dict[type, EncryptionPolicy] = {
         json=("data", "meta"),
         shared=True,
     ),
+    # `command` stays in the clear: it is what a person types to find the row,
+    # so it has to be matchable before the row — and therefore its key — is
+    # known. Tag ids can be keyed tokens because a tag is opened with its
+    # owner's key, which is in hand before the lookup; a shared prompt is not.
+    Prompt: EncryptionPolicy(
+        owner="user_id",
+        text=("title", "content"),
+        shared=True,
+        identity="command",
+    ),
 }
 
 
@@ -108,10 +122,11 @@ def _key_for(target, policy: EncryptionPolicy) -> bytes:
     if actor is None:
         raise RuntimeError("No current user context. Cannot access encrypted data.")
 
-    key = resolve_key(type(target).__name__, target.id, actor)
+    resource_id = getattr(target, policy.identity)
+    key = resolve_key(type(target).__name__, resource_id, actor)
     if key is None:
         raise EncryptedDataAccessDeniedError(
-            f"{actor} holds no key for {type(target).__name__} {target.id}."
+            f"{actor} holds no key for {type(target).__name__} {resource_id}."
         )
     return key
 
@@ -133,20 +148,21 @@ def _provision_resource_keys(session, flush_context, instances) -> None:
             continue
 
         resource_type = type(target).__name__
+        resource_id = getattr(target, policy.identity)
         owner_id = getattr(target, policy.owner)
         access_control = getattr(target, "access_control", None)
 
         validate_shareable_access_control(access_control)
 
         if target in session.new:
-            key = create_owner_key(resource_type, target.id, owner_id, session)
+            key = create_owner_key(resource_type, resource_id, owner_id, session)
         else:
             actor = get_current_user_id()
-            key = resolve_key(resource_type, target.id, actor) if actor else None
+            key = resolve_key(resource_type, resource_id, actor) if actor else None
 
         setattr(target, _RESOURCE_KEY_STASH, key)
         sync_shared_keys(
-            resource_type, target.id, owner_id, access_control, key, session
+            resource_type, resource_id, owner_id, access_control, key, session
         )
 
     # A deleted resource takes its key copies with it, or the wrapped keys of
@@ -156,7 +172,8 @@ def _provision_resource_keys(session, flush_context, instances) -> None:
         if policy is None or not policy.shared:
             continue
         session.query(ResourceKey).filter_by(
-            resource_type=type(target).__name__, resource_id=target.id
+            resource_type=type(target).__name__,
+            resource_id=getattr(target, policy.identity),
         ).delete(synchronize_session=False)
 
 
@@ -170,6 +187,11 @@ def named_recipient_resources() -> list[str]:
     return sorted(
         model.__name__ for model, policy in ENCRYPTED_MODELS.items() if policy.shared
     )
+
+
+def _identity_column(model: type):
+    policy = ENCRYPTED_MODELS.get(model)
+    return getattr(model, policy.identity if policy else "id")
 
 
 def read_without_decrypting(session, model: type, id: str, *columns: str):
@@ -191,7 +213,7 @@ def read_without_decrypting(session, model: type, id: str, *columns: str):
 
     return (
         session.query(*[getattr(model, column) for column in columns])
-        .filter(model.id == id)
+        .filter(_identity_column(model) == id)
         .first()
     )
 
@@ -214,7 +236,9 @@ def delete_without_reading(session, model: type, ids: list[str]) -> None:
             ResourceKey.resource_id.in_(ids),
         ).delete(synchronize_session=False)
 
-    session.query(model).filter(model.id.in_(ids)).delete(synchronize_session=False)
+    session.query(model).filter(_identity_column(model).in_(ids)).delete(
+        synchronize_session=False
+    )
 
 
 def _encrypt(target, policy: EncryptionPolicy) -> None:
@@ -312,7 +336,6 @@ NOT_ENCRYPTED: dict[str, str] = {
     # query paths rewritten before it can be encrypted, so they are listed here
     # deliberately rather than left to be discovered.
     "Feedback": "TODO: user content; snapshot embeds the conversation",
-    "Prompt": "TODO: user content; looked up by command",
     # The channel feature is closed here rather than encrypted: a channel has
     # many readers, a public one has no bounded member set, and its inbound
     # webhook writes messages with no user at all, so no per-user key can cover

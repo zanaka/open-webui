@@ -9,7 +9,9 @@ from open_webui.models.users import Users, UserResponse
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import BigInteger, Column, String, Text, JSON
 
+from open_webui.crypto_exceptions import CryptoPolicyError
 from open_webui.utils.access_control import has_access
+from open_webui.utils.db.access_control import has_permission
 
 ####################
 # Prompts DB Schema
@@ -96,6 +98,10 @@ class PromptsTable:
                     return PromptModel.model_validate(result)
                 else:
                     return None
+        except CryptoPolicyError:
+            # A refused audience is an answer for the caller, not a failure to
+            # write, so it must not be flattened into None here.
+            raise
         except Exception:
             return None
 
@@ -109,43 +115,47 @@ class PromptsTable:
         except Exception:
             return None
 
-    def get_prompts(self, db: Optional[Session] = None) -> list[PromptUserResponse]:
-        with get_db_context(db) as db:
-            all_prompts = db.query(Prompt).order_by(Prompt.timestamp.desc()).all()
-
-            user_ids = list(set(prompt.user_id for prompt in all_prompts))
-
-            users = Users.get_users_by_user_ids(user_ids, db=db) if user_ids else []
-            users_dict = {user.id: user for user in users}
-
-            prompts = []
-            for prompt in all_prompts:
-                user = users_dict.get(prompt.user_id)
-                prompts.append(
-                    PromptUserResponse.model_validate(
-                        {
-                            **PromptModel.model_validate(prompt).model_dump(),
-                            "user": user.model_dump() if user else None,
-                        }
-                    )
-                )
-
-            return prompts
-
     def get_prompts_by_user_id(
         self, user_id: str, permission: str = "write", db: Optional[Session] = None
     ) -> list[PromptUserResponse]:
-        prompts = self.get_prompts(db=db)
-        user_group_ids = {
-            group.id for group in Groups.get_groups_by_member_id(user_id, db=db)
-        }
+        """Every prompt this person may open, at this permission.
 
-        return [
-            prompt
-            for prompt in prompts
-            if prompt.user_id == user_id
-            or has_access(user_id, permission, prompt.access_control, user_group_ids)
-        ]
+        Narrowed in SQL rather than after loading: a prompt is decrypted as it
+        is read, so loading one whose key this person does not hold would raise
+        rather than simply be filtered out.
+        """
+        with get_db_context(db) as db:
+            filter = {"user_id": user_id}
+            groups = Groups.get_groups_by_member_id(user_id, db=db)
+            if groups:
+                filter["group_ids"] = [group.id for group in groups]
+
+            query = has_permission(
+                db, Prompt, db.query(Prompt), filter, permission
+            ).order_by(Prompt.timestamp.desc())
+
+            rows = query.all()
+            user_ids = list({row.user_id for row in rows})
+            users = {
+                user.id: user
+                for user in (
+                    Users.get_users_by_user_ids(user_ids, db=db) if user_ids else []
+                )
+            }
+
+            return [
+                PromptUserResponse.model_validate(
+                    {
+                        **PromptModel.model_validate(row).model_dump(),
+                        "user": (
+                            users[row.user_id].model_dump()
+                            if row.user_id in users
+                            else None
+                        ),
+                    }
+                )
+                for row in rows
+            ]
 
     def update_prompt_by_command(
         self, command: str, form_data: PromptForm, db: Optional[Session] = None
@@ -159,15 +169,21 @@ class PromptsTable:
                 prompt.timestamp = int(time.time())
                 db.commit()
                 return PromptModel.model_validate(prompt)
+        except CryptoPolicyError:
+            raise
         except Exception:
             return None
 
     def delete_prompt_by_command(
         self, command: str, db: Optional[Session] = None
     ) -> bool:
+        # Deleting does not need the contents, so it must not need the key. See
+        # Knowledges.delete_knowledge_by_id for why the import is not at the top.
+        from open_webui.utils.encrypted_models import delete_without_reading
+
         try:
             with get_db_context(db) as db:
-                db.query(Prompt).filter_by(command=command).delete()
+                delete_without_reading(db, Prompt, [command])
                 db.commit()
 
                 return True

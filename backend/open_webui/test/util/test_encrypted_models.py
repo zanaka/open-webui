@@ -10,6 +10,7 @@ from open_webui.models.folders import Folder
 from open_webui.models.knowledge import Knowledge
 from open_webui.models.memories import Memory
 from open_webui.models.notes import Note
+from open_webui.models.prompts import Prompt
 from open_webui.models.tags import Tag
 from open_webui.utils.crypto_context import set_current_user_id
 from open_webui.utils import encrypted_models
@@ -82,6 +83,14 @@ BUILDERS = {
         access_control={},
         created_at=_now(),
         updated_at=_now(),
+    ),
+    Prompt: lambda owner: Prompt(
+        command="/marker",
+        user_id=owner,
+        title=f"{MARKER} prompt",
+        content=f"{MARKER} content",
+        access_control={},
+        timestamp=_now(),
     ),
     Knowledge: lambda owner: Knowledge(
         id="k1",

@@ -26,22 +26,17 @@ router = APIRouter()
 async def get_prompts(
     user=Depends(get_verified_user), db: Session = Depends(get_session)
 ):
-    if user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL:
-        prompts = Prompts.get_prompts(db=db)
-    else:
-        prompts = Prompts.get_prompts_by_user_id(user.id, "read", db=db)
-
-    return prompts
+    # Listed by what the person can open, administrator or not: a prompt is
+    # opened with a key its members hold, and an administrator holds no key for
+    # someone else's.
+    return Prompts.get_prompts_by_user_id(user.id, "read", db=db)
 
 
 @router.get("/list", response_model=list[PromptAccessResponse])
 async def get_prompt_list(
     user=Depends(get_verified_user), db: Session = Depends(get_session)
 ):
-    if user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL:
-        prompts = Prompts.get_prompts(db=db)
-    else:
-        prompts = Prompts.get_prompts_by_user_id(user.id, "read", db=db)
+    prompts = Prompts.get_prompts_by_user_id(user.id, "read", db=db)
 
     return [
         PromptAccessResponse(
