@@ -24,6 +24,7 @@ from fastapi.responses import HTMLResponse
 from starlette.responses import Response, StreamingResponse, JSONResponse
 
 
+from open_webui.utils.log_redaction import describe
 from open_webui.utils.misc import is_string_allowed
 from open_webui.models.oauth_sessions import OAuthSessions
 from open_webui.models.chats import Chats
@@ -556,9 +557,9 @@ async def chat_completion_tools_handler(
 
     try:
         response = await generate_chat_completion(request, form_data=payload, user=user)
-        log.debug(f"{response=}")
+        log.debug("tool call response: %s", describe(response))
         content = await get_content_from_response(response)
-        log.debug(f"{content=}")
+        log.debug("tool call content: %s", describe(content))
 
         if not content:
             return body, {}
@@ -701,7 +702,7 @@ async def chat_completion_tools_handler(
         log.debug(f"Error: {e}")
         content = None
 
-    log.debug(f"tool_contexts: {sources}")
+    log.debug("tool_contexts: %s", describe(sources))
 
     if skip_files and "files" in body.get("metadata", {}):
         del body["metadata"]["files"]
@@ -1274,7 +1275,7 @@ async def chat_completion_files_handler(
         except Exception as e:
             log.exception(e)
 
-        log.debug(f"rag_contexts:sources: {sources}")
+        log.debug("rag_contexts:sources: %s", describe(sources))
 
         unique_ids = set()
         for source in sources or []:
@@ -1405,7 +1406,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     # -> Chat Files
 
     form_data = apply_params_to_form_data(form_data, model)
-    log.debug(f"form_data: {form_data}")
+    log.debug("form_data: %s", describe(form_data))
 
     system_message = get_system_message(form_data.get("messages", []))
     if system_message:  # Chat Controls/User Settings

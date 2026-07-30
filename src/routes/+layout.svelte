@@ -872,6 +872,17 @@
 	</div>
 {/if}
 
+{#if $config?.features?.debug_mode}
+	<!-- The backend logs plaintext exactly while this notice is up, so it is
+	     rendered above every page, the login page included, and cannot be
+	     dismissed. One flag drives both; see utils/log_redaction.py. -->
+	<div
+		class="fixed top-1 left-1/2 -translate-x-1/2 z-[9999] pointer-events-none rounded-full bg-amber-500/90 px-3 py-0.5 text-xs font-medium text-black shadow"
+	>
+		{$i18n.t('Debug mode is on: what you type may be recorded in the logs')}
+	</div>
+{/if}
+
 {#if loaded}
 	{#if $isApp}
 		<div class="flex flex-row h-screen">
