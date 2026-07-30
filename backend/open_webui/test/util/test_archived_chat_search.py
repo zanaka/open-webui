@@ -220,3 +220,61 @@ class TestOrdering:
                 filter={"order_by": "title", "direction": "sideways"},
                 db=db,
             )
+
+
+class TestHowMuchIsDecrypted:
+    """Every row read here is decrypted, body and all, by the load hook.
+
+    Searching has to pay that for the whole archive — a match cannot be
+    decided on ciphertext. Merely opening the archive must not.
+    """
+
+    @pytest.fixture
+    def counted(self, db, monkeypatch):
+        import open_webui.utils.encrypted_models as em
+
+        counts = {"bodies": 0}
+        original = em.decrypt_json_value
+
+        def counting(value, dek):
+            counts["bodies"] += 1
+            return original(value, dek)
+
+        for i in range(20):
+            _add(db, f"c{i}", f"title {i}", body="hello", ts=i)
+
+        monkeypatch.setattr(em, "decrypt_json_value", counting)
+        return db, counts
+
+    def test_a_plain_page_only_reads_its_own_page(self, counted):
+        db, counts = counted
+
+        page = Chats.get_archived_chat_list_by_user_id(
+            USER_ID, filter={}, skip=0, limit=5, db=db
+        )
+
+        assert len(page) == 5
+        assert counts["bodies"] == 5, "the whole archive was decrypted for one page"
+
+    def test_a_sql_ordered_page_only_reads_its_own_page(self, counted):
+        db, counts = counted
+
+        Chats.get_archived_chat_list_by_user_id(
+            USER_ID,
+            filter={"order_by": "updated_at", "direction": "desc"},
+            skip=0,
+            limit=5,
+            db=db,
+        )
+
+        assert counts["bodies"] == 5
+
+    def test_searching_pays_for_the_whole_archive(self, counted):
+        """Not a regression — a match cannot be found without the plaintext."""
+        db, counts = counted
+
+        Chats.get_archived_chat_list_by_user_id(
+            USER_ID, filter={"query": "hello"}, skip=0, limit=5, db=db
+        )
+
+        assert counts["bodies"] == 20

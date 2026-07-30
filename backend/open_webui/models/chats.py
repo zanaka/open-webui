@@ -721,6 +721,16 @@ class ChatTable:
             elif not order_by:
                 query = query.order_by(Chat.updated_at.desc())
 
+            # Reading the whole archive is only worth it when the plaintext is
+            # what decides the answer. Every row loaded here is decrypted, body
+            # and all, so an ordinary page still gets cut in SQL.
+            if not query_key and order_by != "title":
+                if skip:
+                    query = query.offset(skip)
+                if limit:
+                    query = query.limit(limit)
+                return [ChatModel.model_validate(chat) for chat in query.all()]
+
             chats = query.all()
 
             if query_key:
@@ -738,7 +748,7 @@ class ChatTable:
             if order_by == "title":
                 chats = sorted(
                     chats,
-                    key=lambda chat: (chat.title or "").lower(),
+                    key=lambda chat: ((chat.title or "").lower(), chat.updated_at),
                     reverse=direction.lower() == "desc",
                 )
 
