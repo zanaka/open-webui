@@ -705,9 +705,15 @@ class ChatTable:
                         raise ValueError("Invalid order_by field")
                     if direction.lower() not in ("asc", "desc"):
                         raise ValueError("Invalid direction for ordering")
+                else:
+                    # Half an ordering is not an ordering. The route builds this
+                    # filter out of independent query parameters, so either one
+                    # can arrive alone; both fall back to the default below.
+                    order_by = None
+                    direction = None
 
             # Ordering by title happens below, once the titles are readable.
-            if order_by and direction and order_by != "title":
+            if order_by and order_by != "title":
                 column = getattr(Chat, order_by)
                 query = query.order_by(
                     column.asc() if direction.lower() == "asc" else column.desc()

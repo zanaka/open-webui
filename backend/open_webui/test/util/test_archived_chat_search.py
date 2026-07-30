@@ -174,6 +174,37 @@ class TestOrdering:
 
         assert [chat.id for chat in result] == ["old", "new"]
 
+    def test_a_column_without_a_direction_falls_back(self, db):
+        """`?order_by=title` with no direction is a shape the route can pass on."""
+        _add(db, "old", "old", ts=100)
+        _add(db, "new", "new", ts=200)
+
+        result = Chats.get_archived_chat_list_by_user_id(
+            USER_ID, filter={"order_by": "title"}, db=db
+        )
+
+        assert [chat.id for chat in result] == ["new", "old"]
+
+    def test_a_sql_column_without_a_direction_falls_back(self, db):
+        _add(db, "old", "old", ts=100)
+        _add(db, "new", "new", ts=200)
+
+        result = Chats.get_archived_chat_list_by_user_id(
+            USER_ID, filter={"order_by": "updated_at"}, db=db
+        )
+
+        assert [chat.id for chat in result] == ["new", "old"]
+
+    def test_a_direction_without_a_column_falls_back(self, db):
+        _add(db, "old", "old", ts=100)
+        _add(db, "new", "new", ts=200)
+
+        result = Chats.get_archived_chat_list_by_user_id(
+            USER_ID, filter={"direction": "asc"}, db=db
+        )
+
+        assert [chat.id for chat in result] == ["new", "old"]
+
     def test_an_unknown_column_is_refused(self, db):
         with pytest.raises(ValueError):
             Chats.get_archived_chat_list_by_user_id(
