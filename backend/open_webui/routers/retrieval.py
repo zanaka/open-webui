@@ -39,6 +39,7 @@ from langchain_core.documents import Document
 from open_webui.crypto_exceptions import EncryptedDataAccessDeniedError
 from open_webui.models.files import FileModel, FileUpdateForm, Files
 from open_webui.models.knowledge import Knowledges
+from open_webui.utils.access_control import has_access
 from open_webui.internal.db import get_session
 from open_webui.utils.file_crypto import decrypted_file_path
 from sqlalchemy.orm import Session
@@ -1512,6 +1513,29 @@ def rank_docs_in_memory(
     return [docs[idx] for idx in keep]
 
 
+def require_knowledge_write_access(knowledge_id: str, user, db=None) -> None:
+    """Holding a knowledge base's key is not permission to write to it.
+
+    Read-only members are handed the same key as writers, so possession alone
+    would let them inject chunks. Check the access control list as well.
+    """
+    knowledge = Knowledges.get_knowledge_by_id(id=knowledge_id, db=db)
+    if not knowledge:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND
+        )
+
+    if (
+        knowledge.user_id != user.id
+        and user.role != "admin"
+        and not has_access(user.id, "write", knowledge.access_control, db=db)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+        )
+
+
 def save_docs_to_vector_db(
     request: Request,
     docs,
@@ -1656,6 +1680,7 @@ def process_file(
                 collection_key = owner_key(user.id)
             else:
                 # Going into a knowledge base, so keyed by that knowledge base.
+                require_knowledge_write_access(collection_name, user, db=db)
                 collection_key = knowledge_key(collection_name, user.id, db=db)
 
             if form_data.content:
@@ -2604,6 +2629,7 @@ async def process_files_batch(
     """
 
     collection_name = form_data.collection_name
+    require_knowledge_write_access(collection_name, user, db=db)
 
     file_results: List[BatchProcessFilesResult] = []
     file_errors: List[BatchProcessFilesResult] = []
@@ -2612,9 +2638,15 @@ async def process_files_batch(
     # Prepare all documents first
     all_docs: List[Document] = []
 
-    for file in form_data.files:
+    for submitted in form_data.files:
         try:
-            text_content = file.data.get("content", "")
+            # Read the file from the database rather than trusting the request
+            # body, and only the caller's own files.
+            file = Files.get_file_by_id_and_user_id(submitted.id, user.id, db=db)
+            if not file:
+                raise ValueError(f"No file {submitted.id} belonging to this user.")
+
+            text_content = (file.data or {}).get("content", "")
             docs: List[Document] = [
                 Document(
                     page_content=text_content.replace("<br/>", "\n"),
@@ -2641,9 +2673,13 @@ async def process_files_batch(
             )
 
         except Exception as e:
-            log.error(f"process_files_batch: Error processing file {file.id}: {str(e)}")
+            log.error(
+                f"process_files_batch: Error processing file {submitted.id}: {str(e)}"
+            )
             file_errors.append(
-                BatchProcessFilesResult(file_id=file.id, status="failed", error=str(e))
+                BatchProcessFilesResult(
+                    file_id=submitted.id, status="failed", error=str(e)
+                )
             )
 
     # Save all documents in one batch
