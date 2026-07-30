@@ -2541,16 +2541,16 @@ def delete_entries_from_collection(
 ):
     try:
         if VECTOR_DB_CLIENT.has_collection(collection_name=form_data.collection_name):
-            hash = Files.get_file_hash_by_id(form_data.file_id, db=db)
-            if hash is None:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=ERROR_MESSAGES.NOT_FOUND,
-                )
-
+            # By file_id rather than by content hash. The stored hash is keyed
+            # with the collection's key, and this endpoint takes any collection
+            # name, so which key applies could only be guessed from the name.
+            # Every chunk of a file carries its file_id, and that is what
+            # "delete this file's entries" means anyway; the hash would also
+            # have taken out a different file that happened to say the same
+            # thing.
             VECTOR_DB_CLIENT.delete(
                 collection_name=form_data.collection_name,
-                filter={"hash": hash},
+                filter={"file_id": form_data.file_id},
             )
             return {"status": True}
         else:

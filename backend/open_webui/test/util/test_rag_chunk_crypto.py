@@ -78,13 +78,23 @@ class TestChunkCryptoPrimitives:
         assert result.documents[0] == ["first secret", "second secret"]
         assert [m["name"] for m in result.metadatas[0]] == ["a.pdf", "b.pdf"]
 
-    def test_non_filename_metadata_left_plaintext(self):
+    def test_identifiers_stay_queryable(self):
         kdek = generate_dek()
         items = _items()
         encrypt_items(items, kdek)
-        # Opaque identifiers stay queryable (not encrypted).
+        # An id says nothing about the content, so it stays as it is.
         assert items[0]["metadata"]["file_id"] == "f1"
-        assert items[0]["metadata"]["hash"] == "deadbeef"
+
+    def test_the_content_hash_is_keyed(self):
+        """It has to stay comparable, but not recomputable from the document.
+        See test_vector_metadata_crypto.py for why."""
+        kdek = generate_dek()
+        first, second = _items(), _items()
+        encrypt_items(first, kdek)
+        encrypt_items(second, kdek)
+
+        assert first[0]["metadata"]["hash"] != "deadbeef"
+        assert first[0]["metadata"]["hash"] == second[0]["metadata"]["hash"]
 
     def test_wrong_key_cannot_decrypt(self):
         items = _items()
