@@ -61,10 +61,12 @@ from open_webui.utils import logger
 from open_webui.utils.audit import AuditLevel, AuditLoggingMiddleware
 from open_webui.utils.logger import start_logger
 from open_webui.utils.memory_lock import enable_memory_lock
-# Register SQLAlchemy encryption event listeners.
-import open_webui.utils.chat_hooks  # noqa: F401
-import open_webui.utils.file_hooks  # noqa: F401
-import open_webui.utils.memory_hooks  # noqa: F401
+from open_webui.utils.encrypted_models import (
+    assert_models_are_covered,
+    install as install_column_encryption,
+)
+
+install_column_encryption()
 from open_webui.socket.main import (
     MODELS,
     app as socket_app,
@@ -593,6 +595,8 @@ async def lifespan(app: FastAPI):
     app.state.instance_id = INSTANCE_ID
     start_logger()
     enable_memory_lock()
+    # Every model module has been imported by now, so the schema can be checked.
+    assert_models_are_covered()
 
     if RESET_CONFIG_ON_START:
         reset_config()

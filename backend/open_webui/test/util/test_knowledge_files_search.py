@@ -14,7 +14,9 @@ from open_webui.utils.crypto_context import cache_dek, set_current_user_id
 from open_webui.utils.crypto_utils import generate_dek
 
 # Ensure File ORM load/save operations transparently encrypt/decrypt columns.
-import open_webui.utils.file_hooks  # noqa: F401
+from open_webui.utils.encrypted_models import install as install_column_encryption
+
+install_column_encryption()
 
 
 USER_ID = "knowledge-user"

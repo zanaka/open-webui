@@ -15,7 +15,9 @@ from open_webui.utils.crypto_context import (
 from open_webui.utils.crypto_utils import generate_dek
 
 # Ensure the encryption hooks are registered before File operations run.
-import open_webui.utils.file_hooks  # noqa: F401
+from open_webui.utils.encrypted_models import install as install_column_encryption
+
+install_column_encryption()
 
 
 USER_ID = "test-user"

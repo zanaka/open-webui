@@ -171,18 +171,19 @@ class FolderTable:
     ) -> Optional[FolderModel]:
         try:
             with get_db_context(db) as db:
-                # Check if folder exists
-                folder = (
+                # Folder.name is encrypted at rest, so its ciphertext is not
+                # matchable in SQL; compare the names after they are decrypted.
+                folders = (
                     db.query(Folder)
                     .filter_by(parent_id=parent_id, user_id=user_id)
-                    .filter(Folder.name.ilike(name))
-                    .first()
+                    .all()
                 )
 
-                if not folder:
-                    return None
+                for folder in folders:
+                    if folder.name and folder.name.lower() == name.lower():
+                        return FolderModel.model_validate(folder)
 
-                return FolderModel.model_validate(folder)
+                return None
         except Exception as e:
             log.error(f"get_folder_by_parent_id_and_user_id_and_name: {e}")
             return None
@@ -238,18 +239,17 @@ class FolderTable:
 
                 form_data = form_data.model_dump(exclude_unset=True)
 
-                existing_folder = (
-                    db.query(Folder)
-                    .filter_by(
-                        name=form_data.get("name"),
-                        parent_id=folder.parent_id,
-                        user_id=user_id,
+                new_name = form_data.get("name")
+                if new_name is not None:
+                    # Names are encrypted at rest, so the duplicate check has to
+                    # compare them after they are decrypted.
+                    existing_folder = (
+                        self.get_folder_by_parent_id_and_user_id_and_name(
+                            folder.parent_id, user_id, new_name, db=db
+                        )
                     )
-                    .first()
-                )
-
-                if existing_folder and existing_folder.id != id:
-                    return None
+                    if existing_folder and existing_folder.id != id:
+                        return None
 
                 folder.name = form_data.get("name", folder.name)
                 if "data" in form_data:

@@ -10,15 +10,25 @@ from sqlalchemy.orm import sessionmaker
 from open_webui.internal.db import Base
 from open_webui.models.chats import Chat
 from open_webui.utils import crypto_context
-from open_webui.utils.crypto_context import cache_dek
+from open_webui.utils.crypto_context import cache_dek, set_current_user_id
 from open_webui.utils.crypto_utils import decrypt_value, generate_dek
 
 # Importing this module registers the SQLAlchemy event listeners for Chat.
-import open_webui.utils.chat_hooks  # noqa: F401
+from open_webui.utils.encrypted_models import install as install_column_encryption
+
+install_column_encryption()
 
 USER_ID = "chat-user"
 TITLE = "Project Phoenix"
 BODY = "launch the rocket at dawn"
+
+
+@pytest.fixture(autouse=True)
+def _current_user():
+    """Stand in for an authenticated request from USER_ID."""
+    set_current_user_id(USER_ID)
+    yield
+    set_current_user_id(None)
 
 
 @pytest.fixture

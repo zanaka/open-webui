@@ -9,14 +9,24 @@ from open_webui.internal.db import Base
 from open_webui.models.chats import Chat, Chats, _extract_chat_search_text
 from open_webui.models.users import User
 from open_webui.utils import crypto_context
-from open_webui.utils.crypto_context import cache_dek
+from open_webui.utils.crypto_context import cache_dek, set_current_user_id
 from open_webui.utils.crypto_utils import generate_dek
 
 # Ensure Chat ORM load/save operations transparently encrypt/decrypt columns.
-import open_webui.utils.chat_hooks  # noqa: F401
+from open_webui.utils.encrypted_models import install as install_column_encryption
+
+install_column_encryption()
 
 
 USER_ID = "chat-user"
+
+
+@pytest.fixture(autouse=True)
+def _current_user():
+    """Stand in for an authenticated request from USER_ID."""
+    set_current_user_id(USER_ID)
+    yield
+    set_current_user_id(None)
 
 
 @pytest.fixture
