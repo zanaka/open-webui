@@ -30,12 +30,6 @@ from open_webui.storage.provider import Storage
 from open_webui.constants import ERROR_MESSAGES
 from open_webui.utils.auth import get_verified_user, get_admin_user
 from open_webui.utils.access_control import has_access, has_permission
-from open_webui.utils.knowledge_crypto import (
-    create_owner_kdek,
-    resolve_kdek,
-    sync_shared_keys,
-    KdekAccessError,
-)
 from open_webui.utils.vector_keys import knowledge_key
 
 
@@ -45,19 +39,6 @@ from open_webui.models.models import Models, ModelForm
 
 log = logging.getLogger(__name__)
 
-
-def validate_encryptable_access_control(access_control: Optional[dict]) -> None:
-    if access_control is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Public sharing is not supported for encrypted knowledge.",
-        )
-    for permission in ("read", "write"):
-        if (access_control.get(permission) or {}).get("group_ids"):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Group sharing is not supported for encrypted knowledge.",
-            )
 
 router = APIRouter()
 
@@ -282,15 +263,12 @@ async def create_new_knowledge(
     ):
         form_data.access_control = {}
 
-    validate_encryptable_access_control(form_data.access_control)
-
+    # No key handling here on purpose. Saving the row provisions its key and
+    # hands wrapped copies to whoever it is shared with, or refuses an audience
+    # that cannot be keyed. See utils/encrypted_models.py.
     knowledge = Knowledges.insert_new_knowledge(user.id, form_data, db=db)
 
     if knowledge:
-        kdek = create_owner_kdek(knowledge.id, user.id, db=db)
-        sync_shared_keys(
-            knowledge.id, user.id, form_data.access_control, kdek, db=db
-        )
         # Embed knowledge base for semantic search
         await embed_knowledge_base_metadata(
             request,
@@ -324,7 +302,12 @@ async def reindex_knowledge_files(
             detail=ERROR_MESSAGES.UNAUTHORIZED,
         )
 
-    knowledge_bases = Knowledges.get_knowledge_bases(db=db)
+    # Only what this administrator holds a key for. Reindexing deletes the
+    # collection before rebuilding it, so running it over a knowledge base
+    # whose files cannot be read would empty it and report success.
+    knowledge_bases = Knowledges.get_knowledge_bases_by_user_id(
+        user.id, "write", db=db
+    )
 
     log.info(f"Starting reindexing for {len(knowledge_bases)} knowledge bases")
 
@@ -386,14 +369,14 @@ async def reindex_knowledge_base_metadata_embeddings(
     user=Depends(get_admin_user),
     db: Session = Depends(get_session),
 ):
-    """Batch embed all existing knowledge bases. Admin only."""
-    knowledge_bases = Knowledges.get_knowledge_bases(db=db)
+    """Batch embed the knowledge bases this administrator can open."""
+    knowledge_bases = Knowledges.get_knowledge_bases_by_user_id(
+        user.id, "write", db=db
+    )
     log.info(f"Reindexing embeddings for {len(knowledge_bases)} knowledge bases")
 
     success_count = 0
     for kb in knowledge_bases:
-        # Only knowledge bases whose key this admin holds can be re-embedded; the
-        # rest are counted as failures rather than silently indexed in the clear.
         if await embed_knowledge_base_metadata(
             request, kb.id, kb.name, kb.description, user.id
         ):
@@ -489,19 +472,8 @@ async def update_knowledge_by_id(
     ):
         form_data.access_control = {}
 
-    validate_encryptable_access_control(form_data.access_control)
-
-    actor_kdek = resolve_kdek(id, user.id, db=db)
-    try:
-        sync_shared_keys(
-            id, knowledge.user_id, form_data.access_control, actor_kdek, db=db
-        )
-    except KdekAccessError:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You must be a member of this knowledge base to share it.",
-        )
-
+    # As in create: saving brings the wrapped key copies in line with the new
+    # access_control by itself, and refuses if this person holds no key.
     knowledge = Knowledges.update_knowledge_by_id(id=id, form_data=form_data, db=db)
     if knowledge:
         # Re-embed knowledge base for semantic search
@@ -811,7 +783,10 @@ def remove_file_from_knowledge_by_id(
 async def delete_knowledge_by_id(
     id: str, user=Depends(get_verified_user), db: Session = Depends(get_session)
 ):
-    knowledge = Knowledges.get_knowledge_by_id(id=id, db=db)
+    # Only who owns it and who may reach it, not what it holds: deleting does
+    # not need the contents, so an administrator can remove a knowledge base
+    # they hold no key for. Reading it here would decrypt it and refuse.
+    knowledge = Knowledges.get_knowledge_access_by_id(id=id, db=db)
     if not knowledge:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -828,7 +803,7 @@ async def delete_knowledge_by_id(
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
 
-    log.info(f"Deleting knowledge base: {id} (name: {knowledge.name})")
+    log.info(f"Deleting knowledge base: {id}")
 
     # Get all models
     models = Models.get_all_models(db=db)

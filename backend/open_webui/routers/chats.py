@@ -1305,7 +1305,7 @@ async def share_chat_by_id(
 ):
     # A share link has no named recipient, so there is no public key to wrap the
     # chat's encryption key with. Encrypted knowledge sharing is named-recipient
-    # only for the same reason (see validate_encryptable_access_control).
+    # only for the same reason (see utils/resource_crypto.py).
     raise HTTPException(
         status_code=status.HTTP_501_NOT_IMPLEMENTED,
         detail="Chat sharing is unavailable: a share link has no named recipient whose key could wrap the chat's data encryption key.",

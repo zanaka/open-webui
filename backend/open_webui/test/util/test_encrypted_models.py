@@ -7,6 +7,7 @@ from open_webui.crypto_exceptions import EncryptedDataAccessDeniedError
 from open_webui.models.chats import Chat
 from open_webui.models.files import File
 from open_webui.models.folders import Folder
+from open_webui.models.knowledge import Knowledge
 from open_webui.models.memories import Memory
 from open_webui.models.tags import Tag
 from open_webui.utils.crypto_context import set_current_user_id
@@ -68,6 +69,16 @@ BUILDERS = {
         id="m1",
         user_id=owner,
         content=f"{MARKER} memory",
+        created_at=_now(),
+        updated_at=_now(),
+    ),
+    Knowledge: lambda owner: Knowledge(
+        id="k1",
+        user_id=owner,
+        name=f"{MARKER} knowledge",
+        description=f"{MARKER} description",
+        meta={"note": MARKER},
+        access_control={},
         created_at=_now(),
         updated_at=_now(),
     ),

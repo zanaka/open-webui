@@ -19,7 +19,9 @@ from open_webui.internal.db import Base
 from open_webui.models.chats import Chat
 from open_webui.models.files import File
 from open_webui.models.folders import Folder
+from open_webui.models.knowledge import Knowledge
 from open_webui.models.memories import Memory
+from open_webui.models.resource_keys import ResourceKey
 from open_webui.models.tags import Tag
 from open_webui.crypto_exceptions import EncryptedDataAccessDeniedError
 from open_webui.utils.crypto_context import (
@@ -72,6 +74,12 @@ ENCRYPTED_MODELS: dict[type, EncryptionPolicy] = {
         owner="user_id", text=("name",), json=("items", "meta", "data")
     ),
     Tag: EncryptionPolicy(owner="user_id", text=("name",), json=("meta",)),
+    Knowledge: EncryptionPolicy(
+        owner="user_id",
+        text=("name", "description"),
+        json=("meta",),
+        shared=True,
+    ),
 }
 
 
@@ -108,7 +116,7 @@ def _provision_resource_keys(session, flush_context, instances) -> None:
     to it. A feature that sets access_control gets the key handling for free —
     or a refusal, if it asks for an audience that cannot be keyed.
     """
-    written = [obj for obj in session.new] + [
+    written = list(session.new) + [
         obj for obj in session.dirty if session.is_modified(obj)
     ]
 
@@ -134,6 +142,61 @@ def _provision_resource_keys(session, flush_context, instances) -> None:
             resource_type, target.id, owner_id, access_control, key, session
         )
 
+    # A deleted resource takes its key copies with it, or the wrapped keys of
+    # content that no longer exists would be left behind.
+    for target in session.deleted:
+        policy = ENCRYPTED_MODELS.get(type(target))
+        if policy is None or not policy.shared:
+            continue
+        session.query(ResourceKey).filter_by(
+            resource_type=type(target).__name__, resource_id=target.id
+        ).delete(synchronize_session=False)
+
+
+def read_without_decrypting(session, model: type, id: str, *columns: str):
+    """Read columns that carry no user content, leaving the row encrypted.
+
+    Ownership and access_control say who a row belongs to and who may reach it,
+    never what it says, so they can be read by someone holding no key. Asking
+    for an encrypted column here is refused rather than quietly handed back as
+    ciphertext.
+    """
+    policy = ENCRYPTED_MODELS.get(model)
+    if policy is not None:
+        encrypted = set(columns) & set(policy.columns)
+        if encrypted:
+            raise ValueError(
+                f"{', '.join(sorted(encrypted))} on {model.__name__} is encrypted. "
+                "Load the row itself, with the key, to read it."
+            )
+
+    return (
+        session.query(*[getattr(model, column) for column in columns])
+        .filter(model.id == id)
+        .first()
+    )
+
+
+def delete_without_reading(session, model: type, ids: list[str]) -> None:
+    """Remove rows without loading them, and take their key copies with them.
+
+    Deleting does not need to know what a row says, so it must not need the key
+    either — an administrator can clear out someone's data without being able
+    to open it. Loading the row would decrypt it, so this deletes by statement
+    and cleans up the wrapped keys itself instead of relying on the flush hook.
+    """
+    if not ids:
+        return
+
+    policy = ENCRYPTED_MODELS.get(model)
+    if policy is not None and policy.shared:
+        session.query(ResourceKey).filter(
+            ResourceKey.resource_type == model.__name__,
+            ResourceKey.resource_id.in_(ids),
+        ).delete(synchronize_session=False)
+
+    session.query(model).filter(model.id.in_(ids)).delete(synchronize_session=False)
+
 
 def _encrypt(target, policy: EncryptionPolicy) -> None:
     dek = _key_for(target, policy)
@@ -158,6 +221,11 @@ def _decrypt(target, policy: EncryptionPolicy) -> None:
 
 
 def _restore_plaintext(target) -> None:
+    # The key was only stashed to carry it from before_flush to the encrypt
+    # step; keeping it would let whoever loads this object next borrow it.
+    if hasattr(target, _RESOURCE_KEY_STASH):
+        delattr(target, _RESOURCE_KEY_STASH)
+
     stash = getattr(target, _PLAINTEXT_STASH, None)
     if stash is None:
         return
@@ -204,7 +272,6 @@ NOT_ENCRYPTED: dict[str, str] = {
     # Key material and credentials. Encrypting these is circular or breaks the
     # lookup that authentication itself depends on.
     "Auth": "holds the KDF salt and wrapped DEK that everything else is unlocked with",
-    "KnowledgeKey": "holds KDEKs already wrapped with the member's public key",
     "ResourceKey": "holds content keys already wrapped with each member's public key",
     "ApiKey": "the key is looked up by value to authenticate the request",
     "OAuthSession": "the token column is already encrypted with the server key",
@@ -228,7 +295,6 @@ NOT_ENCRYPTED: dict[str, str] = {
     "Note": "TODO: user content; search filters on the data JSON in SQL",
     "Feedback": "TODO: user content; snapshot embeds the conversation",
     "Prompt": "TODO: user content; looked up by command",
-    "Knowledge": "TODO: name and description; searched in SQL and shared across users",
     # The channel feature is closed here rather than encrypted: a channel has
     # many readers, a public one has no bounded member set, and its inbound
     # webhook writes messages with no user at all, so no per-user key can cover
