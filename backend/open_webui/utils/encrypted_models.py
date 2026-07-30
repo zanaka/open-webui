@@ -19,6 +19,7 @@ from open_webui.models.chats import Chat
 from open_webui.models.files import File
 from open_webui.models.folders import Folder
 from open_webui.models.memories import Memory
+from open_webui.models.tags import Tag
 from open_webui.utils.crypto_context import require_current_user_dek
 from open_webui.utils.crypto_utils import (
     decrypt_json_value,
@@ -52,6 +53,7 @@ ENCRYPTED_MODELS: dict[type, EncryptionPolicy] = {
     Folder: EncryptionPolicy(
         owner="user_id", text=("name",), json=("items", "meta", "data")
     ),
+    Tag: EncryptionPolicy(owner="user_id", text=("name",), json=("meta",)),
 }
 
 
@@ -125,6 +127,7 @@ NOT_ENCRYPTED: dict[str, str] = {
     # lookup that authentication itself depends on.
     "Auth": "holds the KDF salt and wrapped DEK that everything else is unlocked with",
     "KnowledgeKey": "holds KDEKs already wrapped with the member's public key",
+    "ResourceKey": "holds content keys already wrapped with each member's public key",
     "ApiKey": "the key is looked up by value to authenticate the request",
     "OAuthSession": "the token column is already encrypted with the server key",
     "User": "email and name are looked up at sign-in and shown to admins",
@@ -147,7 +150,6 @@ NOT_ENCRYPTED: dict[str, str] = {
     "Note": "TODO: user content; search filters on the data JSON in SQL",
     "Feedback": "TODO: user content; snapshot embeds the conversation",
     "Prompt": "TODO: user content; looked up by command",
-    "Tag": "TODO: user content; tags are matched in SQL during chat search",
     "Knowledge": "TODO: name and description; searched in SQL and shared across users",
     # The channel feature is closed here rather than encrypted: a channel has
     # many readers, a public one has no bounded member set, and its inbound

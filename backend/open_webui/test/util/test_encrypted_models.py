@@ -10,6 +10,7 @@ from open_webui.models.chats import Chat
 from open_webui.models.files import File
 from open_webui.models.folders import Folder
 from open_webui.models.memories import Memory
+from open_webui.models.tags import Tag
 from open_webui.utils import crypto_context
 from open_webui.utils.crypto_context import cache_dek, set_current_user_id
 from open_webui.utils.crypto_utils import generate_dek
@@ -64,6 +65,12 @@ BUILDERS = {
         data={"note": f"{MARKER} data"},
         created_at=_now(),
         updated_at=_now(),
+    ),
+    Tag: lambda: Tag(
+        id="t1",
+        user_id=OWNER,
+        name=f"{MARKER} tag",
+        meta={"note": MARKER},
     ),
     Memory: lambda: Memory(
         id="m1",

@@ -74,15 +74,12 @@
 				}
 			]
 				.filter((tag) => {
-					const tagName = lastWord.slice(4);
-					if (tagName) {
-						const tagId = tagName.replaceAll(' ', '_').toLowerCase();
-
-						if (tag.id !== tagId) {
-							return tag.id.startsWith(tagId);
-						} else {
-							return false;
-						}
+					const typed = lastWord.slice(4);
+					if (typed) {
+						// Tag ids are opaque tokens, so match on what the user reads.
+						const typedName = typed.replaceAll('_', ' ').toLowerCase();
+						const name = (tag.name ?? '').toLowerCase();
+						return name !== typedName && name.startsWith(typedName);
 					} else {
 						return true;
 					}
@@ -330,7 +327,12 @@
 									const words = value.split(' ');
 
 									words.pop();
-									words.push(`${item.type}:${item.id} `);
+									// The tag id is an opaque token; the query carries the name.
+									const term =
+										item.type === 'tag' && item.id !== 'none'
+											? (item.name ?? '').replaceAll(' ', '_')
+											: item.id;
+									words.push(`${item.type}:${term} `);
 
 									value = words.join(' ');
 
@@ -343,7 +345,7 @@
 								</div>
 
 								<div class=" text-gray-500 line-clamp-1">
-									{item.id}
+									{item.type === 'tag' ? '' : item.id}
 								</div>
 							</button>
 						{/each}

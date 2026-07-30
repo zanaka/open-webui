@@ -34,6 +34,7 @@ from pydantic import BaseModel
 
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.access_control import has_permission
+from open_webui.utils.tag_tokens import normalize_tag_name, tag_id
 
 log = logging.getLogger(__name__)
 
@@ -1398,15 +1399,14 @@ async def add_tag_by_id_and_tag_name(
     chat = Chats.get_chat_by_id_and_user_id(id, user.id, db=db)
     if chat:
         tags = chat.meta.get("tags", [])
-        tag_id = form_data.name.replace(" ", "_").lower()
 
-        if tag_id == "none":
+        if normalize_tag_name(form_data.name) == "none":
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=ERROR_MESSAGES.DEFAULT("Tag name cannot be 'None'"),
             )
 
-        if tag_id not in tags:
+        if tag_id(form_data.name, user.id) not in tags:
             Chats.add_chat_tag_by_id_and_user_id_and_tag_name(
                 id, user.id, form_data.name, db=db
             )

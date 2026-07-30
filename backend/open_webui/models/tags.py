@@ -5,6 +5,7 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 from open_webui.internal.db import Base, JSONField, get_db, get_db_context
+from open_webui.utils.tag_tokens import tag_id
 
 
 from pydantic import BaseModel, ConfigDict
@@ -55,7 +56,7 @@ class TagTable:
         self, name: str, user_id: str, db: Optional[Session] = None
     ) -> Optional[TagModel]:
         with get_db_context(db) as db:
-            id = name.replace(" ", "_").lower()
+            id = tag_id(name, user_id)
             tag = TagModel(**{"id": id, "user_id": user_id, "name": name})
             try:
                 result = Tag(**tag.model_dump())
@@ -74,7 +75,7 @@ class TagTable:
         self, name: str, user_id: str, db: Optional[Session] = None
     ) -> Optional[TagModel]:
         try:
-            id = name.replace(" ", "_").lower()
+            id = tag_id(name, user_id)
             with get_db_context(db) as db:
                 tag = db.query(Tag).filter_by(id=id, user_id=user_id).first()
                 return TagModel.model_validate(tag)
@@ -106,7 +107,7 @@ class TagTable:
     ) -> bool:
         try:
             with get_db_context(db) as db:
-                id = name.replace(" ", "_").lower()
+                id = tag_id(name, user_id)
                 res = db.query(Tag).filter_by(id=id, user_id=user_id).delete()
                 log.debug(f"res: {res}")
                 db.commit()

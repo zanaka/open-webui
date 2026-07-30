@@ -12,6 +12,7 @@ from open_webui.utils.crypto_utils import decrypt_value
 from open_webui.utils.crypto_context import get_cached_dek
 from open_webui.internal.db import Base, JSONField, get_db, get_db_context
 from open_webui.models.tags import TagModel, Tag, Tags
+from open_webui.utils.tag_tokens import tag_id
 from open_webui.models.folders import Folders
 from open_webui.utils.misc import sanitize_data_for_db, sanitize_text_for_db
 
@@ -980,10 +981,14 @@ class ChatTable:
         search_text_words = search_text.split(" ")
 
         # search_text might contain 'tag:tag_name' format so we need to extract the tag_name, split the search_text and remove the tags
+        # "none" is a marker for "has no tags", not a tag, so it is not tokenised.
         tag_ids = [
-            word.replace("tag:", "").replace(" ", "_").lower()
-            for word in search_text_words
-            if word.startswith("tag:")
+            name if name == "none" else tag_id(name, user_id)
+            for name in (
+                word.replace("tag:", "")
+                for word in search_text_words
+                if word.startswith("tag:")
+            )
         ]
 
         # Extract folder names - handle spaces and case insensitivity
@@ -1220,7 +1225,7 @@ class ChatTable:
     ) -> list[ChatModel]:
         with get_db_context(db) as db:
             query = db.query(Chat).filter_by(user_id=user_id)
-            tag_id = tag_name.replace(" ", "_").lower()
+            tag_token = tag_id(tag_name, user_id)
 
             log.info(f"DB dialect name: {db.bind.dialect.name}")
             if db.bind.dialect.name == "sqlite":
@@ -1229,14 +1234,14 @@ class ChatTable:
                     text(
                         f"EXISTS (SELECT 1 FROM json_each(Chat.meta, '$.tags') WHERE json_each.value = :tag_id)"
                     )
-                ).params(tag_id=tag_id)
+                ).params(tag_id=tag_token)
             elif db.bind.dialect.name == "postgresql":
                 # PostgreSQL JSON query for tags within the meta JSON field (for `json` type)
                 query = query.filter(
                     text(
                         "EXISTS (SELECT 1 FROM json_array_elements_text(Chat.meta->'tags') elem WHERE elem = :tag_id)"
                     )
-                ).params(tag_id=tag_id)
+                ).params(tag_id=tag_token)
             else:
                 raise NotImplementedError(
                     f"Unsupported dialect: {db.bind.dialect.name}"
@@ -1256,11 +1261,11 @@ class ChatTable:
             with get_db_context(db) as db:
                 chat = db.get(Chat, id)
 
-                tag_id = tag.id
-                if tag_id not in chat.meta.get("tags", []):
+                tag_token = tag.id
+                if tag_token not in chat.meta.get("tags", []):
                     chat.meta = {
                         **chat.meta,
-                        "tags": list(set(chat.meta.get("tags", []) + [tag_id])),
+                        "tags": list(set(chat.meta.get("tags", []) + [tag_token])),
                     }
 
                 db.commit()
@@ -1275,8 +1280,7 @@ class ChatTable:
         with get_db_context(db) as db:  # Assuming `get_db()` returns a session object
             query = db.query(Chat).filter_by(user_id=user_id, archived=False)
 
-            # Normalize the tag_name for consistency
-            tag_id = tag_name.replace(" ", "_").lower()
+            tag_token = tag_id(tag_name, user_id)
 
             if db.bind.dialect.name == "sqlite":
                 # SQLite JSON1 support for querying the tags inside the `meta` JSON field
@@ -1284,7 +1288,7 @@ class ChatTable:
                     text(
                         f"EXISTS (SELECT 1 FROM json_each(Chat.meta, '$.tags') WHERE json_each.value = :tag_id)"
                     )
-                ).params(tag_id=tag_id)
+                ).params(tag_id=tag_token)
 
             elif db.bind.dialect.name == "postgresql":
                 # PostgreSQL JSONB support for querying the tags inside the `meta` JSON field
@@ -1292,7 +1296,7 @@ class ChatTable:
                     text(
                         "EXISTS (SELECT 1 FROM json_array_elements_text(Chat.meta->'tags') elem WHERE elem = :tag_id)"
                     )
-                ).params(tag_id=tag_id)
+                ).params(tag_id=tag_token)
 
             else:
                 raise NotImplementedError(
@@ -1326,9 +1330,9 @@ class ChatTable:
             with get_db_context(db) as db:
                 chat = db.get(Chat, id)
                 tags = chat.meta.get("tags", [])
-                tag_id = tag_name.replace(" ", "_").lower()
+                tag_token = tag_id(tag_name, user_id)
 
-                tags = [tag for tag in tags if tag != tag_id]
+                tags = [tag for tag in tags if tag != tag_token]
                 chat.meta = {
                     **chat.meta,
                     "tags": list(set(tags)),
