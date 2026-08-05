@@ -12,10 +12,7 @@ from open_webui.crypto_exceptions import EncryptedDataAccessDeniedError
 from open_webui.models.prompts import Prompt, PromptForm, Prompts
 from open_webui.models.resource_keys import ResourceKey
 from open_webui.utils.crypto_context import set_current_user_id
-from open_webui.utils.encrypted_models import (
-    ENCRYPTED_MODELS,
-    read_without_decrypting,
-)
+from open_webui.utils.encrypted_models import ENCRYPTED_MODELS
 from open_webui.utils.resource_crypto import SharingNotSupportedError, resolve_key
 
 MARKER = "OBSIDIAN-CANARY"
@@ -153,13 +150,13 @@ class TestRefusedAudiences:
 
 class TestDeletingWithoutReading:
     def test_ownership_can_be_read_without_a_key(self, db, accounts):
+        """What the delete route checks. Loading the row would decrypt it,
+        refuse, and have the refusal swallowed into a misleading "not found"."""
         _add(db, accounts.owner)
         db.expunge_all()
 
         set_current_user_id(accounts.intruder)
-        access = read_without_decrypting(
-            db, Prompt, COMMAND, "command", "user_id", "access_control"
-        )
+        access = Prompts.get_prompt_access_by_command(COMMAND, db=db)
 
         assert access.user_id == accounts.owner
 

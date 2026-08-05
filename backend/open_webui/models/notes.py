@@ -245,6 +245,22 @@ class NoteTable:
             note = db.query(Note).filter(Note.id == id).first()
             return NoteModel.model_validate(note) if note else None
 
+    def get_note_access_by_id(self, id: str, db: Optional[Session] = None):
+        """Who owns this note and who may reach it, without reading it.
+
+        For deciding whether an action is allowed — deleting, above all.
+        Deleting does not need the contents, so it must not need the key: an
+        administrator can remove someone's note without being able to open it,
+        and loading the row here would decrypt it and refuse.
+        """
+        # See delete_note_by_id for why this import is not at the top.
+        from open_webui.utils.encrypted_models import read_without_decrypting
+
+        with get_db_context(db) as db:
+            return read_without_decrypting(
+                db, Note, id, "id", "user_id", "access_control"
+            )
+
     def update_note_by_id(
         self, id: str, form_data: NoteUpdateForm, db: Optional[Session] = None
     ) -> Optional[NoteModel]:

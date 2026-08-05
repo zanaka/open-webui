@@ -179,7 +179,11 @@ async def update_prompt_by_command(
 async def delete_prompt_by_command(
     command: str, user=Depends(get_verified_user), db: Session = Depends(get_session)
 ):
-    prompt = Prompts.get_prompt_by_command(f"/{command}", db=db)
+    # Only who owns it and who may reach it, not what it says: deleting does
+    # not need the contents, so an administrator can remove a prompt they hold
+    # no key for. Loading the row here would decrypt it, refuse, and have the
+    # refusal read as "not found".
+    prompt = Prompts.get_prompt_access_by_command(f"/{command}", db=db)
     if not prompt:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

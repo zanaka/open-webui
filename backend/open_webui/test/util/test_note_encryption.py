@@ -202,6 +202,18 @@ class TestRefusedAudiences:
 
 
 class TestDeleting:
+    def test_ownership_can_be_read_without_a_key(self, db, accounts):
+        """What the delete route checks before deleting. Loading the row would
+        decrypt it and refuse, so the route reads only ownership and reach."""
+        created = _add(db, accounts.owner)
+        db.expunge_all()
+
+        set_current_user_id(accounts.intruder)
+        access = Notes.get_note_access_by_id(created.id, db=db)
+
+        assert access.user_id == accounts.owner
+        assert access.access_control == {}
+
     def test_someone_holding_no_key_can_still_delete_it(self, db, accounts):
         created = _add(db, accounts.owner)
         db.expunge_all()

@@ -162,8 +162,6 @@ async def create_new_note(
         note = Notes.insert_new_note(user.id, form_data, db=db)
         return note
     except CryptoPolicyError:
-        # A refused audience carries its own message and status; flattening it
-        # into a generic 400 here would hide why the save did not happen.
         raise
     except Exception as e:
         log.exception(e)
@@ -317,7 +315,10 @@ async def delete_note_by_id(
             detail=ERROR_MESSAGES.UNAUTHORIZED,
         )
 
-    note = Notes.get_note_by_id(id, db=db)
+    # Only who owns it and who may reach it, not what it says: deleting does
+    # not need the contents, so an administrator can remove a note they hold
+    # no key for. Loading the row here would decrypt it and refuse.
+    note = Notes.get_note_access_by_id(id, db=db)
     if not note:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND
@@ -334,7 +335,7 @@ async def delete_note_by_id(
         )
 
     try:
-        note = Notes.delete_note_by_id(id, db=db)
+        Notes.delete_note_by_id(id, db=db)
         return True
     except Exception as e:
         log.exception(e)

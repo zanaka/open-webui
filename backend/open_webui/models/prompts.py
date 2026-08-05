@@ -115,6 +115,23 @@ class PromptsTable:
         except Exception:
             return None
 
+    def get_prompt_access_by_command(self, command: str, db: Optional[Session] = None):
+        """Who owns this prompt and who may reach it, without reading it.
+
+        For deciding whether an action is allowed — deleting, above all.
+        Deleting does not need the contents, so it must not need the key: an
+        administrator can remove someone's prompt without being able to open
+        it. Loading the row would decrypt it and refuse — and worse, the
+        refusal would be swallowed into None above and read as "not found".
+        """
+        # See delete_prompt_by_command for why this import is not at the top.
+        from open_webui.utils.encrypted_models import read_without_decrypting
+
+        with get_db_context(db) as db:
+            return read_without_decrypting(
+                db, Prompt, command, "command", "user_id", "access_control"
+            )
+
     def get_prompts_by_user_id(
         self, user_id: str, permission: str = "write", db: Optional[Session] = None
     ) -> list[PromptUserResponse]:
