@@ -59,6 +59,7 @@ from starsessions.stores.redis import RedisStore
 
 from open_webui.utils import logger
 from open_webui.utils.audit import AuditLevel, AuditLoggingMiddleware
+from open_webui.utils.log_redaction import DEBUG_MODE
 from open_webui.utils.logger import start_logger
 from open_webui.utils.memory_lock import enable_memory_lock
 from open_webui.utils.encrypted_models import (
@@ -1931,6 +1932,11 @@ async def get_app_config(request: Request):
             }
         },
         "features": {
+            # Deliberately in the unauthenticated part of the config: while the
+            # deployment logs in debug mode, everyone who opens it — including
+            # the login page — is told that what they type may be recorded.
+            # The same flag decides both; see utils/log_redaction.py.
+            "debug_mode": DEBUG_MODE,
             "auth": WEBUI_AUTH,
             "auth_trusted_header": bool(app.state.AUTH_TRUSTED_EMAIL_HEADER),
             "enable_signup_password_confirmation": ENABLE_SIGNUP_PASSWORD_CONFIRMATION,
