@@ -13,7 +13,12 @@ import logging
 from typing import Dict, List, Optional, Union
 
 from open_webui.retrieval.vector.main import GetResult, SearchResult, VectorItem
-from open_webui.utils.rag_crypto import decrypt_result, encrypt_items
+from open_webui.utils.rag_crypto import (
+    KEYED_FIELDS,
+    decrypt_result,
+    encrypt_items,
+    hash_token,
+)
 from open_webui.utils.vector_keys import VectorKeyError
 from open_webui.utils.vem_crypto import rotate_items, rotate_vectors
 
@@ -37,9 +42,16 @@ class EncryptingVectorClient:
         collection_name: str,
         ids: Optional[List[str]] = None,
         filter: Optional[Dict] = None,
+        *,
+        key: Optional[bytes] = None,
     ) -> None:
+        # Deleting by id or by a plain field needs no key. Deleting by a field
+        # derived from the content does, because the stored value is keyed and
+        # the caller is passing the unkeyed one.
         return self._inner.delete(
-            collection_name=collection_name, ids=ids, filter=filter
+            collection_name=collection_name,
+            ids=ids,
+            filter=_protect_filter(filter, key, collection_name),
         )
 
     def reset(self) -> None:
@@ -74,7 +86,7 @@ class EncryptingVectorClient:
         result = self._inner.search(
             collection_name=collection_name,
             vectors=rotate_vectors(vectors, key),
-            filter=filter,
+            filter=_protect_filter(filter, key, collection_name),
             limit=limit,
         )
         return decrypt_result(result, key)
@@ -89,7 +101,9 @@ class EncryptingVectorClient:
     ) -> Optional[GetResult]:
         _check(key, collection_name)
         result = self._inner.query(
-            collection_name=collection_name, filter=filter, limit=limit
+            collection_name=collection_name,
+            filter=_protect_filter(filter, key, collection_name),
+            limit=limit,
         )
         return decrypt_result(result, key)
 
@@ -102,6 +116,33 @@ class EncryptingVectorClient:
         _check(key, "write")
         encrypt_items(items, key)
         rotate_items(items, key)
+
+
+def _protect_filter(
+    filter: Optional[Dict], key: Optional[bytes], collection_name: str
+) -> Optional[Dict]:
+    """Translate a filter written in plain values into the stored ones.
+
+    A caller filters on the hash it computed from the document. What is stored
+    is that hash keyed with the collection's key, so the filter has to be keyed
+    the same way to match. Doing it here rather than at each call site means a
+    caller cannot forget, and cannot accidentally write the plain hash into a
+    query that would then match nothing and look like an empty collection.
+    """
+    if not filter:
+        return filter
+
+    keyed = [field for field in KEYED_FIELDS if field in filter]
+    if not keyed:
+        return filter
+
+    if not key:
+        raise VectorKeyError(
+            f"Filtering collection {collection_name} on {', '.join(keyed)} needs "
+            "its key: the stored value is derived from the content with it."
+        )
+
+    return {**filter, **{field: hash_token(filter[field], key) for field in keyed}}
 
 
 def _check(key: bytes, collection_name: str) -> None:

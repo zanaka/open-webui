@@ -763,7 +763,9 @@ def remove_file_from_knowledge_by_id(
         )  # Remove by file_id first
 
         VECTOR_DB_CLIENT.delete(
-            collection_name=knowledge.id, filter={"hash": file.hash}
+            collection_name=knowledge.id,
+            filter={"hash": file.hash},
+            key=knowledge_key(knowledge.id, user.id, db=db),
         )  # Remove by hash as well in case of duplicates
     except Exception as e:
         log.debug("This was most likely caused by bypassing embedding processing")
