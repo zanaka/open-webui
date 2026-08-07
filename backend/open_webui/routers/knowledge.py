@@ -143,12 +143,14 @@ async def get_knowledge_bases(
     skip = (page - 1) * limit
 
     filter = {}
-    if not user.role == "admin" or not BYPASS_ADMIN_ACCESS_CONTROL:
-        groups = Groups.get_groups_by_member_id(user.id, db=db)
-        if groups:
-            filter["group_ids"] = [group.id for group in groups]
+    # Listed by what the person can open, administrator or not: knowledge bases
+    # are opened with a key their members hold, and an administrator holds no
+    # key for someone else's.
+    groups = Groups.get_groups_by_member_id(user.id, db=db)
+    if groups:
+        filter["group_ids"] = [group.id for group in groups]
 
-        filter["user_id"] = user.id
+    filter["user_id"] = user.id
 
     result = Knowledges.search_knowledge_bases(
         user.id, filter=filter, skip=skip, limit=limit, db=db
@@ -190,12 +192,14 @@ async def search_knowledge_bases(
     if view_option:
         filter["view_option"] = view_option
 
-    if not user.role == "admin" or not BYPASS_ADMIN_ACCESS_CONTROL:
-        groups = Groups.get_groups_by_member_id(user.id, db=db)
-        if groups:
-            filter["group_ids"] = [group.id for group in groups]
+    # Listed by what the person can open, administrator or not: knowledge bases
+    # are opened with a key their members hold, and an administrator holds no
+    # key for someone else's.
+    groups = Groups.get_groups_by_member_id(user.id, db=db)
+    if groups:
+        filter["group_ids"] = [group.id for group in groups]
 
-        filter["user_id"] = user.id
+    filter["user_id"] = user.id
 
     result = Knowledges.search_knowledge_bases(
         user.id, filter=filter, skip=skip, limit=limit, db=db

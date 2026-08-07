@@ -101,6 +101,20 @@ def has_permission(db, DocumentModel, query, filter: dict, permission: str = "re
     if user_id:
         conditions.append(DocumentModel.user_id == user_id)
 
+        # Shared with this person by name. Encrypted content can only be shared
+        # this way, so a listing that missed it would never show it at all.
+        if dialect_name == "sqlite":
+            conditions.append(
+                DocumentModel.access_control[permission]["user_ids"].contains(user_id)
+            )
+        elif dialect_name == "postgresql":
+            conditions.append(
+                cast(
+                    DocumentModel.access_control[permission]["user_ids"],
+                    JSONB,
+                ).contains([user_id])
+            )
+
     # Group-level permission
     if group_ids:
         group_conditions = []
