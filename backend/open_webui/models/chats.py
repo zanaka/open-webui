@@ -775,31 +775,74 @@ class ChatTable:
             if not include_archived:
                 query = query.filter_by(archived=False)
 
+            query_key = None
+            order_by = None
+            direction = None
+
             if filter:
                 query_key = filter.get("query")
-                if query_key:
-                    query = query.filter(Chat.title.ilike(f"%{query_key}%"))
 
                 order_by = filter.get("order_by")
                 direction = filter.get("direction")
 
-                if order_by and direction and getattr(Chat, order_by):
-                    if direction.lower() == "asc":
-                        query = query.order_by(getattr(Chat, order_by).asc())
-                    elif direction.lower() == "desc":
-                        query = query.order_by(getattr(Chat, order_by).desc())
-                    else:
+                if order_by and direction:
+                    if not getattr(Chat, order_by, None):
+                        raise ValueError("Invalid order_by field")
+                    if direction.lower() not in ("asc", "desc"):
                         raise ValueError("Invalid direction for ordering")
-            else:
+                else:
+                    # Half an ordering is not an ordering; see
+                    # get_archived_chat_list_by_user_id.
+                    order_by = None
+                    direction = None
+
+            # Ordering by title happens below, once the titles are readable.
+            if order_by and order_by != "title":
+                column = getattr(Chat, order_by)
+                query = query.order_by(
+                    column.asc() if direction.lower() == "asc" else column.desc()
+                )
+            elif not order_by:
                 query = query.order_by(Chat.updated_at.desc())
 
-            if skip:
-                query = query.offset(skip)
-            if limit:
-                query = query.limit(limit)
+            # An ordinary page is still cut in SQL; every row loaded here is
+            # decrypted, body and all.
+            if not query_key and order_by != "title":
+                if skip:
+                    query = query.offset(skip)
+                if limit:
+                    query = query.limit(limit)
+                return [ChatModel.model_validate(chat) for chat in query.all()]
 
-            all_chats = query.all()
-            return [ChatModel.model_validate(chat) for chat in all_chats]
+            chats = query.all()
+
+            if query_key:
+                # Matched after the rows are read. The title and the messages
+                # are encrypted at rest, so an ilike in SQL matched ciphertext
+                # and this search returned nothing at all.
+                needle = query_key.lower()
+                chats = [
+                    chat
+                    for chat in chats
+                    if needle in (chat.title or "").lower()
+                    or needle in _extract_chat_search_text(chat.chat)
+                ]
+
+            if order_by == "title":
+                chats = sorted(
+                    chats,
+                    key=lambda chat: ((chat.title or "").lower(), chat.updated_at),
+                    reverse=direction.lower() == "desc",
+                )
+
+            # Paginated after filtering, so a page is never short of entries
+            # that were dropped by the search.
+            if skip:
+                chats = chats[skip:]
+            if limit:
+                chats = chats[:limit]
+
+            return [ChatModel.model_validate(chat) for chat in chats]
 
     def get_chat_title_id_list_by_user_id(
         self,
