@@ -13,6 +13,7 @@ import logging
 from dataclasses import dataclass
 
 from sqlalchemy import event
+from sqlalchemy.orm import Session
 
 from open_webui.internal.db import Base
 from open_webui.models.chats import Chat
@@ -20,7 +21,17 @@ from open_webui.models.files import File
 from open_webui.models.folders import Folder
 from open_webui.models.memories import Memory
 from open_webui.models.tags import Tag
-from open_webui.utils.crypto_context import require_current_user_dek
+from open_webui.crypto_exceptions import EncryptedDataAccessDeniedError
+from open_webui.utils.crypto_context import (
+    get_current_user_id,
+    require_current_user_dek,
+)
+from open_webui.utils.resource_crypto import (
+    create_owner_key,
+    resolve_key,
+    sync_shared_keys,
+    validate_shareable_access_control,
+)
 from open_webui.utils.crypto_utils import (
     decrypt_json_value,
     decrypt_text,
@@ -35,11 +46,18 @@ _PLAINTEXT_STASH = "_plaintext_before_encrypt"
 
 @dataclass(frozen=True)
 class EncryptionPolicy:
-    """Whose key opens a row, and which of its columns are encrypted."""
+    """Whose key opens a row, and which of its columns are encrypted.
+
+    `shared=True` means the row is opened by a key belonging to the resource
+    itself rather than to its owner, so it can be handed to named people. Those
+    rows are provisioned and re-shared automatically from their access_control;
+    a feature offering sharing does not have to do anything, and cannot forget.
+    """
 
     owner: str
     text: tuple[str, ...] = ()
     json: tuple[str, ...] = ()
+    shared: bool = False
 
     @property
     def columns(self) -> tuple[str, ...]:
@@ -57,8 +75,68 @@ ENCRYPTED_MODELS: dict[type, EncryptionPolicy] = {
 }
 
 
+_RESOURCE_KEY_STASH = "_resource_key"
+
+
+def _key_for(target, policy: EncryptionPolicy) -> bytes:
+    """The key that opens this row."""
+    if not policy.shared:
+        return require_current_user_dek(getattr(target, policy.owner))
+
+    # Provisioned during before_flush for rows being written, so the key does not
+    # have to be read back from a table that has not been written yet.
+    stashed = getattr(target, _RESOURCE_KEY_STASH, None)
+    if stashed is not None:
+        return stashed
+
+    actor = get_current_user_id()
+    if actor is None:
+        raise RuntimeError("No current user context. Cannot access encrypted data.")
+
+    key = resolve_key(type(target).__name__, target.id, actor)
+    if key is None:
+        raise EncryptedDataAccessDeniedError(
+            f"{actor} holds no key for {type(target).__name__} {target.id}."
+        )
+    return key
+
+
+def _provision_resource_keys(session, flush_context, instances) -> None:
+    """Give shared rows a key, and keep the shared copies in step.
+
+    Runs before the flush, which is the only point where new rows may be added
+    to it. A feature that sets access_control gets the key handling for free —
+    or a refusal, if it asks for an audience that cannot be keyed.
+    """
+    written = [obj for obj in session.new] + [
+        obj for obj in session.dirty if session.is_modified(obj)
+    ]
+
+    for target in written:
+        policy = ENCRYPTED_MODELS.get(type(target))
+        if policy is None or not policy.shared:
+            continue
+
+        resource_type = type(target).__name__
+        owner_id = getattr(target, policy.owner)
+        access_control = getattr(target, "access_control", None)
+
+        validate_shareable_access_control(access_control)
+
+        if target in session.new:
+            key = create_owner_key(resource_type, target.id, owner_id, session)
+        else:
+            actor = get_current_user_id()
+            key = resolve_key(resource_type, target.id, actor) if actor else None
+
+        setattr(target, _RESOURCE_KEY_STASH, key)
+        sync_shared_keys(
+            resource_type, target.id, owner_id, access_control, key, session
+        )
+
+
 def _encrypt(target, policy: EncryptionPolicy) -> None:
-    dek = require_current_user_dek(getattr(target, policy.owner))
+    dek = _key_for(target, policy)
 
     # Kept so the caller's own object still reads as plaintext after the flush.
     stash = {column: getattr(target, column) for column in policy.columns}
@@ -71,7 +149,7 @@ def _encrypt(target, policy: EncryptionPolicy) -> None:
 
 
 def _decrypt(target, policy: EncryptionPolicy) -> None:
-    dek = require_current_user_dek(getattr(target, policy.owner))
+    dek = _key_for(target, policy)
 
     for column in policy.text:
         setattr(target, column, decrypt_text(getattr(target, column), dek))
@@ -203,6 +281,7 @@ def install() -> None:
         return
     _installed = True
 
+    event.listen(Session, "before_flush", _provision_resource_keys)
     for model, policy in ENCRYPTED_MODELS.items():
         _register(model, policy)
     log.info(
