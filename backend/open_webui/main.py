@@ -69,6 +69,7 @@ from open_webui.utils.resource_crypto import (
 )
 from open_webui.utils.encrypted_models import (
     assert_models_are_covered,
+    named_recipient_resources,
     install as install_column_encryption,
 )
 
@@ -1959,6 +1960,13 @@ async def get_app_config(request: Request):
                 name: config.get("name", name)
                 for name, config in OAUTH_PROVIDERS.items()
             }
+        },
+        "sharing": {
+            # Which resources can only be shared with named people, read
+            # straight off the encryption registry so the two cannot drift.
+            # Offering an audience the save path will refuse is worse than not
+            # offering it, so the interface asks rather than assumes.
+            "named_recipients_only": named_recipient_resources(),
         },
         "features": {
             # Deliberately in the unauthenticated part of the config: while the
