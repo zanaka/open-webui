@@ -1,19 +1,15 @@
 import time
 
 import pytest
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import text
 
 from open_webui.crypto_exceptions import EncryptedDataAccessDeniedError
-from open_webui.internal.db import Base
 from open_webui.models.chats import Chat
 from open_webui.models.files import File
 from open_webui.models.folders import Folder
 from open_webui.models.memories import Memory
 from open_webui.models.tags import Tag
-from open_webui.utils import crypto_context
-from open_webui.utils.crypto_context import cache_dek, set_current_user_id
-from open_webui.utils.crypto_utils import generate_dek
+from open_webui.utils.crypto_context import set_current_user_id
 from open_webui.utils import encrypted_models
 from open_webui.utils.encrypted_models import (
     ENCRYPTED_MODELS,
@@ -22,10 +18,6 @@ from open_webui.utils.encrypted_models import (
     install,
 )
 
-install()
-
-OWNER = "registry-owner"
-INTRUDER = "registry-intruder"
 MARKER = "SECRET-MARKER-PHRASE"
 
 
@@ -33,21 +25,21 @@ def _now():
     return int(time.time())
 
 
-# One builder per registered model. The first test below fails if a model is
-# added to the registry without being covered here.
+# One builder per registered model, taking the owner's id. The first test below
+# fails if a model is added to the registry without being covered here.
 BUILDERS = {
-    Chat: lambda: Chat(
+    Chat: lambda owner: Chat(
         id="c1",
-        user_id=OWNER,
+        user_id=owner,
         title=f"{MARKER} title",
         chat={"messages": [{"role": "user", "content": f"{MARKER} body"}]},
         meta={"tags": []},
         created_at=_now(),
         updated_at=_now(),
     ),
-    File: lambda: File(
+    File: lambda owner: File(
         id="f1",
-        user_id=OWNER,
+        user_id=owner,
         filename=f"{MARKER}.txt",
         path="/uploads/f1",
         data={"content": f"{MARKER} contents"},
@@ -55,10 +47,10 @@ BUILDERS = {
         created_at=_now(),
         updated_at=_now(),
     ),
-    Folder: lambda: Folder(
+    Folder: lambda owner: Folder(
         id="fo1",
         parent_id=None,
-        user_id=OWNER,
+        user_id=owner,
         name=f"{MARKER} folder",
         items={"chat_ids": [f"{MARKER}-chat"]},
         meta={"icon": MARKER},
@@ -66,42 +58,20 @@ BUILDERS = {
         created_at=_now(),
         updated_at=_now(),
     ),
-    Tag: lambda: Tag(
+    Tag: lambda owner: Tag(
         id="t1",
-        user_id=OWNER,
+        user_id=owner,
         name=f"{MARKER} tag",
         meta={"note": MARKER},
     ),
-    Memory: lambda: Memory(
+    Memory: lambda owner: Memory(
         id="m1",
-        user_id=OWNER,
+        user_id=owner,
         content=f"{MARKER} memory",
         created_at=_now(),
         updated_at=_now(),
     ),
 }
-
-
-@pytest.fixture
-def db():
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(
-        engine, tables=[model.__table__ for model in ENCRYPTED_MODELS]
-    )
-    session = sessionmaker(bind=engine)()
-
-    cache_dek(OWNER, generate_dek(), jti="jti-owner", expires_at=time.time() + 3600)
-    cache_dek(
-        INTRUDER, generate_dek(), jti="jti-intruder", expires_at=time.time() + 3600
-    )
-    set_current_user_id(OWNER)
-
-    yield session
-
-    set_current_user_id(None)
-    session.close()
-    engine.dispose()
-    crypto_context._dek_cache.clear()
 
 
 def _raw(db, model, columns):
@@ -122,53 +92,53 @@ def test_every_registered_model_is_covered_here():
 
 @pytest.mark.parametrize("model", MODELS, ids=IDS)
 class TestRegisteredModels:
-    def test_declared_columns_are_ciphertext_at_rest(self, db, model):
-        db.add(BUILDERS[model]())
+    def test_declared_columns_are_ciphertext_at_rest(self, db, accounts, model):
+        db.add(BUILDERS[model](accounts.owner))
         db.commit()
 
         stored = _raw(db, model, ENCRYPTED_MODELS[model].columns)
         assert MARKER not in stored
 
-    def test_round_trips_for_the_owner(self, db, model):
-        db.add(BUILDERS[model]())
+    def test_round_trips_for_the_owner(self, db, accounts, model):
+        db.add(BUILDERS[model](accounts.owner))
         db.commit()
-        db.expire_all()
+        db.expunge_all()
 
         loaded = db.query(model).one()
         policy = ENCRYPTED_MODELS[model]
-        expected = BUILDERS[model]()
+        expected = BUILDERS[model](accounts.owner)
         for column in policy.columns:
             assert getattr(loaded, column) == getattr(expected, column)
 
-    def test_object_reads_as_plaintext_after_save(self, db, model):
-        instance = BUILDERS[model]()
-        expected = BUILDERS[model]()
+    def test_object_reads_as_plaintext_after_save(self, db, accounts, model):
+        instance = BUILDERS[model](accounts.owner)
+        expected = BUILDERS[model](accounts.owner)
         db.add(instance)
         db.commit()
 
         for column in ENCRYPTED_MODELS[model].columns:
             assert getattr(instance, column) == getattr(expected, column)
 
-    def test_another_user_cannot_decrypt(self, db, model):
-        db.add(BUILDERS[model]())
+    def test_another_user_cannot_decrypt(self, db, accounts, model):
+        db.add(BUILDERS[model](accounts.owner))
         db.commit()
-        db.expire_all()
+        db.expunge_all()
 
-        set_current_user_id(INTRUDER)
+        set_current_user_id(accounts.intruder)
         with pytest.raises(EncryptedDataAccessDeniedError):
             db.query(model).one()
 
-    def test_without_a_user_context_it_refuses(self, db, model):
-        db.add(BUILDERS[model]())
+    def test_without_a_user_context_it_refuses(self, db, accounts, model):
+        db.add(BUILDERS[model](accounts.owner))
         db.commit()
-        db.expire_all()
+        db.expunge_all()
 
         set_current_user_id(None)
         with pytest.raises(RuntimeError):
             db.query(model).one()
 
-    def test_update_re_encrypts(self, db, model):
-        db.add(BUILDERS[model]())
+    def test_update_re_encrypts(self, db, accounts, model):
+        db.add(BUILDERS[model](accounts.owner))
         db.commit()
 
         loaded = db.query(model).one()
@@ -177,7 +147,7 @@ class TestRegisteredModels:
         db.commit()
 
         assert MARKER not in _raw(db, model, [column])
-        db.expire_all()
+        db.expunge_all()
         assert getattr(db.query(model).one(), column) == f"{MARKER} changed"
 
 
@@ -220,14 +190,14 @@ class TestCoverage:
         )
 
 
-def test_install_is_idempotent(db):
+def test_install_is_idempotent(db, accounts):
     """A second install must not stack a second round of encryption."""
     install()
     install()
 
-    db.add(BUILDERS[Chat]())
+    db.add(BUILDERS[Chat](accounts.owner))
     db.commit()
-    db.expire_all()
+    db.expunge_all()
 
     loaded = db.query(Chat).one()
     assert loaded.title == f"{MARKER} title"
