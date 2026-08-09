@@ -73,6 +73,11 @@ class EncryptionPolicy:
 
 ENCRYPTED_MODELS: dict[type, EncryptionPolicy] = {
     Chat: EncryptionPolicy(owner="user_id", text=("title",), json=("chat",)),
+    # `hash` is deliberately absent: it never holds a plain SHA-256. The
+    # fingerprint is keyed to its owner where it is computed (file_hash_token in
+    # rag_crypto), because it must stay readable to people without the owner's
+    # key — a member removing a file from a shared knowledge base, an
+    # administrator deleting without reading — who pass it around opaquely.
     File: EncryptionPolicy(owner="user_id", text=("filename",), json=("data", "meta")),
     Memory: EncryptionPolicy(owner="user_id", text=("content",)),
     Folder: EncryptionPolicy(

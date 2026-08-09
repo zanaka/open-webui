@@ -96,6 +96,7 @@ from open_webui.utils.misc import (
 )
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.access_control import has_permission
+from open_webui.utils.rag_crypto import file_hash_token
 from open_webui.utils.vector_keys import knowledge_key, owner_key
 
 from open_webui.config import (
@@ -1821,7 +1822,14 @@ def process_file(
                 {"content": text_content},
                 db=db,
             )
-            hash = calculate_sha256_string(text_content)
+            # Keyed to the owner right here, where the fingerprint is born.
+            # Everything downstream — the file row, the vector metadata, the
+            # delete filters quoting it back — carries this token opaquely, so
+            # no reader of either store can hash a document they hold and learn
+            # who stores it.
+            hash = file_hash_token(
+                calculate_sha256_string(text_content), owner_key(file.user_id)
+            )
 
             if request.app.state.config.BYPASS_EMBEDDING_AND_RETRIEVAL:
                 Files.update_file_data_by_id(file.id, {"status": "completed"}, db=db)
@@ -2664,7 +2672,11 @@ async def process_files_batch(
 
             file_updates.append(
                 FileUpdateForm(
-                    hash=calculate_sha256_string(text_content),
+                    # The same owner-keyed token process_file stores; the files
+                    # here are the caller's own, so user.id is the owner.
+                    hash=file_hash_token(
+                        calculate_sha256_string(text_content), owner_key(user.id)
+                    ),
                     data={"content": text_content},
                 )
             )
