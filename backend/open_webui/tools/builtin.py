@@ -1363,32 +1363,24 @@ async def view_knowledge_file(
     try:
         from open_webui.models.files import Files
         from open_webui.models.knowledge import Knowledges
-        from open_webui.utils.access_control import has_access
 
         user_id = __user__.get("id")
         user_role = __user__.get("role", "user")
-        user_group_ids = [group.id for group in Groups.get_groups_by_member_id(user_id)]
 
         file = Files.get_file_by_id(file_id)
         if not file:
             return json.dumps({"error": "File not found"})
 
-        # Check access via any KB containing this file
-        knowledges = Knowledges.get_knowledges_by_file_id(file_id)
-        has_knowledge_access = False
-        knowledge_info = None
-
-        for knowledge_base in knowledges:
-            if (
-                user_role == "admin"
-                or knowledge_base.user_id == user_id
-                or has_access(
-                    user_id, "read", knowledge_base.access_control, user_group_ids
-                )
-            ):
-                has_knowledge_access = True
-                knowledge_info = {"id": knowledge_base.id, "name": knowledge_base.name}
-                break
+        # Check access via any KB containing this file. The query already
+        # returns only the knowledge bases this person may open, so there is
+        # nothing left to re-check here.
+        knowledges = Knowledges.get_knowledges_by_file_id(file_id, user_id)
+        has_knowledge_access = bool(knowledges)
+        knowledge_info = (
+            {"id": knowledges[0].id, "name": knowledges[0].name}
+            if knowledges
+            else None
+        )
 
         if not has_knowledge_access:
             if file.user_id != user_id and user_role != "admin":

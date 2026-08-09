@@ -4,35 +4,26 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
 
-from open_webui.internal import db as internal_db
-from open_webui.internal.db import Base
+from open_webui.models.auths import Auths
 from open_webui.models.files import File, Files
-from open_webui.models.groups import Group, GroupMember
 from open_webui.models.knowledge import Knowledge
-from open_webui.models.users import User
 from open_webui.routers import retrieval
 from open_webui.routers.retrieval import (
     BatchProcessFilesForm,
     process_files_batch,
     require_knowledge_write_access,
 )
-from open_webui.utils import crypto_context
-from open_webui.utils.crypto_context import cache_dek, set_current_user_id
-from open_webui.utils.crypto_utils import generate_dek
+from open_webui.utils.crypto_context import cache_dek
 
-# File columns are encrypted on the way in and out.
-from open_webui.utils.encrypted_models import install as install_column_encryption
-
-install_column_encryption()
-
-
-OWNER = "kb-owner"
-WRITER = "kb-writer"
-READER = "kb-reader"
-STRANGER = "kb-stranger"
+# Saving a knowledge base provisions its key and wraps a copy for every named
+# recipient, so the people here have to be real accounts with key pairs, not
+# invented ids. The conftest supplies the owner and a stranger; the named
+# writer and reader are created below. Filled in by the module fixture.
+OWNER = None
+WRITER = None
+READER = None
+STRANGER = None
 KB_ID = "kb-1"
 FILE_ID = "file-1"
 STORED_CONTENT = "the real contents of the owner's file"
@@ -42,27 +33,39 @@ def _user(user_id, role="user"):
     return SimpleNamespace(id=user_id, role=role)
 
 
+@pytest.fixture(scope="module", autouse=True)
+def people(accounts):
+    global OWNER, WRITER, READER, STRANGER
+    OWNER, STRANGER = accounts.owner, accounts.intruder
+
+    ids = {}
+    for name, password in (
+        ("writer", "writer-correct-horse"),
+        ("reader", "reader-battery-staple"),
+    ):
+        auth = Auths.insert_new_auth(
+            email=f"kb-authz-{name}@example.com",
+            hashed_password=f"hashed::{name}",
+            name=name,
+            raw_password=password,
+            role="user",
+            db=accounts.session,
+        )
+        cache_dek(auth.user.id, auth.dek, f"jti-kb-authz-{name}", time.time() + 3600)
+        ids[name] = auth.user.id
+    WRITER, READER = ids["writer"], ids["reader"]
+
+
 @pytest.fixture
-def db(monkeypatch):
-    monkeypatch.setattr(internal_db, "DATABASE_ENABLE_SESSION_SHARING", True)
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(
-        engine,
-        tables=[
-            User.__table__,
-            File.__table__,
-            Knowledge.__table__,
-            Group.__table__,
-            GroupMember.__table__,
-        ],
-    )
-    session = sessionmaker(bind=engine)()
+def db(db):
+    """The conftest database, seeded with the shared knowledge base and file.
 
-    cache_dek(OWNER, generate_dek(), jti="jti-owner", expires_at=time.time() + 3600)
-    set_current_user_id(OWNER)
-
+    Committing the knowledge row runs the real provisioning path — a key is
+    created and wrapped for the reader and the writer — which is what made the
+    old self-contained in-memory fixture stop being enough.
+    """
     now = int(time.time())
-    session.add(
+    db.add(
         Knowledge(
             id=KB_ID,
             user_id=OWNER,
@@ -78,7 +81,7 @@ def db(monkeypatch):
             updated_at=now,
         )
     )
-    session.add(
+    db.add(
         File(
             id=FILE_ID,
             user_id=OWNER,
@@ -90,14 +93,10 @@ def db(monkeypatch):
             updated_at=now,
         )
     )
-    session.commit()
-    session.expire_all()
+    db.commit()
+    db.expire_all()
 
-    yield session
-
-    set_current_user_id(None)
-    session.close()
-    engine.dispose()
+    return db
     crypto_context._dek_cache.clear()
 
 

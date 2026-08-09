@@ -62,6 +62,11 @@ from open_webui.utils.audit import AuditLevel, AuditLoggingMiddleware
 from open_webui.utils.log_redaction import DEBUG_MODE
 from open_webui.utils.logger import start_logger
 from open_webui.utils.memory_lock import enable_memory_lock
+from open_webui.crypto_exceptions import EncryptedDataAccessDeniedError
+from open_webui.utils.resource_crypto import (
+    ResourceKeyAccessError,
+    SharingNotSupportedError,
+)
 from open_webui.utils.encrypted_models import (
     assert_models_are_covered,
     install as install_column_encryption,
@@ -678,6 +683,30 @@ app.state.oauth_manager = oauth_manager
 # For Integrations
 oauth_client_manager = OAuthClientManager(app)
 app.state.oauth_client_manager = oauth_client_manager
+
+
+# The encryption rules refuse some requests outright — an audience that cannot
+# be handed keys, or content the caller holds no key for. They are raised deep
+# in the save path so that no feature has to remember to check; turning them
+# into a response belongs here, once, rather than in each router.
+@app.exception_handler(SharingNotSupportedError)
+async def _sharing_not_supported(request: Request, exc: SharingNotSupportedError):
+    return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+@app.exception_handler(ResourceKeyAccessError)
+async def _no_key_to_share(request: Request, exc: ResourceKeyAccessError):
+    return JSONResponse(status_code=403, content={"detail": str(exc)})
+
+
+@app.exception_handler(EncryptedDataAccessDeniedError)
+async def _encrypted_access_denied(
+    request: Request, exc: EncryptedDataAccessDeniedError
+):
+    # Deliberately vague: whether a key exists is itself worth not confirming.
+    log.info("Refused encrypted access: %s", exc)
+    return JSONResponse(status_code=403, content={"detail": ERROR_MESSAGES.DEFAULT()})
+
 
 app.state.instance_id = None
 app.state.config = AppConfig(

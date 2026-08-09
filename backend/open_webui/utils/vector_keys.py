@@ -12,7 +12,7 @@ from typing import Optional
 from sqlalchemy.orm import Session
 
 from open_webui.utils.crypto_context import get_cached_dek
-from open_webui.utils.knowledge_crypto import resolve_kdek
+from open_webui.utils.resource_crypto import resolve_key
 
 log = logging.getLogger(__name__)
 
@@ -35,7 +35,11 @@ def owner_key(user_id: Optional[str]) -> bytes:
 def knowledge_key(
     knowledge_id: str, user_id: Optional[str], db: Optional[Session] = None
 ) -> bytes:
-    """Key for a knowledge base, shared with every user it is shared with."""
+    """Key for a knowledge base, held by everyone it is shared with.
+
+    The same content key that protects the knowledge row's own columns, so a
+    knowledge base and its vectors are opened by one key, not two.
+    """
     if not knowledge_id:
         raise VectorKeyError("No knowledge base to key vector data with.")
     if not user_id:
@@ -43,9 +47,9 @@ def knowledge_key(
             f"No user to unwrap the key of knowledge base {knowledge_id} with."
         )
 
-    kdek = resolve_kdek(knowledge_id, user_id, db=db)
-    if kdek is None:
+    key = resolve_key("Knowledge", knowledge_id, user_id, db=db)
+    if key is None:
         raise VectorKeyError(
             f"User {user_id} holds no key for knowledge base {knowledge_id}."
         )
-    return kdek
+    return key

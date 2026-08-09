@@ -22,7 +22,6 @@ from sqlalchemy import (
     BigInteger,
     Column,
     ForeignKey,
-    LargeBinary,
     String,
     Text,
     JSON,
@@ -30,6 +29,7 @@ from sqlalchemy import (
     or_,
 )
 
+from open_webui.crypto_exceptions import CryptoPolicyError
 from open_webui.utils.access_control import has_access
 from open_webui.utils.db.access_control import has_permission
 
@@ -181,33 +181,12 @@ class KnowledgeTable:
                     return KnowledgeModel.model_validate(result)
                 else:
                     return None
+            except CryptoPolicyError:
+                # A refused audience is an answer for the caller, not a failure
+                # to write, so it must not be flattened into None here.
+                raise
             except Exception:
                 return None
-
-    def get_knowledge_bases(
-        self, skip: int = 0, limit: int = 30, db: Optional[Session] = None
-    ) -> list[KnowledgeUserModel]:
-        with get_db_context(db) as db:
-            all_knowledge = (
-                db.query(Knowledge).order_by(Knowledge.updated_at.desc()).all()
-            )
-            user_ids = list(set(knowledge.user_id for knowledge in all_knowledge))
-
-            users = Users.get_users_by_user_ids(user_ids, db=db) if user_ids else []
-            users_dict = {user.id: user for user in users}
-
-            knowledge_bases = []
-            for knowledge in all_knowledge:
-                user = users_dict.get(knowledge.user_id)
-                knowledge_bases.append(
-                    KnowledgeUserModel.model_validate(
-                        {
-                            **KnowledgeModel.model_validate(knowledge).model_dump(),
-                            "user": user.model_dump() if user else None,
-                        }
-                    )
-                )
-            return knowledge_bases
 
     def search_knowledge_bases(
         self,
@@ -362,18 +341,43 @@ class KnowledgeTable:
     def get_knowledge_bases_by_user_id(
         self, user_id: str, permission: str = "write", db: Optional[Session] = None
     ) -> list[KnowledgeUserModel]:
-        knowledge_bases = self.get_knowledge_bases(db=db)
-        user_group_ids = {
-            group.id for group in Groups.get_groups_by_member_id(user_id, db=db)
-        }
-        return [
-            knowledge_base
-            for knowledge_base in knowledge_bases
-            if knowledge_base.user_id == user_id
-            or has_access(
-                user_id, permission, knowledge_base.access_control, user_group_ids
+        """Every knowledge base this person may open, at this permission.
+
+        Narrowed in SQL rather than after loading: a knowledge base is decrypted
+        as it is read, so loading one whose key this person does not hold would
+        raise rather than simply be filtered out.
+        """
+        with get_db_context(db) as db:
+            filter = {"user_id": user_id}
+            groups = Groups.get_groups_by_member_id(user_id, db=db)
+            if groups:
+                filter["group_ids"] = [group.id for group in groups]
+
+            query = has_permission(
+                db, Knowledge, db.query(Knowledge), filter, permission
             )
-        ]
+
+            rows = query.order_by(Knowledge.updated_at.desc()).all()
+            user_ids = list({row.user_id for row in rows})
+            users = {
+                user.id: user
+                for user in (
+                    Users.get_users_by_user_ids(user_ids, db=db) if user_ids else []
+                )
+            }
+            return [
+                KnowledgeUserModel.model_validate(
+                    {
+                        **KnowledgeModel.model_validate(row).model_dump(),
+                        "user": (
+                            users[row.user_id].model_dump()
+                            if row.user_id in users
+                            else None
+                        ),
+                    }
+                )
+                for row in rows
+            ]
 
     def get_knowledge_by_id(
         self, id: str, db: Optional[Session] = None
@@ -384,6 +388,22 @@ class KnowledgeTable:
                 return KnowledgeModel.model_validate(knowledge) if knowledge else None
         except Exception:
             return None
+
+    def get_knowledge_access_by_id(self, id: str, db: Optional[Session] = None):
+        """Who owns this knowledge base and who may reach it, without reading it.
+
+        For callers that only have to decide whether an action is allowed —
+        deleting, above all. Deleting does not need the contents, so it must not
+        need the key: an administrator can remove someone's knowledge base
+        without being able to open it.
+        """
+        # See delete_knowledge_by_id for why this import is not at the top.
+        from open_webui.utils.encrypted_models import read_without_decrypting
+
+        with get_db_context(db) as db:
+            return read_without_decrypting(
+                db, Knowledge, id, "id", "user_id", "access_control"
+            )
 
     def get_knowledge_by_id_and_user_id(
         self, id: str, user_id: str, db: Optional[Session] = None
@@ -403,18 +423,30 @@ class KnowledgeTable:
         return None
 
     def get_knowledges_by_file_id(
-        self, file_id: str, db: Optional[Session] = None
+        self, file_id: str, user_id: str, db: Optional[Session] = None
     ) -> list[KnowledgeModel]:
+        """The knowledge bases holding this file that this person may open.
+
+        Scoped to one person for the same reason as
+        get_knowledge_bases_by_user_id: reading a knowledge base decrypts it.
+        """
         try:
             with get_db_context(db) as db:
-                knowledges = (
+                filter = {"user_id": user_id}
+                groups = Groups.get_groups_by_member_id(user_id, db=db)
+                if groups:
+                    filter["group_ids"] = [group.id for group in groups]
+
+                query = (
                     db.query(Knowledge)
                     .join(KnowledgeFile, Knowledge.id == KnowledgeFile.knowledge_id)
                     .filter(KnowledgeFile.file_id == file_id)
-                    .all()
                 )
+                query = has_permission(db, Knowledge, query, filter, "read")
+
                 return [
-                    KnowledgeModel.model_validate(knowledge) for knowledge in knowledges
+                    KnowledgeModel.model_validate(knowledge)
+                    for knowledge in query.all()
                 ]
         except Exception:
             return []
@@ -609,20 +641,23 @@ class KnowledgeTable:
         overwrite: bool = False,
         db: Optional[Session] = None,
     ) -> Optional[KnowledgeModel]:
-        try:
-            with get_db_context(db) as db:
-                knowledge = self.get_knowledge_by_id(id=id, db=db)
-                db.query(Knowledge).filter_by(id=id).update(
-                    {
-                        **form_data.model_dump(),
-                        "updated_at": int(time.time()),
-                    }
-                )
-                db.commit()
-                return self.get_knowledge_by_id(id=id, db=db)
-        except Exception as e:
-            log.exception(e)
-            return None
+        # Written through the loaded row rather than as a bulk UPDATE: a bulk
+        # UPDATE skips the mapper events, so the name and description would be
+        # stored in the clear and the shared key copies would never be brought
+        # in line with the new access_control.
+        with get_db_context(db) as db:
+            knowledge = db.query(Knowledge).filter_by(id=id).first()
+            if not knowledge:
+                return None
+
+            knowledge.name = form_data.name
+            knowledge.description = form_data.description
+            knowledge.access_control = form_data.access_control
+            knowledge.updated_at = int(time.time())
+
+            db.commit()
+            db.refresh(knowledge)
+            return KnowledgeModel.model_validate(knowledge)
 
     def update_knowledge_data_by_id(
         self, id: str, data: dict, db: Optional[Session] = None
@@ -643,18 +678,26 @@ class KnowledgeTable:
             return None
 
     def delete_knowledge_by_id(self, id: str, db: Optional[Session] = None) -> bool:
+        # Imported here because the registry imports every model, this one
+        # included, so importing it at the top would close a cycle.
+        from open_webui.utils.encrypted_models import delete_without_reading
+
         try:
             with get_db_context(db) as db:
-                db.query(Knowledge).filter_by(id=id).delete()
+                delete_without_reading(db, Knowledge, [id])
                 db.commit()
                 return True
         except Exception:
             return False
 
     def delete_all_knowledge(self, db: Optional[Session] = None) -> bool:
+        # See delete_knowledge_by_id for why this import is not at the top.
+        from open_webui.utils.encrypted_models import delete_without_reading
+
         with get_db_context(db) as db:
             try:
-                db.query(Knowledge).delete()
+                ids = [row.id for row in db.query(Knowledge.id).all()]
+                delete_without_reading(db, Knowledge, ids)
                 db.commit()
 
                 return True
@@ -663,74 +706,3 @@ class KnowledgeTable:
 
 
 Knowledges = KnowledgeTable()
-
-
-####################
-# KnowledgeKey: per-knowledge KDEK, wrapped with each member's RSA public key
-####################
-
-
-class KnowledgeKey(Base):
-    __tablename__ = "knowledge_key"
-
-    knowledge_id = Column(
-        Text, ForeignKey("knowledge.id", ondelete="CASCADE"), primary_key=True
-    )
-    user_id = Column(Text, primary_key=True)
-    wrapped_kdek = Column(LargeBinary, nullable=False)
-    created_at = Column(BigInteger)
-
-
-class KnowledgeKeysTable:
-    def insert_new_key(
-        self,
-        knowledge_id: str,
-        user_id: str,
-        wrapped_kdek: bytes,
-        db: Optional[Session] = None,
-    ) -> bool:
-        with get_db_context(db) as db:
-            row = KnowledgeKey(
-                knowledge_id=knowledge_id,
-                user_id=user_id,
-                wrapped_kdek=wrapped_kdek,
-                created_at=int(time.time()),
-            )
-            db.add(row)
-            db.commit()
-            return True
-
-    def get_wrapped_kdek(
-        self, knowledge_id: str, user_id: str, db: Optional[Session] = None
-    ) -> Optional[bytes]:
-        with get_db_context(db) as db:
-            row = (
-                db.query(KnowledgeKey)
-                .filter_by(knowledge_id=knowledge_id, user_id=user_id)
-                .first()
-            )
-            return row.wrapped_kdek if row else None
-
-    def get_user_ids(
-        self, knowledge_id: str, db: Optional[Session] = None
-    ) -> list[str]:
-        with get_db_context(db) as db:
-            rows = (
-                db.query(KnowledgeKey.user_id)
-                .filter_by(knowledge_id=knowledge_id)
-                .all()
-            )
-            return [row[0] for row in rows]
-
-    def delete_key(
-        self, knowledge_id: str, user_id: str, db: Optional[Session] = None
-    ) -> bool:
-        with get_db_context(db) as db:
-            db.query(KnowledgeKey).filter_by(
-                knowledge_id=knowledge_id, user_id=user_id
-            ).delete(synchronize_session=False)
-            db.commit()
-            return True
-
-
-KnowledgeKeys = KnowledgeKeysTable()

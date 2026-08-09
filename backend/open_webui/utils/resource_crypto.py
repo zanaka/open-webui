@@ -15,6 +15,7 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
+from open_webui.crypto_exceptions import CryptoPolicyError
 from open_webui.models.auths import Auths
 from open_webui.models.resource_keys import ResourceKey, ResourceKeys
 from open_webui.utils.crypto_context import require_cached_dek
@@ -28,11 +29,11 @@ from open_webui.utils.crypto_utils import (
 log = logging.getLogger(__name__)
 
 
-class SharingNotSupportedError(Exception):
+class SharingNotSupportedError(CryptoPolicyError):
     """The requested audience cannot be given keys."""
 
 
-class ResourceKeyAccessError(Exception):
+class ResourceKeyAccessError(CryptoPolicyError):
     """The actor holds no key for this resource, so cannot pass one on."""
 
 
