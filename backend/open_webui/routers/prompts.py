@@ -26,22 +26,17 @@ router = APIRouter()
 async def get_prompts(
     user=Depends(get_verified_user), db: Session = Depends(get_session)
 ):
-    if user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL:
-        prompts = Prompts.get_prompts(db=db)
-    else:
-        prompts = Prompts.get_prompts_by_user_id(user.id, "read", db=db)
-
-    return prompts
+    # Listed by what the person can open, administrator or not: a prompt is
+    # opened with a key its members hold, and an administrator holds no key for
+    # someone else's.
+    return Prompts.get_prompts_by_user_id(user.id, "read", db=db)
 
 
 @router.get("/list", response_model=list[PromptAccessResponse])
 async def get_prompt_list(
     user=Depends(get_verified_user), db: Session = Depends(get_session)
 ):
-    if user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL:
-        prompts = Prompts.get_prompts(db=db)
-    else:
-        prompts = Prompts.get_prompts_by_user_id(user.id, "read", db=db)
+    prompts = Prompts.get_prompts_by_user_id(user.id, "read", db=db)
 
     return [
         PromptAccessResponse(
@@ -184,7 +179,11 @@ async def update_prompt_by_command(
 async def delete_prompt_by_command(
     command: str, user=Depends(get_verified_user), db: Session = Depends(get_session)
 ):
-    prompt = Prompts.get_prompt_by_command(f"/{command}", db=db)
+    # Only who owns it and who may reach it, not what it says: deleting does
+    # not need the contents, so an administrator can remove a prompt they hold
+    # no key for. Loading the row here would decrypt it, refuse, and have the
+    # refusal read as "not found".
+    prompt = Prompts.get_prompt_access_by_command(f"/{command}", db=db)
     if not prompt:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

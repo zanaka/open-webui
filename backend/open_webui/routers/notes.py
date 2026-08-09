@@ -24,6 +24,7 @@ from open_webui.config import (
     ENABLE_ADMIN_EXPORT,
 )
 from open_webui.constants import ERROR_MESSAGES
+from open_webui.crypto_exceptions import CryptoPolicyError
 
 
 from open_webui.utils.auth import get_admin_user, get_verified_user
@@ -160,6 +161,8 @@ async def create_new_note(
     try:
         note = Notes.insert_new_note(user.id, form_data, db=db)
         return note
+    except CryptoPolicyError:
+        raise
     except Exception as e:
         log.exception(e)
         raise HTTPException(
@@ -283,6 +286,8 @@ async def update_note_by_id(
         )
 
         return note
+    except CryptoPolicyError:
+        raise
     except Exception as e:
         log.exception(e)
         raise HTTPException(
@@ -310,7 +315,10 @@ async def delete_note_by_id(
             detail=ERROR_MESSAGES.UNAUTHORIZED,
         )
 
-    note = Notes.get_note_by_id(id, db=db)
+    # Only who owns it and who may reach it, not what it says: deleting does
+    # not need the contents, so an administrator can remove a note they hold
+    # no key for. Loading the row here would decrypt it and refuse.
+    note = Notes.get_note_access_by_id(id, db=db)
     if not note:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND
@@ -327,7 +335,7 @@ async def delete_note_by_id(
         )
 
     try:
-        note = Notes.delete_note_by_id(id, db=db)
+        Notes.delete_note_by_id(id, db=db)
         return True
     except Exception as e:
         log.exception(e)

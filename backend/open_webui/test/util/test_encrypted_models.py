@@ -9,6 +9,8 @@ from open_webui.models.files import File
 from open_webui.models.folders import Folder
 from open_webui.models.knowledge import Knowledge
 from open_webui.models.memories import Memory
+from open_webui.models.notes import Note
+from open_webui.models.prompts import Prompt
 from open_webui.models.tags import Tag
 from open_webui.utils.crypto_context import set_current_user_id
 from open_webui.utils import encrypted_models
@@ -71,6 +73,24 @@ BUILDERS = {
         content=f"{MARKER} memory",
         created_at=_now(),
         updated_at=_now(),
+    ),
+    Note: lambda owner: Note(
+        id="n1",
+        user_id=owner,
+        title=f"{MARKER} note",
+        data={"content": {"md": f"{MARKER} body", "html": "", "json": None}},
+        meta={"tags": [MARKER]},
+        access_control={},
+        created_at=_now(),
+        updated_at=_now(),
+    ),
+    Prompt: lambda owner: Prompt(
+        command="/marker",
+        user_id=owner,
+        title=f"{MARKER} prompt",
+        content=f"{MARKER} content",
+        access_control={},
+        timestamp=_now(),
     ),
     Knowledge: lambda owner: Knowledge(
         id="k1",
@@ -181,14 +201,14 @@ class TestCoverage:
 
     def test_an_unclassified_model_stops_startup(self, monkeypatch):
         self._import_every_model()
-        without_note = {
+        without_feedback = {
             name: reason
             for name, reason in encrypted_models.NOT_ENCRYPTED.items()
-            if name != "Note"
+            if name != "Feedback"
         }
-        monkeypatch.setattr(encrypted_models, "NOT_ENCRYPTED", without_note)
+        monkeypatch.setattr(encrypted_models, "NOT_ENCRYPTED", without_feedback)
 
-        with pytest.raises(UnclassifiedModelError, match="Note"):
+        with pytest.raises(UnclassifiedModelError, match="Feedback"):
             assert_models_are_covered()
 
     def test_encrypted_and_exempt_do_not_overlap(self):

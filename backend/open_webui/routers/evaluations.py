@@ -26,7 +26,32 @@ from sqlalchemy.orm import Session
 log = logging.getLogger(__name__)
 
 
-router = APIRouter()
+def check_evaluations_access():
+    """Closed while there is no way to encrypt feedback without breaking it.
+
+    A feedback row holds three different things: a rating, an automatically
+    generated set of tags, and a snapshot of the whole conversation. The
+    leaderboard reads the rating of every user's feedback to work out an Elo
+    score, so a rating encrypted with its submitter's key cannot be counted —
+    and no server-wide key exists to count it with. The snapshot, meanwhile, is
+    the conversation itself, so leaving it readable would undo the encryption of
+    chats for every message anyone rated.
+
+    Refusing here rather than choosing between those keeps the table empty. When
+    the feature is wanted, the choice can be made then, with nothing to migrate.
+    Reopening means deleting this guard and giving Feedback a policy in
+    utils/encrypted_models.py.
+    """
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail=(
+            "Response rating is unavailable: a leaderboard has to read every "
+            "user's ratings, which no single key can open."
+        ),
+    )
+
+
+router = APIRouter(dependencies=[Depends(check_evaluations_access)])
 
 
 # Leaderboard Elo Rating Computation

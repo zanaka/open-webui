@@ -853,6 +853,7 @@ Provide the enhanced notes in markdown format. Use markdown syntax for headings,
 		bind:show={showAccessControlModal}
 		bind:accessControl={note.access_control}
 		accessRoles={['read', 'write']}
+		resourceType="Note"
 		onChange={() => {
 			changeDebounceHandler();
 		}}

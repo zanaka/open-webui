@@ -88,6 +88,7 @@
 	bind:show={showAccessControlModal}
 	bind:accessControl
 	accessRoles={['read', 'write']}
+	resourceType="Prompt"
 	share={$user?.permissions?.sharing?.prompts || $user?.role === 'admin'}
 	sharePublic={$user?.permissions?.sharing?.public_prompts || $user?.role === 'admin'}
 />
