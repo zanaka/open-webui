@@ -29,6 +29,10 @@
 		resourceType ?? ''
 	);
 
+	// Public needs both the permission and a resource whose readers are not
+	// enumerated as key holders.
+	$: canBePublic = sharePublic && !namedOnly;
+
 	let selectedGroupId = '';
 	let groups = [];
 
@@ -36,12 +40,12 @@
 	let userResults = [];
 	let knownUsers: Record<string, { id: string; name: string; email: string }> = {};
 
-	$: if ((!sharePublic || namedOnly) && accessControl === null) {
+	$: if (!canBePublic && accessControl === null) {
 		initPublicAccess();
 	}
 
 	const initPublicAccess = () => {
-		if ((!sharePublic || namedOnly) && accessControl === null) {
+		if (!canBePublic && accessControl === null) {
 			accessControl = {
 				read: {
 					group_ids: [],
@@ -186,7 +190,7 @@
 					}}
 				>
 					<option class=" text-gray-700" value="private" selected>{$i18n.t('Private')}</option>
-					{#if share && sharePublic && !namedOnly}
+					{#if share && canBePublic}
 						<option class=" text-gray-700" value="public" selected>{$i18n.t('Public')}</option>
 					{/if}
 				</select>
