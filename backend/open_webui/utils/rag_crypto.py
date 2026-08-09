@@ -42,6 +42,8 @@ KEYED_FIELDS = ("hash",)
 
 _HASH_INFO = b"owui-vector-hash-v1:"
 
+_FILE_HASH_INFO = b"owui-file-hash-v1:"
+
 _ENCRYPTED_METADATA_FIELDS = _ENCRYPTED_TEXT_FIELDS + _ENCRYPTED_LIST_FIELDS
 
 
@@ -49,6 +51,22 @@ def hash_token(value, key: bytes) -> str:
     """A content hash that only a holder of the collection's key can produce."""
     return hmac.new(
         key, _HASH_INFO + str(value).encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+
+
+def file_hash_token(value, dek: bytes) -> str:
+    """A file's content fingerprint, keyed to its owner at the moment it is made.
+
+    Applied right where the SHA-256 is computed, and from there carried around
+    exactly as the plain hash used to be: written to the file row, handed to the
+    vector store as metadata, read back and quoted in delete filters — always as
+    an opaque value, never reversed. Deterministic per owner, so a re-upload is
+    still recognised; useless to anyone else, so holding a copy of a document no
+    longer confirms who stores it. The distinct info prefix keeps these tokens
+    apart from the per-collection ones hash_token() derives from them.
+    """
+    return hmac.new(
+        dek, _FILE_HASH_INFO + str(value).encode("utf-8"), hashlib.sha256
     ).hexdigest()
 
 
