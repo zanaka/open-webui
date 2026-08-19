@@ -49,7 +49,10 @@ from open_webui.env import (
     GLOBAL_LOG_LEVEL,
 )
 
-from open_webui.utils.crypto_context import purge_expired_sessions
+from open_webui.utils.crypto_context import (
+    purge_expired_sessions,
+    set_current_user_id,
+)
 from open_webui.utils.vem_crypto import purge_expired_vems
 
 logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
@@ -413,7 +416,10 @@ async def join_note(sid, data):
     if not user:
         return
 
-    note = Notes.get_note_by_id(data["note_id"])
+    # Only who owns it and who may reach it, not what it says: joining a room
+    # needs no key, and loading the row here would decrypt it — which fails
+    # outside a request, where no user context is set.
+    note = Notes.get_note_access_by_id(data["note_id"])
     if not note:
         log.error(f"Note {data['note_id']} not found for user {user.id}")
         return
@@ -426,8 +432,8 @@ async def join_note(sid, data):
         log.error(f"User {user.id} does not have access to note {data['note_id']}")
         return
 
-    log.debug(f"Joining note {note.id} for user {user.id}")
-    await sio.enter_room(sid, f"note:{note.id}")
+    log.debug(f"Joining note {data['note_id']} for user {user.id}")
+    await sio.enter_room(sid, f"note:{data['note_id']}")
 
 
 @sio.on("events:channel")
@@ -475,7 +481,8 @@ async def ydoc_document_join(sid, data):
 
         if document_id.startswith("note:"):
             note_id = document_id.split(":")[1]
-            note = Notes.get_note_by_id(note_id)
+            # Ownership and reach only — see join_note.
+            note = Notes.get_note_access_by_id(note_id)
             if not note:
                 log.error(f"Note {note_id} not found")
                 return
@@ -545,7 +552,8 @@ async def ydoc_document_join(sid, data):
 async def document_save_handler(document_id, data, user):
     if document_id.startswith("note:"):
         note_id = document_id.split(":")[1]
-        note = Notes.get_note_by_id(note_id)
+        # Ownership and reach only — see join_note.
+        note = Notes.get_note_access_by_id(note_id)
         if not note:
             log.error(f"Note {note_id} not found")
             return
@@ -560,7 +568,15 @@ async def document_save_handler(document_id, data, user):
             log.error(f"User {user.get('id')} does not have access to note {note_id}")
             return
 
-        Notes.update_note_by_id(note_id, NoteUpdateForm(data=data))
+        # Writing re-encrypts the row, and outside a request no user context is
+        # set, so the save ran keyless and failed — edits looked saved but were
+        # not. The socket session's user holds the key (their DEK is cached
+        # while they are signed in), so act as them for the write.
+        set_current_user_id(user.get("id"))
+        try:
+            Notes.update_note_by_id(note_id, NoteUpdateForm(data=data))
+        finally:
+            set_current_user_id(None)
 
 
 @sio.on("ydoc:document:state")
