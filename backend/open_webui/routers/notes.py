@@ -19,7 +19,6 @@ from open_webui.models.notes import (
 )
 
 from open_webui.config import (
-    BYPASS_ADMIN_ACCESS_CONTROL,
     ENABLE_ADMIN_CHAT_ACCESS,
     ENABLE_ADMIN_EXPORT,
 )
@@ -128,12 +127,16 @@ async def search_notes(
     if direction:
         filter["direction"] = direction
 
-    if not user.role == "admin" or not BYPASS_ADMIN_ACCESS_CONTROL:
-        groups = Groups.get_groups_by_member_id(user.id, db=db)
-        if groups:
-            filter["group_ids"] = [group.id for group in groups]
+    # Listed by what the person can open, administrator or not: a note is
+    # opened with a key its owner and named recipients hold, and an
+    # administrator holds no key for someone else's. Widening the query for an
+    # admin (BYPASS_ADMIN_ACCESS_CONTROL) would load rows it cannot decrypt and
+    # fail the whole listing. Mirrors get_knowledge_bases.
+    groups = Groups.get_groups_by_member_id(user.id, db=db)
+    if groups:
+        filter["group_ids"] = [group.id for group in groups]
 
-        filter["user_id"] = user.id
+    filter["user_id"] = user.id
 
     return Notes.search_notes(user.id, filter, skip=skip, limit=limit, db=db)
 
