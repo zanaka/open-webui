@@ -102,7 +102,7 @@
 					}}
 				/>
 			{:else}
-				<div class="flex flex-row justify-center gap-3 @sm:gap-3.5 w-fit px-5 max-w-xl">
+				<div class="flex flex-row justify-center gap-3 @sm:gap-3.5 w-fit px-5 max-w-[min(36rem,100%)]">
 					<div class="flex shrink-0 justify-center">
 						<div class="flex -space-x-4 mb-0.5" in:fade={{ duration: 100 }}>
 							{#each models as model, modelIdx}
@@ -134,16 +134,16 @@
 					</div>
 
 					<div
-						class=" text-3xl @sm:text-3xl line-clamp-1 flex items-center"
+						class=" text-3xl @sm:text-3xl flex items-center min-w-0"
 						in:fade={{ duration: 100 }}
 					>
 						{#if models[selectedModelIdx]?.name}
 							<Tooltip
 								content={models[selectedModelIdx]?.name}
 								placement="top"
-								className=" flex items-center "
+								className=" flex items-center min-w-0 "
 							>
-								<span class="line-clamp-1">
+								<span class="truncate">
 									{models[selectedModelIdx]?.name}
 								</span>
 							</Tooltip>
