@@ -75,6 +75,29 @@ def run_migrations():
     except Exception as e:
         log.exception(f'Error running migrations: {e}')
 
+    assert_migrations_current()
+
+
+def assert_migrations_current():
+    # The column encryption layer must never run against a half-migrated
+    # schema, so a failed upgrade is fatal here rather than logged and ignored.
+    from alembic.config import Config as AlembicConfig
+    from alembic.runtime.migration import MigrationContext
+    from alembic.script import ScriptDirectory
+
+    from open_webui.internal.db import engine
+
+    alembic_cfg = AlembicConfig(OPEN_WEBUI_DIR / 'alembic.ini')
+    alembic_cfg.set_main_option('script_location', str(OPEN_WEBUI_DIR / 'migrations'))
+    expected = set(ScriptDirectory.from_config(alembic_cfg).get_heads())
+    with engine.connect() as connection:
+        current = set(MigrationContext.configure(connection).get_current_heads())
+    if current != expected:
+        raise RuntimeError(
+            f'Database schema is not up to date (at {sorted(current)}, '
+            f'expected {sorted(expected)}); refusing to start'
+        )
+
 
 if ENABLE_DB_MIGRATIONS:
     run_migrations()
