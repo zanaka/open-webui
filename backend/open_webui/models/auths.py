@@ -4,18 +4,34 @@ from __future__ import annotations
 
 import logging
 import uuid
+from dataclasses import dataclass, field
 from typing import Optional
 
 import bcrypt
 from open_webui.internal.db import Base, JSONField, get_async_db_context
 from open_webui.models.users import User, UserModel, UserProfileImageResponse, Users
+from open_webui.utils.crypto_utils import (
+    derive_kek,
+    encrypt_value,
+    generate_dek,
+    generate_kdf_salt,
+    generate_rsa_keypair,
+    unwrap_dek,
+    wrap_dek,
+)
 from open_webui.utils.validate import validate_profile_image_url
 from pydantic import BaseModel, field_validator
-from sqlalchemy import Boolean, Column, String, Text, delete, select, update
+from sqlalchemy import Boolean, Column, LargeBinary, String, Text, delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class UserWithDek:
+    user: UserModel
+    dek: bytes = field(repr=False)
 
 # Pre-computed hash verified on signin paths that lack a real credential
 # (unknown user, inactive account) so response timing cannot reveal
@@ -32,6 +48,10 @@ class Auth(Base):  # credential ↔ user linkage
     email = Column(String)  # login address, kept in sync with User.email
     password = Column(Text)  # argon2 / bcrypt hash
     active = Column(Boolean)  # account soft-disable toggle
+    kdf_salt = Column(LargeBinary, nullable=False)
+    wrapped_dek = Column(LargeBinary, nullable=False)
+    public_key = Column(LargeBinary, nullable=False)
+    wrapped_private_key = Column(LargeBinary, nullable=False)
 
 
 class AuthModel(BaseModel):
@@ -41,6 +61,10 @@ class AuthModel(BaseModel):
     email: str
     password: str
     active: bool = True
+    kdf_salt: bytes
+    wrapped_dek: bytes
+    public_key: bytes
+    wrapped_private_key: bytes
 
 
 class Token(BaseModel):
@@ -104,24 +128,37 @@ class AuthsTable:
     async def insert_new_auth(
         self,
         email: str,
-        password: str,
+        hashed_password: str,
         name: str,
+        raw_password: str,
         profile_image_url: str = '/user.png',
         role: str = 'pending',
         oauth: dict | None = None,
         db: AsyncSession | None = None,
-    ) -> UserModel | None:
+    ) -> Optional['UserWithDek']:
         """Create an Auth + User pair inside a single transaction."""
         async with get_async_db_context(db) as session:
             log.info('insert_new_auth')
 
             new_id = str(uuid.uuid4())
 
+            dek = generate_dek()
+            kdf_salt = generate_kdf_salt()
+            kek = derive_kek(raw_password, kdf_salt)
+            wrapped_dek = wrap_dek(dek, kek)
+
+            private_key_der, public_key_der = generate_rsa_keypair()
+            wrapped_private_key = encrypt_value(private_key_der, dek)
+
             credential = Auth(
                 id=new_id,
                 email=email,
-                password=password,
+                password=hashed_password,
                 active=True,
+                kdf_salt=kdf_salt,
+                wrapped_dek=wrapped_dek,
+                public_key=public_key_der,
+                wrapped_private_key=wrapped_private_key,
             )
             session.add(credential)
 
@@ -139,14 +176,17 @@ class AuthsTable:
             except IntegrityError:
                 await session.rollback()
                 raise
-            return created_user if credential and created_user else None
+            if credential and created_user:
+                return UserWithDek(user=created_user, dek=dek)
+            return None
 
     async def authenticate_user(
         self,
         email: str,
+        raw_password: str,
         verify_password: callable,
         db: AsyncSession | None = None,
-    ) -> UserModel | None:
+    ) -> Optional['UserWithDek']:
         """Verify email + password credentials and return the matching user."""
         log.info('authenticate_user: %s', email)
         resolved = await Users.get_user_by_email(email, db=db)
@@ -161,7 +201,27 @@ class AuthsTable:
                 return
             if not await verify_password(credential.password):
                 return
-            return resolved
+            kek = derive_kek(raw_password, credential.kdf_salt)
+            dek = unwrap_dek(credential.wrapped_dek, kek)
+            return UserWithDek(user=resolved, dek=dek)
+
+    async def get_public_key(
+        self,
+        user_id: str,
+        db: AsyncSession | None = None,
+    ) -> bytes | None:
+        async with get_async_db_context(db) as session:
+            credential = await session.get(Auth, user_id)
+            return credential.public_key if credential else None
+
+    async def get_wrapped_private_key(
+        self,
+        user_id: str,
+        db: AsyncSession | None = None,
+    ) -> bytes | None:
+        async with get_async_db_context(db) as session:
+            credential = await session.get(Auth, user_id)
+            return credential.wrapped_private_key if credential else None
 
     async def authenticate_user_by_api_key(
         self,
@@ -213,17 +273,29 @@ class AuthsTable:
     async def update_user_password_by_id(
         self,
         user_id: str,
-        new_password: str,
+        new_hashed_password: str,
+        new_raw_password: str,
+        current_raw_password: str,
         db: AsyncSession | None = None,
     ) -> bool:
-        """Set a new password hash for an existing user."""
-        async with get_async_db_context(db) as session:
-            auth_row = await session.get(Auth, user_id)
-            if auth_row is None:
-                return False
-            auth_row.password = new_password
-            await session.commit()
-            return True
+        """Set a new password hash and re-wrap the DEK under the new password."""
+        try:
+            async with get_async_db_context(db) as session:
+                auth_row = await session.get(Auth, user_id)
+                if auth_row is None:
+                    return False
+
+                current_kek = derive_kek(current_raw_password, auth_row.kdf_salt)
+                dek = unwrap_dek(auth_row.wrapped_dek, current_kek)
+
+                new_kek = derive_kek(new_raw_password, auth_row.kdf_salt)
+                auth_row.wrapped_dek = wrap_dek(dek, new_kek)
+                auth_row.password = new_hashed_password
+                await session.commit()
+                return True
+        except Exception:
+            log.exception('update_user_password_by_id error')
+            return False
 
     async def delete_auth_by_id(
         self,

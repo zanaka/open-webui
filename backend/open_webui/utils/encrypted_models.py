@@ -11,11 +11,17 @@ is the user making the request.
 
 import logging
 from dataclasses import dataclass
+from typing import Optional
 
 from sqlalchemy import event
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, object_session
 
 from open_webui.internal.db import Base
+from open_webui.models.access_grants import (
+    PRINCIPAL_TYPE_USER,
+    WILDCARD_PRINCIPAL_ID,
+    AccessGrant,
+)
 from open_webui.models.chats import Chat
 from open_webui.models.files import File
 from open_webui.models.folders import Folder
@@ -31,10 +37,11 @@ from open_webui.utils.crypto_context import (
     require_current_user_dek,
 )
 from open_webui.utils.resource_crypto import (
+    ResourceKeyAccessError,
+    SharingNotSupportedError,
+    _add_key,
     create_owner_key,
     resolve_key,
-    sync_shared_keys,
-    validate_shareable_access_control,
 )
 from open_webui.utils.crypto_utils import (
     decrypt_json_value,
@@ -128,7 +135,11 @@ def _key_for(target, policy: EncryptionPolicy) -> bytes:
         raise RuntimeError("No current user context. Cannot access encrypted data.")
 
     resource_id = getattr(target, policy.identity)
-    key = resolve_key(type(target).__name__, resource_id, actor)
+    # The row's own session is reused: this runs inside ORM events, where
+    # opening a second connection would stall the async engine's event loop.
+    key = resolve_key(
+        type(target).__name__, resource_id, actor, db=object_session(target)
+    )
     if key is None:
         raise EncryptedDataAccessDeniedError(
             f"{actor} holds no key for {type(target).__name__} {resource_id}."
@@ -136,11 +147,134 @@ def _key_for(target, policy: EncryptionPolicy) -> bytes:
     return key
 
 
+# Grant rows name resources by their lowercase API type and primary key; the
+# key store names them by model class and policy identity. This table carries
+# a grant to the shared encrypted model it concerns; grant types not listed
+# (models, tools, ...) hold no encrypted content and pass through untouched.
+GRANTED_SHARED_MODELS: dict[str, type] = {
+    "knowledge": Knowledge,
+    "note": Note,
+    "prompt": Prompt,
+}
+
+
+def _grant_key_identity(session, model: type, resource_id: str) -> Optional[str]:
+    """The key-store id for a granted resource.
+
+    Grants carry the row's primary key, but a prompt's key is stored against
+    its command (see the Prompt policy). Read as a column query so the row
+    itself is not loaded — and therefore not decrypted — along the way.
+    """
+    policy = ENCRYPTED_MODELS[model]
+    if policy.identity == "id":
+        return resource_id
+    row = (
+        session.query(getattr(model, policy.identity))
+        .filter(model.id == resource_id)
+        .first()
+    )
+    return row[0] if row else None
+
+
+def _validate_grant(grant) -> None:
+    """Named people only; a group, everyone, or a wildcard cannot be keyed."""
+    if grant.principal_type != PRINCIPAL_TYPE_USER or (
+        grant.principal_id == WILDCARD_PRINCIPAL_ID
+    ):
+        raise SharingNotSupportedError(
+            "Sharing with a group or with everyone is not available: encrypted "
+            "content is shared by handing a key to each named person."
+        )
+
+
+def _sync_granted_keys(session) -> None:
+    """Bring the stored key copies in line with the access grants being written.
+
+    set_access_grants replaces a resource's grants wholesale — it deletes the
+    old rows and adds the full new set through the ORM — so the flush shows
+    every change here: the wanted audience is the surviving grant rows plus
+    the pending ones.
+    """
+    touched: dict[tuple[str, str], type] = {}
+    for grant in list(session.new) + list(session.deleted):
+        if isinstance(grant, AccessGrant):
+            model = GRANTED_SHARED_MODELS.get(grant.resource_type)
+            if model is not None:
+                touched[(grant.resource_type, grant.resource_id)] = model
+
+    for (grant_type, grant_resource_id), model in touched.items():
+        new_grants = [
+            g
+            for g in session.new
+            if isinstance(g, AccessGrant)
+            and g.resource_type == grant_type
+            and g.resource_id == grant_resource_id
+        ]
+        for grant in new_grants:
+            _validate_grant(grant)
+
+        deleted_ids = {
+            g.id
+            for g in session.deleted
+            if isinstance(g, AccessGrant)
+            and g.resource_type == grant_type
+            and g.resource_id == grant_resource_id
+        }
+        surviving = [
+            g
+            for g in session.query(AccessGrant).filter_by(
+                resource_type=grant_type, resource_id=grant_resource_id
+            )
+            if g.id not in deleted_ids
+        ]
+
+        wanted = {g.principal_id for g in surviving + new_grants}
+
+        resource_type = model.__name__
+        resource_id = _grant_key_identity(session, model, grant_resource_id)
+        if resource_id is None:
+            # The resource is gone; its keys go with it below, or are already gone.
+            continue
+
+        key_rows = {
+            row.user_id: row
+            for row in session.query(ResourceKey).filter_by(
+                resource_type=resource_type, resource_id=resource_id
+            )
+        }
+        owner_row = (
+            session.query(getattr(model, ENCRYPTED_MODELS[model].owner))
+            .filter(model.id == grant_resource_id)
+            .first()
+        )
+        owner_id = owner_row[0] if owner_row else None
+
+        added = wanted - set(key_rows) - {owner_id}
+        removed = set(key_rows) - wanted - {owner_id}
+
+        if added:
+            actor = get_current_user_id()
+            key = (
+                resolve_key(resource_type, resource_id, actor, db=session)
+                if actor
+                else None
+            )
+            if key is None:
+                raise ResourceKeyAccessError(
+                    "Cannot change who this is shared with without holding its key."
+                )
+            for user_id in added:
+                _add_key(session, resource_type, resource_id, user_id, key)
+
+        for user_id in removed:
+            session.delete(key_rows[user_id])
+
+
 def _provision_resource_keys(session, flush_context, instances) -> None:
     """Give shared rows a key, and keep the shared copies in step.
 
     Runs before the flush, which is the only point where new rows may be added
-    to it. A feature that sets access_control gets the key handling for free —
+    to it. A feature that writes access grants gets the key handling for free —
     or a refusal, if it asks for an audience that cannot be keyed.
     """
     written = list(session.new) + [
@@ -155,20 +289,20 @@ def _provision_resource_keys(session, flush_context, instances) -> None:
         resource_type = type(target).__name__
         resource_id = getattr(target, policy.identity)
         owner_id = getattr(target, policy.owner)
-        access_control = getattr(target, "access_control", None)
-
-        validate_shareable_access_control(access_control)
 
         if target in session.new:
             key = create_owner_key(resource_type, resource_id, owner_id, session)
         else:
             actor = get_current_user_id()
-            key = resolve_key(resource_type, resource_id, actor) if actor else None
+            key = (
+                resolve_key(resource_type, resource_id, actor, db=session)
+                if actor
+                else None
+            )
 
         setattr(target, _RESOURCE_KEY_STASH, key)
-        sync_shared_keys(
-            resource_type, resource_id, owner_id, access_control, key, session
-        )
+
+    _sync_granted_keys(session)
 
     # A deleted resource takes its key copies with it, or the wrapped keys of
     # content that no longer exists would be left behind.

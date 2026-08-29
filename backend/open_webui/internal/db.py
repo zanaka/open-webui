@@ -385,6 +385,21 @@ def get_session():
 get_db = contextmanager(get_session)
 
 
+@contextmanager
+def get_db_context(db: Session | None = None):
+    """Sync counterpart of get_async_db_context, for the encryption hooks.
+
+    ORM event hooks run on the flush's own sync Session and must not call the
+    async table APIs, so the crypto modules stay sync and share the caller's
+    session through this helper.
+    """
+    if isinstance(db, Session) and DATABASE_ENABLE_SESSION_SHARING:
+        yield db
+    else:
+        with get_db() as session:
+            yield session
+
+
 # ============================================================
 # ASYNC ENGINE (used for ALL runtime database operations)
 # ============================================================
