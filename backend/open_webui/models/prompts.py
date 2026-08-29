@@ -9,6 +9,7 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
+from open_webui.crypto_exceptions import CryptoPolicyError
 from open_webui.internal.db import Base, JSONField, get_async_db_context
 from open_webui.models.access_grants import AccessGrantModel, AccessGrants
 from open_webui.models.groups import Groups
@@ -170,6 +171,10 @@ class PromptsTable:
                     await session.commit()
 
                 return await self._to_prompt_model(record, db=session)
+            except CryptoPolicyError:
+                # A refused audience is an answer for the caller, not a failure
+                # to write, so it must not be flattened into None here.
+                raise
             except Exception as e:
                 log.exception('Error creating prompt: %s', e)
                 return None
@@ -474,6 +479,8 @@ class PromptsTable:
                         await session.commit()
 
                 return await self._to_prompt_model(prompt, db=session)
+        except CryptoPolicyError:
+            raise
         except Exception:
             return None
 
@@ -549,6 +556,8 @@ class PromptsTable:
                         await session.commit()
 
                 return await self._to_prompt_model(prompt, db=session)
+        except CryptoPolicyError:
+            raise
         except Exception:
             return None
 
@@ -578,6 +587,8 @@ class PromptsTable:
                 await session.commit()
 
                 return await self._to_prompt_model(prompt, db=session)
+        except CryptoPolicyError:
+            raise
         except Exception:
             return None
 
@@ -641,37 +652,69 @@ class PromptsTable:
         except Exception:
             return None
 
+    async def get_prompt_access_by_command(self, command: str, db: AsyncSession | None = None):
+        """Who owns this prompt, without reading it.
+
+        For deciding whether an action is allowed — deleting, above all.
+        Deleting does not need the contents, so it must not need the key: an
+        administrator can remove someone's prompt without being able to open
+        it. Loading the row would decrypt it and refuse — and worse, the
+        refusal would be swallowed into None above and read as "not found".
+        """
+        from open_webui.utils.encrypted_models import read_without_decrypting_async
+
+        async with get_async_db_context(db) as session:
+            return await read_without_decrypting_async(
+                session, Prompt, command, 'id', 'command', 'user_id'
+            )
+
     async def delete_prompt_by_command(self, command: str, db: AsyncSession | None = None) -> bool:
-        """Permanently delete a prompt and its history."""
+        """Permanently delete a prompt and its history.
+
+        Deleting does not need the contents, so it must not need the key.
+        Loading the row would decrypt it, so this reads only clear columns and
+        deletes by statement.
+        """
+        from open_webui.utils.encrypted_models import (
+            delete_without_reading_async,
+            read_without_decrypting_async,
+        )
+
         try:
             async with get_async_db_context(db) as session:
-                result = await session.execute(select(Prompt).filter_by(command=command))
-                prompt = result.scalars().first()
-                if prompt:
-                    await PromptHistories.delete_history_by_prompt_id(prompt.id, db=session)
-                    await AccessGrants.revoke_all_access('prompt', prompt.id, db=session)
+                row = await read_without_decrypting_async(session, Prompt, command, 'id')
+                if not row:
+                    return False
+                prompt_id = row[0]
 
-                    await session.delete(prompt)
-                    await session.commit()
-                    return True
-                return False
-        except Exception:
+                await PromptHistories.delete_history_by_prompt_id(prompt_id, db=session)
+                await AccessGrants.revoke_all_access('prompt', prompt_id, db=session)
+                await delete_without_reading_async(session, Prompt, [command])
+                await session.commit()
+                return True
+        except Exception as err:
+            log.error(f'Failed to delete prompt: {err}')
             return False
 
     async def delete_prompt_by_id(self, prompt_id: str, db: AsyncSession | None = None) -> bool:
-        """Permanently delete a prompt and its history."""
+        """Permanently delete a prompt and its history.
+
+        Same key-free path as delete_prompt_by_command; see there.
+        """
+        from open_webui.utils.encrypted_models import delete_without_reading_async
+
         try:
             async with get_async_db_context(db) as session:
-                result = await session.execute(select(Prompt).filter_by(id=prompt_id))
-                prompt = result.scalars().first()
-                if prompt:
-                    await PromptHistories.delete_history_by_prompt_id(prompt.id, db=session)
-                    await AccessGrants.revoke_all_access('prompt', prompt.id, db=session)
+                result = await session.execute(select(Prompt.command).where(Prompt.id == prompt_id))
+                row = result.first()
+                if not row:
+                    return False
 
-                    await session.delete(prompt)
-                    await session.commit()
-                    return True
-                return False
+                await PromptHistories.delete_history_by_prompt_id(prompt_id, db=session)
+                await AccessGrants.revoke_all_access('prompt', prompt_id, db=session)
+                await delete_without_reading_async(session, Prompt, [row[0]])
+                await session.commit()
+                return True
         except Exception as err:
             log.error(f'Failed to delete prompt: {err}')
             return False  # deletion failed

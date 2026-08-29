@@ -13,7 +13,8 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
-from sqlalchemy import event
+from sqlalchemy import event, inspect, select
+from sqlalchemy import delete as sql_delete
 from sqlalchemy.orm import Session, object_session
 
 from open_webui.internal.db import Base
@@ -109,7 +110,7 @@ ENCRYPTED_MODELS: dict[type, EncryptionPolicy] = {
     # owner's key, which is in hand before the lookup; a shared prompt is not.
     Prompt: EncryptionPolicy(
         owner="user_id",
-        text=("title", "content"),
+        text=("name", "content"),
         shared=True,
         identity="command",
     ),
@@ -293,6 +294,17 @@ def _provision_resource_keys(session, flush_context, instances) -> None:
         if target in session.new:
             key = create_owner_key(resource_type, resource_id, owner_id, session)
         else:
+            # A renamed identity (a prompt's command can be edited) must carry
+            # the stored key copies along, or the row becomes undecryptable.
+            history = inspect(target).attrs[policy.identity].history
+            if history.has_changes() and history.deleted:
+                session.query(ResourceKey).filter_by(
+                    resource_type=resource_type, resource_id=history.deleted[0]
+                ).update(
+                    {ResourceKey.resource_id: resource_id},
+                    synchronize_session=False,
+                )
+
             actor = get_current_user_id()
             key = (
                 resolve_key(resource_type, resource_id, actor, db=session)
@@ -377,6 +389,44 @@ def delete_without_reading(session, model: type, ids: list[str]) -> None:
 
     session.query(model).filter(_identity_column(model).in_(ids)).delete(
         synchronize_session=False
+    )
+
+
+async def read_without_decrypting_async(session, model: type, id: str, *columns: str):
+    """read_without_decrypting for the async table APIs."""
+    policy = ENCRYPTED_MODELS.get(model)
+    if policy is not None:
+        encrypted = set(columns) & set(policy.columns)
+        if encrypted:
+            raise ValueError(
+                f"{', '.join(sorted(encrypted))} on {model.__name__} is encrypted. "
+                "Load the row itself, with the key, to read it."
+            )
+
+    result = await session.execute(
+        select(*[getattr(model, column) for column in columns]).where(
+            _identity_column(model) == id
+        )
+    )
+    return result.first()
+
+
+async def delete_without_reading_async(session, model: type, ids: list[str]) -> None:
+    """delete_without_reading for the async table APIs."""
+    if not ids:
+        return
+
+    policy = ENCRYPTED_MODELS.get(model)
+    if policy is not None and policy.shared:
+        await session.execute(
+            sql_delete(ResourceKey).where(
+                ResourceKey.resource_type == model.__name__,
+                ResourceKey.resource_id.in_(ids),
+            )
+        )
+
+    await session.execute(
+        sql_delete(model).where(_identity_column(model).in_(ids))
     )
 
 
@@ -491,6 +541,23 @@ NOT_ENCRYPTED: dict[str, str] = {
     "ChannelWebhook": "channels are closed; the token is compared by value anyway",
     "Message": "channels are closed; messages have many readers and no single owner",
     "MessageReaction": "channels are closed; emoji names",
+    # Models new in upstream v0.11.1, provisionally exempted so the merged app
+    # can boot. TODO(phase3): each gets its final decision — encrypt what holds
+    # user content (ChatMessage, Skill, PromptHistory, Calendar*), close what
+    # cannot be keyed (Automation runs headless with no DEK; SharedChat stores
+    # a plaintext snapshot of a chat).
+    "AccessGrant": "TODO(phase3): rows of ids and permissions only",
+    "Automation": "TODO(phase3): to be closed; scheduled runs execute with no DEK in cache",
+    "AutomationRun": "TODO(phase3): to be closed with Automation",
+    "Calendar": "TODO(phase3): to be encrypted with the owner's key",
+    "CalendarEvent": "TODO(phase3): to be encrypted with the owner's key",
+    "CalendarEventAttendee": "TODO(phase3): decide with Calendar; attendee rows",
+    "ChatMessage": "TODO(phase3): to be encrypted; primary message store",
+    "KnowledgeDirectory": "TODO(phase3): inspect columns, then encrypt or exempt",
+    "PinnedNote": "TODO(phase3): join table of ids",
+    "PromptHistory": "TODO(phase3): to be encrypted; snapshots duplicate prompt content",
+    "SharedChat": "TODO(phase3): to be closed; plaintext chat snapshots for sharing",
+    "Skill": "TODO(phase3): to be encrypted like prompts",
 }
 
 
