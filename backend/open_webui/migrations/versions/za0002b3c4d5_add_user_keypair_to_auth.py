@@ -9,8 +9,8 @@ Create Date: 2026-06-19 00:00:00.000000
 from alembic import op
 import sqlalchemy as sa
 
-revision = "b2c3d4e5f6a7"
-down_revision = "a1b2c3d4e5f6"
+revision = "za0002b3c4d5"
+down_revision = "za0001a2b3c4"
 branch_labels = None
 depends_on = None
 
