@@ -181,6 +181,23 @@ from open_webui.routers.retrieval import (
     get_reranking_function,
     get_rf,
 )
+from open_webui.crypto_exceptions import EncryptedDataAccessDeniedError
+from open_webui.utils.encrypted_models import (
+    assert_models_are_covered,
+    named_recipient_resources,
+)
+from open_webui.utils.encrypted_models import (
+    install as install_column_encryption,
+)
+from open_webui.utils.log_redaction import DEBUG_MODE
+from open_webui.utils.memory_lock import enable_memory_lock
+from open_webui.utils.resource_crypto import (
+    ResourceKeyAccessError,
+    SharingNotSupportedError,
+)
+
+install_column_encryption()
+
 from open_webui.socket.main import (
     MODELS,
     get_event_emitter,
@@ -353,6 +370,9 @@ async def lifespan(app: FastAPI):
 
     app.state.instance_id = INSTANCE_ID
     start_logger()
+    enable_memory_lock()
+    # Every model module has been imported by now, so the schema can be checked.
+    assert_models_are_covered()
 
     if RESET_CONFIG_ON_START:
         await async_reset_config()
@@ -504,6 +524,27 @@ app.state.oauth_manager = oauth_manager
 # For Integrations
 oauth_client_manager = OAuthClientManager(app)
 app.state.oauth_client_manager = oauth_client_manager
+
+
+# The encryption rules refuse some requests outright — an audience that cannot
+# be handed keys, or content the caller holds no key for. They are raised deep
+# in the save path so that no feature has to remember to check; turning them
+# into a response belongs here, once, rather than in each router.
+@app.exception_handler(SharingNotSupportedError)
+async def _sharing_not_supported(request: Request, exc: SharingNotSupportedError):
+    return JSONResponse(status_code=400, content={'detail': str(exc)})
+
+
+@app.exception_handler(ResourceKeyAccessError)
+async def _no_key_to_share(request: Request, exc: ResourceKeyAccessError):
+    return JSONResponse(status_code=403, content={'detail': str(exc)})
+
+
+@app.exception_handler(EncryptedDataAccessDeniedError)
+async def _encrypted_access_denied(request: Request, exc: EncryptedDataAccessDeniedError):
+    # Deliberately vague: whether a key exists is itself worth not confirming.
+    log.info('Refused encrypted access: %s', exc)
+    return JSONResponse(status_code=403, content={'detail': ERROR_MESSAGES.DEFAULT()})
 
 app.state.instance_id = None
 app.state.redis = None
@@ -2293,8 +2334,20 @@ async def get_app_config(request: Request):
             ),
             'auto_redirect': config.get('oauth.auto_redirect'),
         },
+        'sharing': {
+            # Which resources can only be shared with named people, read
+            # straight off the encryption registry so the two cannot drift.
+            # Offering an audience the save path will refuse is worse than not
+            # offering it, so the interface asks rather than assumes.
+            'named_recipients_only': named_recipient_resources(),
+        },
         'features': {
             # --- Public: required by login/signup page pre-auth ---
+            # Deliberately in the unauthenticated part of the config: while the
+            # deployment logs in debug mode, everyone who opens it — including
+            # the login page — is told that what they type may be recorded.
+            # The same flag decides both; see utils/log_redaction.py.
+            'debug_mode': DEBUG_MODE,
             'auth': WEBUI_AUTH,
             'auth_trusted_header': bool(WEBUI_AUTH_TRUSTED_EMAIL_HEADER),
             'enable_signup_password_confirmation': ENABLE_SIGNUP_PASSWORD_CONFIRMATION,
@@ -2320,7 +2373,8 @@ async def get_app_config(request: Request):
                     'enable_plugins': ENABLE_PLUGINS,
                     'enable_folders': config.get('folders.enable'),
                     'folder_max_file_count': config.get('folders.max_file_count'),
-                    'enable_channels': config.get('channels.enable'),
+                    # Closed regardless of the setting; see routers/channels.py.
+                    'enable_channels': False,
                     'enable_calendar': config.get('calendar.enable'),
                     'enable_automations': config.get('automations.enable'),
                     'enable_notes': config.get('notes.enable'),
@@ -2334,7 +2388,8 @@ async def get_app_config(request: Request):
                     'enable_image_generation': config.get('image_generation.enable'),
                     'enable_autocomplete_generation': config.get('task.autocomplete.enable'),
                     'enable_community_sharing': config.get('ui.enable_community_sharing'),
-                    'enable_message_rating': config.get('ui.enable_message_rating'),
+                    # Closed regardless of the setting; see routers/evaluations.py.
+                    'enable_message_rating': False,
                     'enable_user_webhooks': config.get('ui.enable_user_webhooks'),
                     'enable_user_status': config.get('users.enable_status'),
                     'enable_admin_export': ENABLE_ADMIN_EXPORT,

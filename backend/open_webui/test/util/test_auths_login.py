@@ -1,11 +1,8 @@
 from dataclasses import dataclass
 
 import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from conftest import run, sqlite_test_database
 
-from open_webui.internal import db as internal_db
-from open_webui.internal.db import Base
 from open_webui.models.auths import Auth, Auths, UserWithDek
 from open_webui.models.users import User
 
@@ -25,11 +22,11 @@ INACTIVE = {
 }
 
 
-def _always_true(_stored_hash):
+async def _always_true(_stored_hash):
     return True
 
 
-def _always_false(_stored_hash):
+async def _always_false(_stored_hash):
     return False
 
 
@@ -40,64 +37,62 @@ class Accounts:
 
 
 @pytest.fixture(scope="module")
-def accounts() -> Accounts:
+def accounts(tmp_path_factory) -> Accounts:
     mp = pytest.MonkeyPatch()
-    mp.setattr(internal_db, "DATABASE_ENABLE_SESSION_SHARING", True)
-
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine, tables=[User.__table__, Auth.__table__])
-    session = sessionmaker(bind=engine)()
-
-    created = Auths.insert_new_auth(
-        email=ACTIVE["email"],
-        hashed_password=ACTIVE["hashed_password"],
-        name=ACTIVE["name"],
-        raw_password=ACTIVE["raw_password"],
-        role="user",
-        db=session,
-    )
-
-    # Inactive account
-    session.add(
-        User(
-            id=INACTIVE["id"],
-            email=INACTIVE["email"],
-            role="user",
-            name=INACTIVE["name"],
-            profile_image_url="/user.png",
-            last_active_at=NOW,
-            created_at=NOW,
-            updated_at=NOW,
+    db_path = tmp_path_factory.mktemp("auths-login") / "test.db"
+    with sqlite_test_database(
+        mp, db_path, tables=[User.__table__, Auth.__table__]
+    ) as session:
+        created = run(
+            Auths.insert_new_auth(
+                email=ACTIVE["email"],
+                hashed_password=ACTIVE["hashed_password"],
+                name=ACTIVE["name"],
+                raw_password=ACTIVE["raw_password"],
+                role="user",
+            )
         )
-    )
-    session.add(
-        Auth(
-            id=INACTIVE["id"],
-            email=INACTIVE["email"],
-            password=INACTIVE["hashed_password"],
-            active=False,
-            kdf_salt=b"\x00" * 16,
-            wrapped_dek=b"\x00" * 60,
-            public_key=b"\x00" * 32,
-            wrapped_private_key=b"\x00" * 32,
+
+        # Inactive account
+        session.add(
+            User(
+                id=INACTIVE["id"],
+                email=INACTIVE["email"],
+                role="user",
+                name=INACTIVE["name"],
+                profile_image_url="/user.png",
+                last_active_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
         )
-    )
-    session.commit()
+        session.add(
+            Auth(
+                id=INACTIVE["id"],
+                email=INACTIVE["email"],
+                password=INACTIVE["hashed_password"],
+                active=False,
+                kdf_salt=b"\x00" * 16,
+                wrapped_dek=b"\x00" * 60,
+                public_key=b"\x00" * 32,
+                wrapped_private_key=b"\x00" * 32,
+            )
+        )
+        session.commit()
 
-    yield Accounts(session=session, created=created)
+        yield Accounts(session=session, created=created)
 
-    session.close()
-    engine.dispose()
     mp.undo()
 
 
 @pytest.fixture(scope="module")
 def login_ok(accounts) -> UserWithDek:
-    return Auths.authenticate_user(
-        ACTIVE["email"],
-        ACTIVE["raw_password"],
-        verify_password=_always_true,
-        db=accounts.session,
+    return run(
+        Auths.authenticate_user(
+            ACTIVE["email"],
+            ACTIVE["raw_password"],
+            verify_password=_always_true,
+        )
     )
 
 
@@ -114,52 +109,57 @@ class TestVerifyPasswordContract:
     def test_verify_password_receives_stored_hash(self, accounts):
         captured = {}
 
-        def verify(stored_hash):
+        async def verify(stored_hash):
             captured["arg"] = stored_hash
             return False
 
-        Auths.authenticate_user(
-            ACTIVE["email"],
-            ACTIVE["raw_password"],
-            verify_password=verify,
-            db=accounts.session,
+        run(
+            Auths.authenticate_user(
+                ACTIVE["email"],
+                ACTIVE["raw_password"],
+                verify_password=verify,
+            )
         )
         assert captured["arg"] == ACTIVE["hashed_password"]
 
 
 class TestFailedLogin:
     def test_wrong_password_hash_returns_none(self, accounts):
-        result = Auths.authenticate_user(
-            ACTIVE["email"],
-            ACTIVE["raw_password"],
-            verify_password=_always_false,
-            db=accounts.session,
+        result = run(
+            Auths.authenticate_user(
+                ACTIVE["email"],
+                ACTIVE["raw_password"],
+                verify_password=_always_false,
+            )
         )
         assert result is None
 
     def test_unknown_email_returns_none(self, accounts):
-        result = Auths.authenticate_user(
-            "nobody@example.com",
-            "whatever_pass",
-            verify_password=_always_true,
-            db=accounts.session,
+        result = run(
+            Auths.authenticate_user(
+                "nobody@example.com",
+                "whatever_pass",
+                verify_password=_always_true,
+            )
         )
         assert result is None
 
     def test_inactive_user_returns_none(self, accounts):
-        result = Auths.authenticate_user(
-            INACTIVE["email"],
-            "whatever_pass",
-            verify_password=_always_true,
-            db=accounts.session,
+        result = run(
+            Auths.authenticate_user(
+                INACTIVE["email"],
+                "whatever_pass",
+                verify_password=_always_true,
+            )
         )
         assert result is None
 
     def test_hash_ok_but_wrong_raw_password_cannot_recover_dek(self, accounts):
-        result = Auths.authenticate_user(
-            ACTIVE["email"],
-            "not-the-real-password",
-            verify_password=_always_true,
-            db=accounts.session,
+        result = run(
+            Auths.authenticate_user(
+                ACTIVE["email"],
+                "not-the-real-password",
+                verify_password=_always_true,
+            )
         )
         assert result is None

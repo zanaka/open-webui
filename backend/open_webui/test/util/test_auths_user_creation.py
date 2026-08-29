@@ -1,12 +1,10 @@
 from dataclasses import dataclass
 
 import pytest
+from conftest import run, sqlite_test_database
 from cryptography.exceptions import InvalidTag
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import text
 
-from open_webui.internal import db as internal_db
-from open_webui.internal.db import Base
 from open_webui.models.auths import Auth, Auths, UserWithDek
 from open_webui.models.users import User
 from open_webui.utils.crypto_utils import NONCE_SIZE, derive_kek, unwrap_dek
@@ -33,36 +31,34 @@ class Created:
 
 
 @pytest.fixture(scope="module")
-def created() -> Created:
+def created(tmp_path_factory) -> Created:
     """Create two accounts once (2 Argon2id derivations) and reuse them."""
     mp = pytest.MonkeyPatch()
-    mp.setattr(internal_db, "DATABASE_ENABLE_SESSION_SHARING", True)
+    db_path = tmp_path_factory.mktemp("auths-creation") / "test.db"
+    with sqlite_test_database(
+        mp, db_path, tables=[User.__table__, Auth.__table__]
+    ) as session:
+        a = run(
+            Auths.insert_new_auth(
+                email=USER_A["email"],
+                hashed_password=USER_A["hashed_password"],
+                name=USER_A["name"],
+                raw_password=USER_A["raw_password"],
+                role="user",
+            )
+        )
+        b = run(
+            Auths.insert_new_auth(
+                email=USER_B["email"],
+                hashed_password=USER_B["hashed_password"],
+                name=USER_B["name"],
+                raw_password=USER_B["raw_password"],
+                role="user",
+            )
+        )
 
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine, tables=[User.__table__, Auth.__table__])
-    session = sessionmaker(bind=engine)()
+        yield Created(session=session, a=a, b=b)
 
-    a = Auths.insert_new_auth(
-        email=USER_A["email"],
-        hashed_password=USER_A["hashed_password"],
-        name=USER_A["name"],
-        raw_password=USER_A["raw_password"],
-        role="user",
-        db=session,
-    )
-    b = Auths.insert_new_auth(
-        email=USER_B["email"],
-        hashed_password=USER_B["hashed_password"],
-        name=USER_B["name"],
-        raw_password=USER_B["raw_password"],
-        role="user",
-        db=session,
-    )
-
-    yield Created(session=session, a=a, b=b)
-
-    session.close()
-    engine.dispose()
     mp.undo()
 
 

@@ -1,11 +1,9 @@
 import time
 
 import pytest
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
+from conftest import run, sqlite_test_database
+from sqlalchemy import text
 
-from open_webui.internal import db as internal_db
-from open_webui.internal.db import Base
 from open_webui.models.tags import Tag, Tags
 from open_webui.utils import crypto_context
 from open_webui.utils.crypto_context import cache_dek, set_current_user_id
@@ -36,16 +34,11 @@ def _keys():
 
 
 @pytest.fixture
-def db(monkeypatch):
-    monkeypatch.setattr(internal_db, "DATABASE_ENABLE_SESSION_SHARING", True)
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine, tables=[Tag.__table__])
-    session = sessionmaker(bind=engine)()
-
-    yield session
-
-    session.close()
-    engine.dispose()
+def db(monkeypatch, tmp_path):
+    with sqlite_test_database(
+        monkeypatch, tmp_path / "test.db", tables=[Tag.__table__]
+    ) as session:
+        yield session
 
 
 def _raw(db):
@@ -89,49 +82,49 @@ class TestTagId:
 
 class TestAtRest:
     def test_neither_the_id_nor_the_name_spells_the_tag(self, db):
-        Tags.insert_new_tag(TAG_NAME, USER_ID, db=db)
+        run(Tags.insert_new_tag(TAG_NAME, USER_ID))
 
         stored = _raw(db).lower()
         assert "falcon" not in stored
 
     def test_round_trips(self, db):
-        created = Tags.insert_new_tag(TAG_NAME, USER_ID, db=db)
+        created = run(Tags.insert_new_tag(TAG_NAME, USER_ID))
 
         assert created.name == TAG_NAME
-        assert Tags.get_tag_by_name_and_user_id(TAG_NAME, USER_ID, db=db).name == (
+        assert run(Tags.get_tag_by_name_and_user_id(TAG_NAME, USER_ID)).name == (
             TAG_NAME
         )
 
 
 class TestLookup:
     def test_finds_the_tag_by_name(self, db):
-        created = Tags.insert_new_tag(TAG_NAME, USER_ID, db=db)
+        created = run(Tags.insert_new_tag(TAG_NAME, USER_ID))
 
-        found = Tags.get_tag_by_name_and_user_id(TAG_NAME, USER_ID, db=db)
+        found = run(Tags.get_tag_by_name_and_user_id(TAG_NAME, USER_ID))
 
         assert found.id == created.id
 
     def test_normalisation_still_applies(self, db):
-        created = Tags.insert_new_tag(TAG_NAME, USER_ID, db=db)
+        created = run(Tags.insert_new_tag(TAG_NAME, USER_ID))
 
-        found = Tags.get_tag_by_name_and_user_id("project_falcon", USER_ID, db=db)
+        found = run(Tags.get_tag_by_name_and_user_id("project_falcon", USER_ID))
 
         assert found.id == created.id
 
     def test_unknown_name_is_not_found(self, db):
-        Tags.insert_new_tag(TAG_NAME, USER_ID, db=db)
+        run(Tags.insert_new_tag(TAG_NAME, USER_ID))
 
-        assert Tags.get_tag_by_name_and_user_id("no such tag", USER_ID, db=db) is None
+        assert run(Tags.get_tag_by_name_and_user_id("no such tag", USER_ID)) is None
 
     def test_lookup_by_id_still_works(self, db):
-        created = Tags.insert_new_tag(TAG_NAME, USER_ID, db=db)
+        created = run(Tags.insert_new_tag(TAG_NAME, USER_ID))
 
-        found = Tags.get_tags_by_ids_and_user_id([created.id], USER_ID, db=db)
+        found = run(Tags.get_tags_by_ids_and_user_id([created.id], USER_ID))
 
         assert [tag.name for tag in found] == [TAG_NAME]
 
     def test_delete_by_name(self, db):
-        Tags.insert_new_tag(TAG_NAME, USER_ID, db=db)
+        run(Tags.insert_new_tag(TAG_NAME, USER_ID))
 
-        assert Tags.delete_tag_by_name_and_user_id(TAG_NAME, USER_ID, db=db) is True
-        assert Tags.get_tag_by_name_and_user_id(TAG_NAME, USER_ID, db=db) is None
+        assert run(Tags.delete_tag_by_name_and_user_id(TAG_NAME, USER_ID)) is True
+        assert run(Tags.get_tag_by_name_and_user_id(TAG_NAME, USER_ID)) is None

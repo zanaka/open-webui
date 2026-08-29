@@ -48,6 +48,7 @@ from open_webui.models.auths import (
     SignupForm,
     Token,
     UpdatePasswordForm,
+    UserWithDek,
 )
 from open_webui.models.config import Config
 from open_webui.models.groups import Groups
@@ -60,6 +61,7 @@ from open_webui.models.users import (
     UserStatus,
 )
 from open_webui.utils.access_control import get_permissions, has_permission
+from open_webui.utils.crypto_context import cache_dek, get_cached_dek, remove_session
 from open_webui.utils.auth import (
     create_api_key,
     create_token,
@@ -170,6 +172,7 @@ async def create_session_response(
     response: Response = None,
     set_cookie: bool = False,
     source: str = 'api',
+    dek: bytes | None = None,
 ) -> dict:
     """
     Create JWT token and build session response for a user.
@@ -181,16 +184,23 @@ async def create_session_response(
         db: Database session
         response: FastAPI response object (required if set_cookie is True)
         set_cookie: Whether to set the auth cookie on the response
+        dek: The user's unwrapped data encryption key, cached for this
+            session's lifetime so their encrypted rows can be opened
     """
     expires_delta = parse_duration(await Config.get('auth.jwt_expiry'))
     expires_at = None
     if expires_delta:
         expires_at = int(time.time()) + int(expires_delta.total_seconds())
 
+    jti = str(uuid.uuid4())
     token = create_token(
         data={'id': user.id},
         expires_delta=expires_delta,
+        jti=jti,
     )
+
+    if dek is not None and expires_at is not None:
+        cache_dek(user.id, dek, jti, float(expires_at))
 
     if set_cookie and response:
         datetime_expires_at = datetime.datetime.fromtimestamp(expires_at, datetime.timezone.utc) if expires_at else None
@@ -252,6 +262,12 @@ async def get_session_user(
     user=Depends(get_current_user),
     db: AsyncSession = Depends(get_async_session),
 ):
+    if get_cached_dek(user.id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail='Session expired. Please log in again.',
+        )
+
     token = None
     auth_header = request.headers.get('Authorization')
     if auth_header:
@@ -393,19 +409,23 @@ async def update_password(
     if WEBUI_AUTH_TRUSTED_EMAIL_HEADER:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=ERROR_MESSAGES.ACTION_PROHIBITED)
     if session_user:
-        user = await Auths.authenticate_user(
+        user_with_dek = await Auths.authenticate_user(
             session_user.email,
+            form_data.password,
             lambda pw: verify_password(form_data.password, pw),
             db=db,
         )
 
-        if user:
+        if user_with_dek:
+            user = user_with_dek.user
             try:
                 validate_password(form_data.new_password)
             except Exception as e:
                 raise HTTPException(400, detail=str(e))
             hashed = await get_password_hash(form_data.new_password)
-            success = await Auths.update_user_password_by_id(user.id, hashed, db=db)
+            success = await Auths.update_user_password_by_id(
+                user.id, hashed, form_data.new_password, form_data.password, db=db
+            )
             if success:
                 await revoke_user_tokens(request, user.id)
                 await publish_event(
@@ -645,6 +665,11 @@ async def ldap_auth(
 
             user = await Users.get_user_by_email(email, db=db)
             if not user:
+                raise HTTPException(
+                    501,
+                    detail='To use LDAP, provide data encryption key to raw_password argument.',
+                )
+
                 try:
                     # Insert with default role first to avoid TOCTOU race on
                     # first-user registration.  Matches signup_handler pattern.
@@ -727,6 +752,8 @@ async def signin(
         )
 
     auth_source = 'password'
+    user = None
+    dek = None
 
     if WEBUI_AUTH_TRUSTED_EMAIL_HEADER:
         auth_source = 'trusted_header'
@@ -742,6 +769,14 @@ async def signin(
                 name = urllib.parse.unquote(name, encoding='utf-8')
             except Exception as e:
                 pass
+
+        # A trusted header carries no password, so there is nothing to derive
+        # the user's key-encryption key from: the account could be created,
+        # but its encrypted data could never be opened.
+        raise HTTPException(
+            501,
+            detail='To use trusted-header auth, provide data encryption key to raw_password argument.',
+        )
 
         if not await Users.get_user_by_email(email.lower(), db=db):
             try:
@@ -790,8 +825,9 @@ async def signin(
         admin_password = 'admin'
 
         if await Users.get_user_by_email(admin_email.lower(), db=db):
-            user = await Auths.authenticate_user(
+            user_with_dek = await Auths.authenticate_user(
                 admin_email.lower(),
+                admin_password,
                 lambda pw: verify_password(admin_password, pw),
                 db=db,
             )
@@ -808,11 +844,15 @@ async def signin(
                 source='system',
             )
 
-            user = await Auths.authenticate_user(
+            user_with_dek = await Auths.authenticate_user(
                 admin_email.lower(),
+                admin_password,
                 lambda pw: verify_password(admin_password, pw),
                 db=db,
             )
+        if user_with_dek:
+            user = user_with_dek.user
+            dek = user_with_dek.dek
     else:
         if signin_rate_limiter.is_limited(form_data.email.lower()):
             raise HTTPException(
@@ -820,14 +860,18 @@ async def signin(
                 detail=ERROR_MESSAGES.RATE_LIMIT_EXCEEDED,
             )
 
-        user = await Auths.authenticate_user(
+        user_with_dek = await Auths.authenticate_user(
             form_data.email.lower(),
+            form_data.password,
             lambda pw: verify_password(form_data.password, pw),
             db=db,
         )
+        if user_with_dek:
+            user = user_with_dek.user
+            dek = user_with_dek.dek
 
     if user:
-        return await create_session_response(request, user, db, response, set_cookie=True, source=auth_source)
+        return await create_session_response(request, user, db, response, set_cookie=True, source=auth_source, dek=dek)
     else:
         raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_CRED)
 
@@ -846,12 +890,12 @@ async def signup_handler(
     *,
     db: AsyncSession,
     source: str = 'api',
-) -> UserModel:
+) -> UserWithDek:
     """
     Core user-creation logic shared by the signup endpoint and
     trusted-header / no-auth auto-registration flows.
 
-    Returns the newly created UserModel.
+    Returns the newly created user together with their unwrapped DEK.
     Raises HTTPException on failure.
     """
     # Insert with default role first to avoid TOCTOU race on first signup.
@@ -859,16 +903,18 @@ async def signup_handler(
     # first-user registration can all see an empty table and each get admin.
     hashed = await get_password_hash(password)
 
-    user = await Auths.insert_new_auth(
+    user_with_dek = await Auths.insert_new_auth(
         email=email.lower(),
-        password=hashed,
+        hashed_password=hashed,
         name=name,
+        raw_password=password,
         profile_image_url=profile_image_url,
         role=await Config.get('ui.default_user_role'),
         db=db,
     )
-    if not user:
+    if not user_with_dek:
         raise HTTPException(500, detail=ERROR_MESSAGES.CREATE_USER_ERROR)
+    user = user_with_dek.user
 
     # Atomically check if this is the only user *after* the insert.
     # Only the single user present at this point should become admin.
@@ -892,7 +938,7 @@ async def signup_handler(
         data={'role': user.role},
     )
 
-    return user
+    return UserWithDek(user=user, dek=user_with_dek.dek)
 
 
 @router.post('/signup', response_model=SessionUserResponse)
@@ -927,7 +973,7 @@ async def signup(
         except Exception as e:
             raise HTTPException(400, detail=str(e))
 
-        user = await signup_handler(
+        user_with_dek = await signup_handler(
             request,
             form_data.email,
             form_data.password,
@@ -935,6 +981,7 @@ async def signup(
             form_data.profile_image_url,
             db=db,
         )
+        user = user_with_dek.user
         await publish_event(
             request,
             EVENTS.AUTH_SIGNUP,
@@ -943,7 +990,9 @@ async def signup(
             subject_type='user',
             data={'email': user.email},
         )
-        return await create_session_response(request, user, db, response, set_cookie=True)
+        return await create_session_response(
+            request, user, db, response, set_cookie=True, dek=user_with_dek.dek
+        )
     except HTTPException:
         raise
     except Exception as err:
@@ -971,6 +1020,10 @@ async def signout(request: Request, response: Response, db: AsyncSession = Depen
         data = decode_token(token)
         if data and data.get('id'):
             actor = await Users.get_user_by_id(data['id'], db=db)
+            # Drop this session's claim on the DEK; the key leaves memory with
+            # the last session.
+            if data.get('jti'):
+                remove_session(data['id'], data['jti'])
         await invalidate_token(request, token)
         await publish_event(
             request,
@@ -1118,16 +1171,18 @@ async def add_user(
             raise HTTPException(400, detail=str(e))
 
         hashed = await get_password_hash(form_data.password)
-        user = await Auths.insert_new_auth(
+        user_with_dek = await Auths.insert_new_auth(
             form_data.email.lower(),
             hashed,
             form_data.name,
+            form_data.password,
             form_data.profile_image_url,
             form_data.role,
             db=db,
         )
 
-        if user:
+        if user_with_dek:
+            user = user_with_dek.user
             await apply_default_group_assignment(
                 await Config.get('ui.default_group_id'),
                 user.id,

@@ -1,12 +1,10 @@
 from dataclasses import dataclass
 
 import pytest
+from conftest import run, sqlite_test_database
 from cryptography.exceptions import InvalidTag
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import text
 
-from open_webui.internal import db as internal_db
-from open_webui.internal.db import Base
 from open_webui.models.auths import Auth, Auths
 from open_webui.models.users import User
 from open_webui.utils.crypto_utils import derive_kek, unwrap_dek
@@ -26,12 +24,6 @@ def _raw_auth_row(session, user_id):
     ).one()
 
 
-def _make_session():
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine, tables=[User.__table__, Auth.__table__])
-    return engine, sessionmaker(bind=engine)()
-
-
 @dataclass
 class Changed:
     session: object
@@ -46,46 +38,47 @@ class Changed:
 
 
 @pytest.fixture(scope="module")
-def changed() -> Changed:
+def changed(tmp_path_factory) -> Changed:
     mp = pytest.MonkeyPatch()
-    mp.setattr(internal_db, "DATABASE_ENABLE_SESSION_SHARING", True)
-    engine, session = _make_session()
+    db_path = tmp_path_factory.mktemp("auths-pw-changed") / "test.db"
+    with sqlite_test_database(
+        mp, db_path, tables=[User.__table__, Auth.__table__]
+    ) as session:
+        created = run(
+            Auths.insert_new_auth(
+                email=EMAIL,
+                hashed_password=OLD_HASH_PASSWORD,
+                name=NAME,
+                raw_password=OLD_RAW_PASSWORD,
+                role="user",
+            )
+        )
+        user_id = created.user.id
+        original_salt, original_wrapped_dek, _ = _raw_auth_row(session, user_id)
 
-    created = Auths.insert_new_auth(
-        email=EMAIL,
-        hashed_password=OLD_HASH_PASSWORD,
-        name=NAME,
-        raw_password=OLD_RAW_PASSWORD,
-        role="user",
-        db=session,
-    )
-    user_id = created.user.id
-    original_salt, original_wrapped_dek, _ = _raw_auth_row(session, user_id)
+        result = run(
+            Auths.update_user_password_by_id(
+                user_id,
+                NEW_HASH_PASSWORD,
+                NEW_RAW_PASSWORD,
+                OLD_RAW_PASSWORD,
+            )
+        )
 
-    result = Auths.update_user_password_by_id(
-        user_id,
-        NEW_HASH_PASSWORD,
-        NEW_RAW_PASSWORD,
-        OLD_RAW_PASSWORD,
-        db=session,
-    )
+        new_salt, new_wrapped_dek, new_password = _raw_auth_row(session, user_id)
 
-    new_salt, new_wrapped_dek, new_password = _raw_auth_row(session, user_id)
+        yield Changed(
+            session=session,
+            user_id=user_id,
+            result=result,
+            original_dek=created.dek,
+            original_salt=original_salt,
+            original_wrapped_dek=original_wrapped_dek,
+            new_salt=new_salt,
+            new_wrapped_dek=new_wrapped_dek,
+            new_password=new_password,
+        )
 
-    yield Changed(
-        session=session,
-        user_id=user_id,
-        result=result,
-        original_dek=created.dek,
-        original_salt=original_salt,
-        original_wrapped_dek=original_wrapped_dek,
-        new_salt=new_salt,
-        new_wrapped_dek=new_wrapped_dek,
-        new_password=new_password,
-    )
-
-    session.close()
-    engine.dispose()
     mp.undo()
 
 
@@ -97,36 +90,37 @@ class Rejected:
 
 
 @pytest.fixture(scope="module")
-def rejected() -> Rejected:
+def rejected(tmp_path_factory) -> Rejected:
     mp = pytest.MonkeyPatch()
-    mp.setattr(internal_db, "DATABASE_ENABLE_SESSION_SHARING", True)
-    engine, session = _make_session()
+    db_path = tmp_path_factory.mktemp("auths-pw-rejected") / "test.db"
+    with sqlite_test_database(
+        mp, db_path, tables=[User.__table__, Auth.__table__]
+    ) as session:
+        created = run(
+            Auths.insert_new_auth(
+                email=EMAIL,
+                hashed_password=OLD_HASH_PASSWORD,
+                name=NAME,
+                raw_password=OLD_RAW_PASSWORD,
+                role="user",
+            )
+        )
+        user_id = created.user.id
+        before = _raw_auth_row(session, user_id)
 
-    created = Auths.insert_new_auth(
-        email=EMAIL,
-        hashed_password=OLD_HASH_PASSWORD,
-        name=NAME,
-        raw_password=OLD_RAW_PASSWORD,
-        role="user",
-        db=session,
-    )
-    user_id = created.user.id
-    before = _raw_auth_row(session, user_id)
+        result = run(
+            Auths.update_user_password_by_id(
+                user_id,
+                NEW_HASH_PASSWORD,
+                NEW_RAW_PASSWORD,
+                "wrong-current-password",
+            )
+        )
 
-    result = Auths.update_user_password_by_id(
-        user_id,
-        NEW_HASH_PASSWORD,
-        NEW_RAW_PASSWORD,
-        "wrong-current-password",
-        db=session,
-    )
+        after = _raw_auth_row(session, user_id)
 
-    after = _raw_auth_row(session, user_id)
+        yield Rejected(result=result, before=before, after=after)
 
-    yield Rejected(result=result, before=before, after=after)
-
-    session.close()
-    engine.dispose()
     mp.undo()
 
 
@@ -156,11 +150,12 @@ class TestRejectedChange:
         assert rejected.after == rejected.before
 
     def test_unknown_user_returns_false(self, changed):
-        result = Auths.update_user_password_by_id(
-            "no-such-user",
-            NEW_HASH_PASSWORD,
-            NEW_RAW_PASSWORD,
-            OLD_RAW_PASSWORD,
-            db=changed.session,
+        result = run(
+            Auths.update_user_password_by_id(
+                "no-such-user",
+                NEW_HASH_PASSWORD,
+                NEW_RAW_PASSWORD,
+                OLD_RAW_PASSWORD,
+            )
         )
         assert result is False
