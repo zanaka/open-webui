@@ -1,4 +1,6 @@
 <script lang="ts">
+	import '$lib/utils/codemirror';
+
 	import { basicSetup, EditorView } from 'codemirror';
 	import { keymap, placeholder } from '@codemirror/view';
 	import { Compartment, EditorState } from '@codemirror/state';
@@ -6,14 +8,14 @@
 	import { acceptCompletion } from '@codemirror/autocomplete';
 	import { indentWithTab } from '@codemirror/commands';
 
-	import { indentUnit, LanguageDescription } from '@codemirror/language';
+	import { indentUnit } from '@codemirror/language';
 	import { languages } from '@codemirror/language-data';
 
 	import { oneDark } from '@codemirror/theme-one-dark';
 
 	import { onMount, createEventDispatcher, getContext, tick, onDestroy } from 'svelte';
 
-	import PyodideWorker from '$lib/workers/pyodide.worker?worker';
+	import { createPyodideWorker } from '$lib/pyodide/createPyodideWorker';
 
 	import { formatPythonCode } from '$lib/apis/utils';
 	import { toast } from 'svelte-sonner';
@@ -24,6 +26,7 @@
 
 	export let boilerplate = '';
 	export let value = '';
+	export let className = 'text-sm';
 
 	export let onSave = () => {};
 	export let onChange = () => {};
@@ -75,34 +78,16 @@
 	export let id = '';
 	export let lang = '';
 
-	let codeEditor;
+	let codeEditor: EditorView | null = null;
+	let codeEditorContainerElement: HTMLDivElement | undefined = undefined;
 
 	export const focus = () => {
-		codeEditor.focus();
+		codeEditor?.focus();
 	};
 
 	let isDarkMode = false;
 	let editorTheme = new Compartment();
 	let editorLanguage = new Compartment();
-
-	languages.push(
-		LanguageDescription.of({
-			name: 'HCL',
-			extensions: ['hcl', 'tf'],
-			load() {
-				return import('codemirror-lang-hcl').then((m) => m.hcl());
-			}
-		})
-	);
-	languages.push(
-		LanguageDescription.of({
-			name: 'Elixir',
-			extensions: ['ex', 'exs'],
-			load() {
-				return import('codemirror-lang-elixir').then((m) => m.elixir());
-			}
-		})
-	);
 
 	const getLang = async () => {
 		const language = languages.find((l) => l.alias.includes(lang));
@@ -113,7 +98,7 @@
 
 	const getPyodideWorker = () => {
 		if (!pyodideWorkerInstance) {
-			pyodideWorkerInstance = new PyodideWorker(); // Your worker constructor
+			pyodideWorkerInstance = createPyodideWorker();
 		}
 		return pyodideWorkerInstance;
 	};
@@ -265,7 +250,7 @@ print("${endTag}")
 				doc: _value,
 				extensions: extensions
 			}),
-			parent: document.getElementById(`code-textarea-${id}`)
+			parent: codeEditorContainerElement
 		});
 
 		if (isDarkMode) {
@@ -320,6 +305,11 @@ print("${endTag}")
 		return () => {
 			observer.disconnect();
 			document.removeEventListener('keydown', keydownHandler);
+			// Must destroy EditorView so CodeMirror releases internal DOMObserver and DOM refs
+			if (codeEditor) {
+				codeEditor.destroy();
+				codeEditor = null;
+			}
 		};
 	});
 
@@ -330,4 +320,8 @@ print("${endTag}")
 	});
 </script>
 
-<div id="code-textarea-{id}" class="h-full w-full text-sm" />
+<div
+	bind:this={codeEditorContainerElement}
+	id="code-textarea-{id}"
+	class="{className} h-full w-full min-w-0 overflow-hidden"
+/>

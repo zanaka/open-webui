@@ -3,18 +3,10 @@
 		addTagById,
 		deleteTagById,
 		getAllTags,
-		getChatList,
-		getChatListByTagName,
 		getTagsById,
 		updateChatById
 	} from '$lib/apis/chats';
-	import {
-		tags as _tags,
-		chats,
-		pinnedChats,
-		currentChatPage,
-		scrollPaginationEnabled
-	} from '$lib/stores';
+	import { tags as _tags } from '$lib/stores';
 	import { createEventDispatcher, onMount } from 'svelte';
 
 	const dispatch = createEventDispatcher();
@@ -23,6 +15,7 @@
 	import { toast } from 'svelte-sonner';
 
 	export let chatId = '';
+	export let disabled = false;
 	let tags = [];
 
 	const getTags = async () => {
@@ -73,6 +66,7 @@
 
 <Tags
 	{tags}
+	{disabled}
 	suggestionTags={$_tags ?? []}
 	on:delete={(e) => {
 		deleteTag(e.detail);

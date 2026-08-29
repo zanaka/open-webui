@@ -13,7 +13,7 @@
 	import Modal from '$lib/components/common/Modal.svelte';
 	import AccessControl from '$lib/components/workspace/common/AccessControl.svelte';
 	import DeleteConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
-	import XMark from '$lib/components/icons/XMark.svelte';
+	import XMark from './icons/XMark.svelte';
 	import MemberSelector from '$lib/components/workspace/common/MemberSelector.svelte';
 	import Visibility from '$lib/components/workspace/common/Visibility.svelte';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
@@ -23,7 +23,7 @@
 	export let onSubmit: Function = () => {};
 	export let onUpdate: Function = () => {};
 
-	export let channel = null;
+	export let channel: any = null;
 	export let edit = false;
 
 	let channelTypes = ['group', 'dm'];
@@ -31,7 +31,7 @@
 	let name = '';
 
 	let isPrivate = null;
-	let accessControl = {};
+	let accessGrants = [];
 
 	let groupIds = [];
 	let userIds = [];
@@ -65,8 +65,8 @@
 		await onSubmit({
 			type: type,
 			name: name.replace(/\s/g, '-'),
-			is_private: type === 'group' ? isPrivate : null,
-			access_control: type === '' ? accessControl : {},
+			is_private: type === 'group' ? (isPrivate ?? true) : null,
+			access_grants: type === '' ? accessGrants : [],
 			group_ids: groupIds,
 			user_ids: userIds
 		});
@@ -85,8 +85,12 @@
 
 		if (channel) {
 			name = channel?.name ?? '';
-			isPrivate = channel?.is_private ?? null;
-			accessControl = channel.access_control;
+			if (type === 'group') {
+				isPrivate = typeof channel?.is_private === 'boolean' ? channel.is_private : true;
+			} else {
+				isPrivate = null;
+			}
+			accessGrants = channel?.access_grants ?? [];
 			userIds = channel?.user_ids ?? [];
 		}
 	};
@@ -102,8 +106,14 @@
 
 	const deleteHandler = async () => {
 		showDeleteConfirmDialog = false;
+		if (!channel?.id) {
+			show = false;
+			return;
+		}
 
-		const res = await deleteChannelById(localStorage.token, channel.id).catch((error) => {
+		const channelId = channel.id;
+
+		const res = await deleteChannelById(localStorage.token, channelId).catch((error) => {
 			toast.error(error.message);
 		});
 
@@ -111,7 +121,7 @@
 			toast.success($i18n.t('Channel deleted successfully'));
 			onUpdate();
 
-			if ($page.url.pathname === `/channels/${channel.id}`) {
+			if ($page.url.pathname === `/channels/${channelId}`) {
 				goto('/');
 			}
 		}
@@ -122,7 +132,7 @@
 	const resetHandler = () => {
 		type = '';
 		name = '';
-		accessControl = {};
+		accessGrants = [];
 		userIds = [];
 		loading = false;
 	};
@@ -130,8 +140,8 @@
 
 <Modal size="md" bind:show>
 	<div>
-		<div class=" flex justify-between dark:text-gray-300 px-5 pt-4 pb-1">
-			<div class=" text-lg font-medium self-center">
+		<div class=" flex justify-between dark:text-gray-300 px-4 pt-3 pb-1">
+			<div class=" text-sm self-center">
 				{#if edit}
 					{$i18n.t('Edit Channel')}
 				{:else}
@@ -139,16 +149,16 @@
 				{/if}
 			</div>
 			<button
-				class="self-center"
+				class="self-center rounded-lg p-1 text-gray-500 transition hover:bg-gray-50 hover:text-gray-700 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-200"
 				on:click={() => {
 					show = false;
 				}}
 			>
-				<XMark className={'size-5'} />
+				<XMark className={'size-4'} />
 			</button>
 		</div>
 
-		<div class="flex flex-col md:flex-row w-full px-5 pb-4 md:space-x-4 dark:text-gray-200">
+		<div class="flex flex-col md:flex-row w-full px-4 pb-4 md:space-x-4 dark:text-gray-200">
 			<div class=" flex flex-col w-full sm:flex-row sm:justify-center sm:space-x-6">
 				<form
 					class="flex flex-col w-full"
@@ -205,9 +215,9 @@
 					<div class="flex flex-col w-full mt-2">
 						<div class=" mb-1 text-xs text-gray-500">
 							{$i18n.t('Channel Name')}
-							<span class="text-xs text-gray-200 dark:text-gray-800 ml-0.5"
-								>{type === 'dm' ? `${$i18n.t('Optional')}` : ''}</span
-							>
+							<span class="text-xs text-gray-200 dark:text-gray-800 ml-0.5">
+								{#if type === 'dm'}{$i18n.t('Optional')}{/if}
+							</span>
 						</div>
 
 						<div class="flex-1">
@@ -226,11 +236,11 @@
 					{#if type !== 'dm'}
 						<div class="-mx-2 mb-1 mt-2.5 px-2">
 							{#if type === ''}
-								<AccessControl bind:accessControl accessRoles={['read', 'write']} />
+								<AccessControl bind:accessGrants accessRoles={['read', 'write']} />
 							{:else if type === 'group'}
 								<Visibility
 									state={isPrivate ? 'private' : 'public'}
-									onChange={(value) => {
+									onChange={(value: string) => {
 										if (value === 'private') {
 											isPrivate = true;
 										} else {
@@ -265,10 +275,10 @@
 						</div>
 					{/if}
 
-					<div class="flex justify-end pt-3 text-sm font-medium gap-1.5">
+					<div class="flex justify-end pt-3 text-sm font-normal gap-1.5">
 						{#if edit}
 							<button
-								class="px-3.5 py-1.5 text-sm font-medium dark:bg-black dark:hover:bg-black/90 dark:text-white bg-white text-black hover:bg-gray-100 transition rounded-full flex flex-row space-x-1 items-center"
+								class="px-3.5 py-1.5 text-sm font-normal dark:bg-black dark:hover:bg-black/90 dark:text-white bg-white text-black hover:bg-gray-100 transition rounded-full flex flex-row space-x-1 items-center"
 								type="button"
 								on:click={() => {
 									showDeleteConfirmDialog = true;
@@ -279,7 +289,7 @@
 						{/if}
 
 						<button
-							class="px-3.5 py-1.5 text-sm font-medium bg-black hover:bg-gray-950 text-white dark:bg-white dark:text-black dark:hover:bg-gray-100 transition rounded-full flex flex-row space-x-1 items-center {loading
+							class="px-3.5 py-1.5 text-sm font-normal bg-black hover:bg-gray-950 text-white dark:bg-white dark:text-black dark:hover:bg-gray-100 transition rounded-full flex flex-row space-x-1 items-center {loading
 								? ' cursor-not-allowed'
 								: ''}"
 							type="submit"

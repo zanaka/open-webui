@@ -7,12 +7,14 @@
 	import {
 		artifactCode,
 		chatId,
+		config,
 		settings,
 		showArtifacts,
 		showControls,
 		artifactContents
 	} from '$lib/stores';
 	import { copyToClipboard, createMessagesList } from '$lib/utils';
+	import { injectCsp } from '$lib/utils/csp';
 
 	import XMark from '../icons/XMark.svelte';
 	import ArrowsPointingOut from '../icons/ArrowsPointingOut.svelte';
@@ -90,24 +92,32 @@
 	};
 
 	onMount(() => {
-		artifactCode.subscribe((value) => {
+		const unsubscribeArtifactCode = artifactCode.subscribe((value) => {
 			if (contents) {
 				const codeIdx = contents.findIndex((content) => content.content.includes(value));
 				selectedContentIdx = codeIdx !== -1 ? codeIdx : 0;
 			}
 		});
 
-		artifactContents.subscribe((value) => {
-			contents = value;
-			console.log('Artifact contents updated:', contents);
+		const unsubscribeArtifactContents = artifactContents.subscribe((value) => {
+			const newContents = value ?? [];
+			console.log('Artifact contents updated:', newContents);
 
-			if (contents.length === 0) {
+			if (newContents.length === 0) {
 				showControls.set(false);
 				showArtifacts.set(false);
+				selectedContentIdx = 0;
+			} else if (newContents.length > contents.length) {
+				selectedContentIdx = newContents.length - 1;
 			}
 
-			selectedContentIdx = contents ? contents.length - 1 : 0;
+			contents = newContents;
 		});
+
+		return () => {
+			unsubscribeArtifactCode();
+			unsubscribeArtifactContents();
+		};
 	});
 </script>
 
@@ -124,6 +134,7 @@
 					<div class="flex items-center space-x-2">
 						<div class="flex items-center gap-0.5 self-center min-w-fit" dir="ltr">
 							<button
+								aria-label={$i18n.t('Previous version')}
 								class="self-center p-1 hover:bg-black/5 dark:hover:bg-white/5 dark:hover:text-white hover:text-black rounded-md transition disabled:cursor-not-allowed"
 								on:click={() => navigateContent('prev')}
 								disabled={contents.length <= 1}
@@ -152,6 +163,7 @@
 							</div>
 
 							<button
+								aria-label={$i18n.t('Next version')}
 								class="self-center p-1 hover:bg-black/5 dark:hover:bg-white/5 dark:hover:text-white hover:text-black rounded-md transition disabled:cursor-not-allowed"
 								on:click={() => navigateContent('next')}
 								disabled={contents.length <= 1}
@@ -234,9 +246,16 @@
 							<iframe
 								bind:this={iframeElement}
 								title="Content"
-								srcdoc={contents[selectedContentIdx].content}
+								srcdoc={injectCsp(
+									contents[selectedContentIdx].content,
+									$config?.ui?.iframe_csp ?? ''
+								)}
 								class="w-full border-0 h-full rounded-none"
-								sandbox="allow-scripts allow-downloads{($settings?.iframeSandboxAllowForms ?? false)
+								sandbox="{($settings?.iframeSandboxAllowScripts ?? true)
+									? 'allow-scripts'
+									: ''}{($settings?.iframeSandboxAllowDownloads ?? true)
+									? ' allow-downloads'
+									: ''}{($settings?.iframeSandboxAllowForms ?? true)
 									? ' allow-forms'
 									: ''}{($settings?.iframeSandboxAllowSameOrigin ?? false)
 									? ' allow-same-origin'
@@ -251,7 +270,7 @@
 						{/if}
 					</div>
 				{:else}
-					<div class="m-auto font-medium text-xs text-gray-900 dark:text-white">
+					<div class="m-auto font-normal text-xs text-gray-900 dark:text-white">
 						{$i18n.t('No HTML, CSS, or JavaScript content found.')}
 					</div>
 				{/if}

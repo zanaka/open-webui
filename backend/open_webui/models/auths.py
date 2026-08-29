@@ -1,73 +1,57 @@
+"""Auth credential models and data-access layer."""
+
+from __future__ import annotations
+
 import logging
 import uuid
 from typing import Optional
 
-from sqlalchemy.orm import Session
-from open_webui.internal.db import Base, get_db_context
-from open_webui.models.users import UserModel, UserProfileImageResponse, Users
-from open_webui.utils.crypto_utils import (
-    generate_dek,
-    generate_kdf_salt,
-    derive_kek,
-    wrap_dek,
-    unwrap_dek,
-    generate_rsa_keypair,
-    encrypt_value,
-)
-from dataclasses import dataclass, field
-
-from pydantic import BaseModel
-from sqlalchemy import Boolean, Column, LargeBinary, String, Text
-
-
-@dataclass
-class UserWithDek:
-    user: UserModel
-    dek: bytes = field(repr=False)
+import bcrypt
+from open_webui.internal.db import Base, JSONField, get_async_db_context
+from open_webui.models.users import User, UserModel, UserProfileImageResponse, Users
+from open_webui.utils.validate import validate_profile_image_url
+from pydantic import BaseModel, field_validator
+from sqlalchemy import Boolean, Column, String, Text, delete, select, update
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 log = logging.getLogger(__name__)
 
-####################
-# DB MODEL
-####################
+# Pre-computed hash verified on signin paths that lack a real credential
+# (unknown user, inactive account) so response timing cannot reveal
+# whether an account exists (CWE-208).
+PLACEHOLDER_HASH = bcrypt.hashpw(b'placeholder', bcrypt.gensalt()).decode('utf-8')
 
 
-class Auth(Base):
-    __tablename__ = "auth"
+class Auth(Base):  # credential ↔ user linkage
+    """Maps a user ID to an email/password pair with an active flag."""
 
-    id = Column(String, primary_key=True, unique=True)
-    email = Column(String)
-    password = Column(Text)
-    active = Column(Boolean)
-    kdf_salt = Column(LargeBinary, nullable=False)
-    wrapped_dek = Column(LargeBinary, nullable=False)
-    public_key = Column(LargeBinary, nullable=False)
-    wrapped_private_key = Column(LargeBinary, nullable=False)
+    __tablename__ = 'auth'
+
+    id = Column(String, primary_key=True, unique=True)  # mirrors User.id
+    email = Column(String)  # login address, kept in sync with User.email
+    password = Column(Text)  # argon2 / bcrypt hash
+    active = Column(Boolean)  # account soft-disable toggle
 
 
 class AuthModel(BaseModel):
+    """Pydantic mirror of the ``auth`` table row."""
+
     id: str
     email: str
     password: str
     active: bool = True
-    kdf_salt: bytes
-    wrapped_dek: bytes
-    public_key: bytes
-    wrapped_private_key: bytes
-
-
-####################
-# Forms
-####################
 
 
 class Token(BaseModel):
+    """JWT bearer-token response wrapper."""
+
     token: str
     token_type: str
 
 
 class ApiKey(BaseModel):
-    api_key: Optional[str] = None
+    api_key: str | None = None
 
 
 class SigninResponse(Token, UserProfileImageResponse):
@@ -97,188 +81,162 @@ class SignupForm(BaseModel):
     name: str
     email: str
     password: str
-    profile_image_url: Optional[str] = "/user.png"
+    profile_image_url: str | None = '/user.png'
+
+    @field_validator('profile_image_url')
+    @classmethod
+    def check_profile_image_url(cls, v: str | None) -> str | None:
+        if v is not None:
+            return validate_profile_image_url(v)
+        return v
 
 
 class AddUserForm(SignupForm):
-    role: Optional[str] = "pending"
+    role: str | None = 'pending'
+
+
+# --- data-access layer ---
 
 
 class AuthsTable:
-    def insert_new_auth(
+    """Provides CRUD operations for the Auth ↔ User lifecycle."""
+
+    async def insert_new_auth(
         self,
         email: str,
-        hashed_password: str,
+        password: str,
         name: str,
-        raw_password: str,
-        profile_image_url: str = "/user.png",
-        role: str = "pending",
-        oauth: Optional[dict] = None,
-        db: Optional[Session] = None,
-    ) -> Optional[UserWithDek]:
-        with get_db_context(db) as db:
-            log.info("insert_new_auth")
+        profile_image_url: str = '/user.png',
+        role: str = 'pending',
+        oauth: dict | None = None,
+        db: AsyncSession | None = None,
+    ) -> UserModel | None:
+        """Create an Auth + User pair inside a single transaction."""
+        async with get_async_db_context(db) as session:
+            log.info('insert_new_auth')
 
-            id = str(uuid.uuid4())
+            new_id = str(uuid.uuid4())
 
-            dek = generate_dek()
-            kdf_salt = generate_kdf_salt()
-            kek = derive_kek(raw_password, kdf_salt)
-            wrapped_dek = wrap_dek(dek, kek)
-
-            private_key_der, public_key_der = generate_rsa_keypair()
-            wrapped_private_key = encrypt_value(private_key_der, dek)
-
-            auth = AuthModel(
-                id=id,
+            credential = Auth(
+                id=new_id,
                 email=email,
-                password=hashed_password,
+                password=password,
                 active=True,
-                kdf_salt=kdf_salt,
-                wrapped_dek=wrapped_dek,
-                public_key=public_key_der,
-                wrapped_private_key=wrapped_private_key,
             )
-            result = Auth(**auth.model_dump())
-            db.add(result)
+            session.add(credential)
 
-            user = Users.insert_new_user(
-                id, name, email, profile_image_url, role, oauth=oauth, db=db
-            )
+            try:
+                created_user = await Users.insert_new_user(
+                    new_id,
+                    name,
+                    email,
+                    profile_image_url,
+                    role,
+                    oauth=oauth,
+                    db=session,
+                )
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                raise
+            return created_user if credential and created_user else None
 
-            db.commit()
-            db.refresh(result)
-
-            if result and user:
-                return UserWithDek(user=user, dek=dek)
-            else:
-                return None
-
-    def authenticate_user(
+    async def authenticate_user(
         self,
         email: str,
-        raw_password: str,
         verify_password: callable,
-        db: Optional[Session] = None,
-    ) -> Optional[UserWithDek]:
-        log.info(f"authenticate_user: {email}")
+        db: AsyncSession | None = None,
+    ) -> UserModel | None:
+        """Verify email + password credentials and return the matching user."""
+        log.info('authenticate_user: %s', email)
+        resolved = await Users.get_user_by_email(email, db=db)
+        if not resolved:
+            await verify_password(PLACEHOLDER_HASH)
+            return
+        # load the credential row and verify the password hash
+        async with get_async_db_context(db) as session:
+            credential = await session.get(Auth, resolved.id)
+            if not credential or not credential.active:
+                await verify_password(PLACEHOLDER_HASH)
+                return
+            if not await verify_password(credential.password):
+                return
+            return resolved
 
-        user = Users.get_user_by_email(email, db=db)
-        if not user:
-            return None
-
-        try:
-            with get_db_context(db) as db:
-                auth = db.query(Auth).filter_by(id=user.id, active=True).first()
-                if auth:
-                    if verify_password(auth.password):
-                        kek = derive_kek(raw_password, auth.kdf_salt)
-                        dek = unwrap_dek(auth.wrapped_dek, kek)
-                        return UserWithDek(user=user, dek=dek)
-                    else:
-                        return None
-                else:
-                    return None
-        except Exception:
-            log.exception("authenticate_user error")
-            return None
-
-    def get_public_key(
-        self, user_id: str, db: Optional[Session] = None
-    ) -> Optional[bytes]:
-        with get_db_context(db) as db:
-            auth = db.query(Auth).filter_by(id=user_id).first()
-            return auth.public_key if auth else None
-
-    def get_wrapped_private_key(
-        self, user_id: str, db: Optional[Session] = None
-    ) -> Optional[bytes]:
-        with get_db_context(db) as db:
-            auth = db.query(Auth).filter_by(id=user_id).first()
-            return auth.wrapped_private_key if auth else None
-
-    def authenticate_user_by_api_key(
-        self, api_key: str, db: Optional[Session] = None
-    ) -> Optional[UserModel]:
-        log.info(f"authenticate_user_by_api_key: {api_key}")
-        # if no api_key, return None
+    async def authenticate_user_by_api_key(
+        self,
+        api_key: str,
+        db: AsyncSession | None = None,
+    ) -> UserModel | None:
+        """Look up the user that owns the given API key."""
+        log.info('authenticate_user_by_api_key')
         if not api_key:
-            return None
+            return
+        # delegate to the Users model for the actual lookup
+        return await Users.get_user_by_api_key(api_key, db=db)
 
-        try:
-            user = Users.get_user_by_api_key(api_key, db=db)
-            return user if user else None
-        except Exception:
-            return False
+    async def authenticate_user_by_email(
+        self,
+        email: str,
+        db: AsyncSession | None = None,
+    ) -> UserModel | None:
+        """Single-query auth via JOIN on Auth ↔ User, filtered by active flag."""
+        log.info('authenticate_user_by_email: %s', email)
+        # single JOIN avoids N+1 — returns (Auth, User) tuple or None
+        async with get_async_db_context(db) as session:
+            joined_query = (
+                select(Auth, User).join(User, Auth.id == User.id).where(Auth.email == email, Auth.active.is_(True))
+            )
+            match = (await session.execute(joined_query)).first()
+            if not match:
+                return
+            _, found_user = match
+            return UserModel.model_validate(found_user)
 
-    def authenticate_user_by_email(
-        self, email: str, db: Optional[Session] = None
-    ) -> Optional[UserModel]:
-        log.info(f"authenticate_user_by_email: {email}")
-        try:
-            with get_db_context(db) as db:
-                auth = db.query(Auth).filter_by(email=email, active=True).first()
-                if auth:
-                    user = Users.get_user_by_id(auth.id, db=db)
-                    return user
-        except Exception:
-            return None
+    async def update_email_by_id(
+        self,
+        user_id: str,
+        email: str,
+        db: AsyncSession | None = None,
+    ) -> bool:
+        """Set a new email on the auth record and propagate to the user row."""
+        async with get_async_db_context(db) as session:
+            auth_row = await session.get(Auth, user_id)
+            if auth_row is None:
+                return False
+            auth_row.email = email
+            await session.commit()
+            await Users.update_user_by_id(user_id, {'email': email}, db=session)
+            return True
+        # --- password modification ---
 
-    def update_user_password_by_id(
+    async def update_user_password_by_id(
+        self,
+        user_id: str,
+        new_password: str,
+        db: AsyncSession | None = None,
+    ) -> bool:
+        """Set a new password hash for an existing user."""
+        async with get_async_db_context(db) as session:
+            auth_row = await session.get(Auth, user_id)
+            if auth_row is None:
+                return False
+            auth_row.password = new_password
+            await session.commit()
+            return True
+
+    async def delete_auth_by_id(
         self,
         id: str,
-        new_hashed_password: str,
-        new_raw_password: str,
-        current_raw_password: str,
-        db: Optional[Session] = None,
+        db: AsyncSession | None = None,
     ) -> bool:
-        try:
-            with get_db_context(db) as db:
-                auth = db.query(Auth).filter_by(id=id).first()
-                if not auth:
-                    return False
-
-                current_kek = derive_kek(current_raw_password, auth.kdf_salt)
-                dek = unwrap_dek(auth.wrapped_dek, current_kek)
-
-                new_kek = derive_kek(new_raw_password, auth.kdf_salt)
-                new_wrapped_dek = wrap_dek(dek, new_kek)
-
-                auth.password = new_hashed_password
-                auth.wrapped_dek = new_wrapped_dek
-                db.commit()
-
-                return True
-        except Exception:
-            log.exception("update_user_password_by_id error")
-            return False
-
-    def update_email_by_id(
-        self, id: str, email: str, db: Optional[Session] = None
-    ) -> bool:
-        try:
-            with get_db_context(db) as db:
-                result = db.query(Auth).filter_by(id=id).update({"email": email})
-                db.commit()
-                return True if result == 1 else False
-        except Exception:
-            return False
-
-    def delete_auth_by_id(self, id: str, db: Optional[Session] = None) -> bool:
-        try:
-            with get_db_context(db) as db:
-                # Delete User
-                result = Users.delete_user_by_id(id, db=db)
-
-                if result:
-                    db.query(Auth).filter_by(id=id).delete()
-                    db.commit()
-
-                    return True
-                else:
-                    return False
-        except Exception:
-            return False
+        """Remove a user and their auth credential in one transaction."""
+        async with get_async_db_context(db) as session:
+            if not await Users.delete_user_by_id(id, db=session):
+                return False
+            await session.execute(delete(Auth).where(Auth.id == id))
+            await session.commit()
+            return True
 
 
-Auths = AuthsTable()
+Auths = AuthsTable()  # singleton — module-level instance
