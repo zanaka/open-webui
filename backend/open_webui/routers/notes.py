@@ -9,6 +9,7 @@ from open_webui.config import (
     ENABLE_ADMIN_EXPORT,
 )
 from open_webui.constants import ERROR_MESSAGES
+from open_webui.crypto_exceptions import CryptoPolicyError
 from open_webui.events import EVENTS, publish_event
 from open_webui.internal.db import get_async_session
 from open_webui.models.access_grants import AccessGrants
@@ -183,12 +184,16 @@ async def search_notes(
     if direction:
         filter['direction'] = direction
 
-    if not user.role == 'admin' or not BYPASS_ADMIN_ACCESS_CONTROL:
-        groups = await Groups.get_groups_by_member_id(user.id, db=db)
-        if groups:
-            filter['group_ids'] = [group.id for group in groups]
+    # Listed by what the person can open, administrator or not: a note is
+    # opened with a key its owner and named recipients hold, and an
+    # administrator holds no key for someone else's. Widening the query for an
+    # admin (BYPASS_ADMIN_ACCESS_CONTROL) would load rows it cannot decrypt and
+    # fail the whole listing. Mirrors get_knowledge_bases.
+    groups = await Groups.get_groups_by_member_id(user.id, db=db)
+    if groups:
+        filter['group_ids'] = [group.id for group in groups]
 
-        filter['user_id'] = user.id
+    filter['user_id'] = user.id
 
     result = await Notes.search_notes(user.id, filter, skip=skip, limit=limit, db=db)
     pinned_note_ids = await Notes.get_pinned_note_ids(user.id, db=db)
@@ -237,6 +242,8 @@ async def create_new_note(
             data={'title': note.title},
         )
         return note
+    except CryptoPolicyError:
+        raise
     except Exception as e:
         log.exception(e)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=ERROR_MESSAGES.DEFAULT())
@@ -588,6 +595,8 @@ async def update_note_by_id(
             data={'title': note.title},
         )
         return note
+    except CryptoPolicyError:
+        raise
     except Exception as e:
         log.exception(e)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=ERROR_MESSAGES.DEFAULT())
@@ -725,7 +734,10 @@ async def delete_note_by_id(
             detail=ERROR_MESSAGES.UNAUTHORIZED,
         )
 
-    note = await Notes.get_note_by_id(id, db=db)
+    # Only who owns it and who may reach it, not what it says: deleting does
+    # not need the contents, so an administrator can remove a note they hold
+    # no key for. Loading the row here would decrypt it and refuse.
+    note = await Notes.get_note_access_by_id(id, db=db)
     if not note:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
 
@@ -734,7 +746,7 @@ async def delete_note_by_id(
         and not await AccessGrants.has_access(
             user_id=user.id,
             resource_type='note',
-            resource_id=note.id,
+            resource_id=id,
             permission='write',
             db=db,
         )
@@ -742,7 +754,7 @@ async def delete_note_by_id(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.DEFAULT())
 
     try:
-        note = await Notes.delete_note_by_id(id, db=db)
+        await Notes.delete_note_by_id(id, db=db)
         await publish_event(
             request,
             EVENTS.NOTE_DELETED,
