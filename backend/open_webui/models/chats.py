@@ -16,7 +16,10 @@ from open_webui.models.automations import AutomationRun
 from open_webui.models.chat_messages import ChatMessage, ChatMessages
 from open_webui.models.folders import Folders
 from open_webui.models.tags import Tag, TagModel, Tags
+from open_webui.utils.crypto_context import get_cached_dek
+from open_webui.utils.crypto_utils import decrypt_text
 from open_webui.utils.misc import get_output_text, sanitize_data_for_db, sanitize_text_for_db
+from open_webui.utils.tag_tokens import tag_id
 from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy import (
     JSON,
@@ -40,7 +43,6 @@ from sqlalchemy import (
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.sql import case, exists
-from sqlalchemy.sql.expression import bindparam
 
 log = logging.getLogger(__name__)
 ACTIVE_CHAT_GAP_SECONDS = 30 * 60
@@ -56,50 +58,41 @@ def chat_search_terms(text: str) -> list[str]:
     return list(dict.fromkeys(re.findall(r'[a-z0-9]+', text.lower())))
 
 
-def chat_search_message_content_match_sql(dialect_name: str, key: str) -> str:
-    if dialect_name == 'sqlite':
-        return f"""
-        (
-            EXISTS (
-                SELECT 1
-                FROM json_each(Chat.chat, '$.history.messages') AS history_message
-                WHERE LOWER(history_message.value->>'content') LIKE '%' || :{key} || '%'
-            )
-            OR EXISTS (
-                SELECT 1
-                FROM json_each(Chat.chat, '$.messages') AS legacy_message
-                WHERE LOWER(legacy_message.value->>'content') LIKE '%' || :{key} || '%'
-            )
+def _message_content_to_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return ' '.join(
+            part.get('text', '') for part in content if isinstance(part, dict) and isinstance(part.get('text'), str)
         )
-        """
+    return ''
 
-    if dialect_name == 'postgresql':
-        return f"""
-        (
-            EXISTS (
-                SELECT 1
-                FROM chat_message AS message
-                WHERE message.chat_id = Chat.id
-                AND message.user_id = Chat.user_id
-                AND json_typeof(message.content) = 'string'
-                AND LOWER(message.content #>> '{{}}') LIKE '%' || :{key} || '%'
-            )
-            OR EXISTS (
-                SELECT 1
-                FROM json_each(Chat.chat#>'{{history,messages}}') AS history_message
-                WHERE json_typeof(history_message.value->'content') = 'string'
-                AND LOWER(history_message.value->>'content') LIKE '%' || :{key} || '%'
-            )
-            OR EXISTS (
-                SELECT 1
-                FROM json_array_elements(Chat.chat->'messages') AS legacy_message
-                WHERE json_typeof(legacy_message->'content') = 'string'
-                AND LOWER(legacy_message->>'content') LIKE '%' || :{key} || '%'
-            )
-        )
-        """
 
-    raise NotImplementedError(f'Unsupported dialect: {dialect_name}')
+def _extract_chat_search_text(chat_json) -> str:
+    """
+    Collect searchable plaintext from a decrypted Chat.chat dict.
+
+    Chat.chat is encrypted at rest, so body content cannot be searched in SQL.
+    This concatenates every message's content (lowercased)
+    so the search can be performed in Python over already-decrypted chat objects.
+    """
+    if not isinstance(chat_json, dict):
+        return ''
+
+    parts = []
+
+    messages_map = chat_json.get('history', {}).get('messages')
+    if isinstance(messages_map, dict):
+        for message in messages_map.values():
+            if isinstance(message, dict):
+                parts.append(_message_content_to_text(message.get('content')))
+    else:
+        # Fallback: legacy top-level messages list
+        for message in chat_json.get('messages', []) or []:
+            if isinstance(message, dict):
+                parts.append(_message_content_to_text(message.get('content')))
+
+    return ' '.join(parts).lower()
 
 
 def chat_list_order(sort_by: str = 'updated_at', sort_dir: str = 'desc', user_id: str | None = None):
@@ -400,6 +393,19 @@ class ChatTable:
     def _clean_null_bytes(self, obj):
         """Recursively remove null bytes from strings in dict/list structures."""
         return sanitize_data_for_db(obj)
+
+    @staticmethod
+    def _to_title_id_response(chat: Chat) -> ChatTitleIdResponse:
+        """Build a title/id row from a fully loaded (and therefore decrypted) Chat."""
+        return ChatTitleIdResponse.model_validate(
+            {
+                'id': chat.id,
+                'title': chat.title,
+                'updated_at': chat.updated_at,
+                'created_at': chat.created_at,
+                'last_read_at': chat.last_read_at,
+            }
+        )
 
     def get_current_message_id(self, chat: dict | None) -> str | None:
         chat = chat or {}
@@ -856,7 +862,9 @@ class ChatTable:
             meta = row[0] or {}
             old_tags = meta.get('tags', [])
             new_tags = [t for t in tags if t.replace(' ', '_').lower() != 'none']
-            new_tag_ids = [t.replace(' ', '_').lower() for t in new_tags]
+            # Chats carry tag tokens, not tag names; the same keyed tokens
+            # Tags.ensure_tags_exist derives for the tag rows below.
+            new_tag_ids = [tag_id(t, user.id) for t in new_tags]
 
             # Single meta update
             await session.execute(update(Chat).filter_by(id=id).values(meta={**meta, 'tags': new_tag_ids}))
@@ -1395,15 +1403,17 @@ class ChatTable:
         db: AsyncSession | None = None,
     ) -> list[ChatTitleIdResponse]:
         async with get_async_db_context(db) as session:
-            stmt = select(Chat.id, Chat.title, Chat.updated_at, Chat.created_at).filter_by(
-                user_id=user_id, archived=True
-            )
+            # Full rows rather than a column select: the title and the body are
+            # encrypted at rest and only entity loads run the decryption hook.
+            stmt = select(Chat).filter_by(user_id=user_id, archived=True)
             stmt = stmt.where(Chat.meta['internal'].as_boolean().is_not(True))
+
+            query_key = None
+            order_by = None
+            direction = None
 
             if filter:
                 query_key = filter.get('query')
-                if query_key:
-                    stmt = stmt.filter(Chat.title.ilike(f'%{query_key}%'))
 
                 order_by = filter.get('order_by')
                 direction = filter.get('direction')
@@ -1411,34 +1421,62 @@ class ChatTable:
                 if order_by and direction:
                     if not getattr(Chat, order_by, None):
                         raise ValueError('Invalid order_by field')
-
-                    if direction.lower() == 'asc':
-                        stmt = stmt.order_by(getattr(Chat, order_by).asc(), Chat.id)
-                    elif direction.lower() == 'desc':
-                        stmt = stmt.order_by(getattr(Chat, order_by).desc(), Chat.id)
-                    else:
+                    if direction.lower() not in ('asc', 'desc'):
                         raise ValueError('Invalid direction for ordering')
-            else:
+                else:
+                    # Half an ordering is not an ordering. The route builds this
+                    # filter out of independent query parameters, so either one
+                    # can arrive alone; both fall back to the default below.
+                    order_by = None
+                    direction = None
+
+            # Ordering by title happens below, once the titles are readable.
+            if order_by and order_by != 'title':
+                column = getattr(Chat, order_by)
+                stmt = stmt.order_by(column.asc() if direction.lower() == 'asc' else column.desc(), Chat.id)
+            elif not order_by:
                 stmt = stmt.order_by(Chat.updated_at.desc(), Chat.id)
 
-            if skip:
-                stmt = stmt.offset(skip)
-            if limit:
-                stmt = stmt.limit(limit)
+            # Reading the whole archive is only worth it when the plaintext is
+            # what decides the answer. Every row loaded here is decrypted, body
+            # and all, so an ordinary page still gets cut in SQL.
+            if not query_key and order_by != 'title':
+                if skip:
+                    stmt = stmt.offset(skip)
+                if limit:
+                    stmt = stmt.limit(limit)
+                result = await session.execute(stmt)
+                return [self._to_title_id_response(chat) for chat in result.scalars().all()]
 
             result = await session.execute(stmt)
-            all_chats = result.all()
-            return [
-                ChatTitleIdResponse.model_validate(
-                    {
-                        'id': chat[0],
-                        'title': chat[1],
-                        'updated_at': chat[2],
-                        'created_at': chat[3],
-                    }
+            chats = result.scalars().all()
+
+            if query_key:
+                # Matched after the rows are read. The title and the messages
+                # are encrypted at rest, so an ilike in SQL matched ciphertext
+                # and this search returned nothing at all.
+                needle = query_key.lower()
+                chats = [
+                    chat
+                    for chat in chats
+                    if needle in (chat.title or '').lower() or needle in _extract_chat_search_text(chat.chat)
+                ]
+
+            if order_by == 'title':
+                chats = sorted(
+                    chats,
+                    key=lambda chat: ((chat.title or '').lower(), chat.updated_at),
+                    reverse=direction.lower() == 'desc',
                 )
-                for chat in all_chats
-            ]
+
+            # Paginated after filtering, so a page is never short of entries
+            # that were dropped by the search.
+            if skip:
+                chats = chats[skip:]
+            if limit:
+                chats = chats[:limit]
+
+            return [self._to_title_id_response(chat) for chat in chats]
 
     async def count_archived_chats_by_user_id(
         self,
@@ -1473,50 +1511,80 @@ class ChatTable:
         db: AsyncSession | None = None,
     ) -> list[ChatTitleIdResponse]:
         async with get_async_db_context(db) as session:
-            stmt = select(Chat.id, Chat.title, Chat.updated_at, Chat.created_at, Chat.last_read_at).filter_by(
-                user_id=user_id
-            )
+            # Full rows rather than a column select: the title and the body are
+            # encrypted at rest and only entity loads run the decryption hook.
+            stmt = select(Chat).filter_by(user_id=user_id)
             stmt = stmt.where(Chat.meta['internal'].as_boolean().is_not(True))
             if not include_archived:
                 stmt = stmt.filter_by(archived=False)
 
+            query_key = None
+            order_by = None
+            direction = None
+
             if filter:
                 query_key = filter.get('query')
-                if query_key:
-                    stmt = stmt.filter(Chat.title.ilike(f'%{query_key}%'))
 
                 order_by = filter.get('order_by')
                 direction = filter.get('direction')
 
-                if order_by and direction and getattr(Chat, order_by):
-                    if direction.lower() == 'asc':
-                        stmt = stmt.order_by(getattr(Chat, order_by).asc(), Chat.id)
-                    elif direction.lower() == 'desc':
-                        stmt = stmt.order_by(getattr(Chat, order_by).desc(), Chat.id)
-                    else:
+                if order_by and direction:
+                    if not getattr(Chat, order_by, None):
+                        raise ValueError('Invalid order_by field')
+                    if direction.lower() not in ('asc', 'desc'):
                         raise ValueError('Invalid direction for ordering')
-            else:
+                else:
+                    # Half an ordering is not an ordering; see
+                    # get_archived_chat_list_by_user_id.
+                    order_by = None
+                    direction = None
+
+            # Ordering by title happens below, once the titles are readable.
+            if order_by and order_by != 'title':
+                column = getattr(Chat, order_by)
+                stmt = stmt.order_by(column.asc() if direction.lower() == 'asc' else column.desc(), Chat.id)
+            elif not order_by:
                 stmt = stmt.order_by(Chat.updated_at.desc(), Chat.id)
 
-            if skip:
-                stmt = stmt.offset(skip)
-            if limit:
-                stmt = stmt.limit(limit)
+            # An ordinary page is still cut in SQL; every row loaded here is
+            # decrypted, body and all.
+            if not query_key and order_by != 'title':
+                if skip:
+                    stmt = stmt.offset(skip)
+                if limit:
+                    stmt = stmt.limit(limit)
+                result = await session.execute(stmt)
+                return [self._to_title_id_response(chat) for chat in result.scalars().all()]
 
             result = await session.execute(stmt)
-            all_chats = result.all()
-            return [
-                ChatTitleIdResponse.model_validate(
-                    {
-                        'id': chat[0],
-                        'title': chat[1],
-                        'updated_at': chat[2],
-                        'created_at': chat[3],
-                        'last_read_at': chat[4],
-                    }
+            chats = result.scalars().all()
+
+            if query_key:
+                # Matched after the rows are read. The title and the messages
+                # are encrypted at rest, so an ilike in SQL matched ciphertext
+                # and this search returned nothing at all.
+                needle = query_key.lower()
+                chats = [
+                    chat
+                    for chat in chats
+                    if needle in (chat.title or '').lower() or needle in _extract_chat_search_text(chat.chat)
+                ]
+
+            if order_by == 'title':
+                chats = sorted(
+                    chats,
+                    key=lambda chat: ((chat.title or '').lower(), chat.updated_at),
+                    reverse=direction.lower() == 'desc',
                 )
-                for chat in all_chats
-            ]
+
+            # Paginated after filtering, so a page is never short of entries
+            # that were dropped by the search.
+            if skip:
+                chats = chats[skip:]
+            if limit:
+                chats = chats[:limit]
+
+            return [self._to_title_id_response(chat) for chat in chats]
 
     async def get_chat_title_id_list_by_user_id(
         self,
@@ -1531,6 +1599,13 @@ class ChatTable:
         db: AsyncSession | None = None,
     ) -> list[ChatTitleIdResponse]:
         async with get_async_db_context(db) as session:
+            # A column select skips the ORM decryption hook, so the titles come
+            # back as ciphertext and are decrypted by hand below. Cheaper than
+            # loading full rows: the body is never read, let alone decrypted.
+            dek = get_cached_dek(user_id)
+            if dek is None:
+                raise RuntimeError(f'No DEK cached for user {user_id}. User must re-login to access encrypted data.')
+
             stmt = select(Chat.id, Chat.title, Chat.updated_at, Chat.created_at, Chat.last_read_at).filter_by(
                 user_id=user_id
             )
@@ -1545,28 +1620,43 @@ class ChatTable:
             if not include_archived:
                 stmt = stmt.filter_by(archived=False)
 
-            stmt = stmt.order_by(*chat_list_order(sort_by, sort_dir))
-
-            if skip:
-                stmt = stmt.offset(skip)
-            if limit:
-                stmt = stmt.limit(limit)
+            # Ordering by title happens below, once the titles are readable;
+            # in SQL it would order the ciphertext.
+            order_by_title = sort_by == 'title'
+            if not order_by_title:
+                stmt = stmt.order_by(*chat_list_order(sort_by, sort_dir))
+                if skip:
+                    stmt = stmt.offset(skip)
+                if limit:
+                    stmt = stmt.limit(limit)
 
             result = await session.execute(stmt)
             all_chats = result.all()
 
-            return [
-                ChatTitleIdResponse.model_validate(
-                    {
-                        'id': chat[0],
-                        'title': chat[1],
-                        'updated_at': chat[2],
-                        'created_at': chat[3],
-                        'last_read_at': chat[4],
-                    }
-                )
+            entries = [
+                {
+                    'id': chat[0],
+                    'title': decrypt_text(chat[1], dek),
+                    'updated_at': chat[2],
+                    'created_at': chat[3],
+                    'last_read_at': chat[4],
+                }
                 for chat in all_chats
             ]
+
+            if order_by_title:
+                # Same reading of sort_dir as chat_list_order: anything but
+                # 'asc' sorts descending.
+                entries.sort(
+                    key=lambda entry: ((entry['title'] or '').lower(), entry['updated_at']),
+                    reverse=sort_dir != 'asc',
+                )
+                if skip:
+                    entries = entries[skip:]
+                if limit:
+                    entries = entries[:limit]
+
+            return [ChatTitleIdResponse.model_validate(entry) for entry in entries]
 
     async def get_chat_list_by_chat_ids(
         self,
@@ -1911,6 +2001,12 @@ class ChatTable:
         self, user_id: str, db: AsyncSession | None = None
     ) -> list[ChatTitleIdResponse]:
         async with get_async_db_context(db) as session:
+            # Column select: titles are ciphertext here and are decrypted by
+            # hand below (the ORM decryption hook only runs on entity loads).
+            dek = get_cached_dek(user_id)
+            if dek is None:
+                raise RuntimeError(f'No DEK cached for user {user_id}. User must re-login to access encrypted data.')
+
             stmt = select(Chat.id, Chat.title, Chat.updated_at, Chat.created_at, Chat.last_read_at).filter_by(
                 user_id=user_id, pinned=True, archived=False
             )
@@ -1921,7 +2017,7 @@ class ChatTable:
                 ChatTitleIdResponse.model_validate(
                     {
                         'id': chat[0],
-                        'title': chat[1],
+                        'title': decrypt_text(chat[1], dek),
                         'updated_at': chat[2],
                         'created_at': chat[3],
                         'last_read_at': chat[4],
@@ -1948,7 +2044,10 @@ class ChatTable:
         db: AsyncSession | None = None,
     ) -> list[ChatModel]:
         """
-        Filters chats based on a search query using Python, allowing pagination using skip and limit.
+        Search chats by title and message body.
+        Tag/folder/pinned/shared/archived filters are applied in SQL,
+        but title and body matching run in Python
+        because Chat.title and Chat.chat are encrypted at rest and their ciphertext is not searchable in SQL.
         """
         search_text = sanitize_text_for_db(search_text).lower().strip()
 
@@ -1960,8 +2059,10 @@ class ChatTable:
         search_text_words = search_text.split()
 
         # search_text might contain 'tag:tag_name' format so we need to extract the tag_name
+        # "none" is a marker for "has no tags", not a tag, so it is not tokenised.
         tag_ids = [
-            word.replace('tag:', '').replace(' ', '_').lower() for word in search_text_words if word.startswith('tag:')
+            name if name == 'none' else tag_id(name, user_id)
+            for name in (word.replace('tag:', '') for word in search_text_words if word.startswith('tag:'))
         ]
 
         # Extract folder names
@@ -2019,38 +2120,10 @@ class ChatTable:
             bind = await session.connection()
             dialect_name = bind.dialect.name
 
-            search_params = {}
-            exact_match_clause = None
-            if phrase_query:
-                exact_match_clause = or_(
-                    Chat.title.ilike(bindparam('phrase_title_key')),
-                    text(chat_search_message_content_match_sql(dialect_name, 'phrase_content_key')),
-                )
-                search_params.update(
-                    {
-                        'phrase_title_key': f'%{phrase_query}%',
-                        'phrase_content_key': phrase_query,
-                    }
-                )
-
-                term_clauses = []
-                for term_idx, term in enumerate(search_terms):
-                    title_key = f'term_title_key_{term_idx}'
-                    content_key = f'term_content_key_{term_idx}'
-                    term_clauses.append(
-                        or_(
-                            Chat.title.ilike(bindparam(title_key)),
-                            text(chat_search_message_content_match_sql(dialect_name, content_key)),
-                        )
-                    )
-                    search_params[title_key] = f'%{term}%'
-                    search_params[content_key] = term
-
-                if term_clauses:
-                    stmt = stmt.filter(or_(exact_match_clause, and_(*term_clauses)))
-                else:
-                    stmt = stmt.filter(exact_match_clause)
-
+            # Note:
+            # title/body text matching is done in Python after load (Chat.title
+            # and Chat.chat are encrypted). Only tag filtering is applied in
+            # SQL here.
             if dialect_name == 'sqlite':
                 # Check if there are any tags to filter
                 if 'none' in tag_ids:
@@ -2079,12 +2152,6 @@ class ChatTable:
                     )
 
             elif dialect_name == 'postgresql':
-                # Safety filter: JSON field must not contain \u0000
-                stmt = stmt.filter(text("Chat.chat::text NOT LIKE '%\\\\u0000%'"))
-
-                # Safety filter: title must not contain actual null bytes
-                stmt = stmt.filter(text("Chat.title::text NOT LIKE '%\\x00%'"))
-
                 if 'none' in tag_ids:
                     stmt = stmt.filter(
                         text("""
@@ -2112,23 +2179,40 @@ class ChatTable:
             else:
                 raise NotImplementedError(f'Unsupported dialect: {dialect_name}')
 
-            if exact_match_clause is not None:
-                stmt = stmt.order_by(case((exact_match_clause, 0), else_=1), Chat.updated_at.desc(), Chat.id)
-            else:
-                stmt = stmt.order_by(Chat.updated_at.desc(), Chat.id)
+            stmt = stmt.order_by(Chat.updated_at.desc(), Chat.id)
 
-            if search_params:
-                stmt = stmt.params(**search_params)
-
-            # Perform pagination at the SQL level
-            stmt = stmt.offset(skip).limit(limit)
             result = await session.execute(stmt)
             all_chats = result.scalars().all()
 
-            log.info('The number of chats: %s', len(all_chats))
+            scored = []
+            for chat in all_chats:
+                # Chat.title and Chat.chat are decrypted on load (see
+                # encrypted_models), so title/body matching is done in Python
+                # because the ciphertext is not searchable in SQL.
+                if phrase_query:
+                    title = (chat.title or '').lower()
+                    body = _extract_chat_search_text(chat.chat)
+                    exact = phrase_query in title or phrase_query in body
+                    if not exact and not (
+                        search_terms and all(term in title or term in body for term in search_terms)
+                    ):
+                        continue
+                    scored.append((0 if exact else 1, chat))
+                else:
+                    scored.append((0, chat))
+
+            # Exact phrase matches first, as the SQL ordering used to do; the
+            # sort is stable, so ties keep their updated_at order from SQL.
+            scored.sort(key=lambda pair: pair[0])
+
+            # Paginated after filtering, so a page is never short of entries
+            # that were dropped by the search.
+            page_chats = [chat for _, chat in scored[skip : skip + limit]]
+
+            log.info('The number of chats: %s', len(page_chats))
 
             # Validate and return chats
-            return [ChatModel.model_validate(chat) for chat in all_chats]
+            return [ChatModel.model_validate(chat) for chat in page_chats]
 
     async def get_chats_by_folder_id_and_user_id(
         self,
@@ -2141,6 +2225,12 @@ class ChatTable:
         db: AsyncSession | None = None,
     ) -> list[ChatTitleIdResponse]:
         async with get_async_db_context(db) as session:
+            # Column select: titles are ciphertext here and are decrypted by
+            # hand below (the ORM decryption hook only runs on entity loads).
+            dek = get_cached_dek(user_id)
+            if dek is None:
+                raise RuntimeError(f'No DEK cached for user {user_id}. User must re-login to access encrypted data.')
+
             stmt = (
                 select(Chat.id, Chat.title, Chat.updated_at, Chat.created_at, Chat.last_read_at)
                 .filter_by(folder_id=folder_id, user_id=user_id)
@@ -2148,27 +2238,42 @@ class ChatTable:
                 .filter_by(archived=False)
                 .where(Chat.meta['internal'].as_boolean().is_not(True))
             )
-            stmt = stmt.order_by(*chat_list_order(sort_by, sort_dir))
 
-            if skip:
-                stmt = stmt.offset(skip)
-            if limit:
-                stmt = stmt.limit(limit)
+            # Ordering by title happens below, once the titles are readable;
+            # in SQL it would order the ciphertext.
+            order_by_title = sort_by == 'title'
+            if not order_by_title:
+                stmt = stmt.order_by(*chat_list_order(sort_by, sort_dir))
+                if skip:
+                    stmt = stmt.offset(skip)
+                if limit:
+                    stmt = stmt.limit(limit)
 
             result = await session.execute(stmt)
             all_chats = result.all()
-            return [
-                ChatTitleIdResponse.model_validate(
-                    {
-                        'id': chat[0],
-                        'title': chat[1],
-                        'updated_at': chat[2],
-                        'created_at': chat[3],
-                        'last_read_at': chat[4],
-                    }
-                )
+
+            entries = [
+                {
+                    'id': chat[0],
+                    'title': decrypt_text(chat[1], dek),
+                    'updated_at': chat[2],
+                    'created_at': chat[3],
+                    'last_read_at': chat[4],
+                }
                 for chat in all_chats
             ]
+
+            if order_by_title:
+                entries.sort(
+                    key=lambda entry: ((entry['title'] or '').lower(), entry['updated_at']),
+                    reverse=sort_dir != 'asc',
+                )
+                if skip:
+                    entries = entries[skip:]
+                if limit:
+                    entries = entries[:limit]
+
+            return [ChatTitleIdResponse.model_validate(entry) for entry in entries]
 
     async def get_all_chats_by_folder_id(
         self,
@@ -2282,11 +2387,17 @@ class ChatTable:
         db: AsyncSession | None = None,
     ) -> list[ChatTitleIdResponse]:
         async with get_async_db_context(db) as session:
+            # Column select: titles are ciphertext here and are decrypted by
+            # hand below (the ORM decryption hook only runs on entity loads).
+            dek = get_cached_dek(user_id)
+            if dek is None:
+                raise RuntimeError(f'No DEK cached for user {user_id}. User must re-login to access encrypted data.')
+
             stmt = select(Chat.id, Chat.title, Chat.updated_at, Chat.created_at, Chat.last_read_at).filter_by(
                 user_id=user_id
             )
             stmt = stmt.where(Chat.meta['internal'].as_boolean().is_not(True))
-            tag_id = tag_name.replace(' ', '_').lower()
+            tag_token = tag_id(tag_name, user_id)
 
             bind = await session.connection()
             dialect_name = bind.dialect.name
@@ -2294,11 +2405,11 @@ class ChatTable:
             if dialect_name == 'sqlite':
                 stmt = stmt.filter(
                     text(f"EXISTS (SELECT 1 FROM json_each(Chat.meta, '$.tags') WHERE json_each.value = :tag_id)")
-                ).params(tag_id=tag_id)
+                ).params(tag_id=tag_token)
             elif dialect_name == 'postgresql':
                 stmt = stmt.filter(
                     text("EXISTS (SELECT 1 FROM json_array_elements_text(Chat.meta->'tags') elem WHERE elem = :tag_id)")
-                ).params(tag_id=tag_id)
+                ).params(tag_id=tag_token)
             else:
                 raise NotImplementedError(f'Unsupported dialect: {dialect_name}')
 
@@ -2315,7 +2426,7 @@ class ChatTable:
                 ChatTitleIdResponse.model_validate(
                     {
                         'id': chat[0],
-                        'title': chat[1],
+                        'title': decrypt_text(chat[1], dek),
                         'updated_at': chat[2],
                         'created_at': chat[3],
                         'last_read_at': chat[4],
@@ -2328,7 +2439,9 @@ class ChatTable:
         self, id: str, user_id: str, tag_name: str, db: AsyncSession | None = None
     ) -> None:
         """Add one tag to a chat's meta. Meta-column-only, never the blob."""
-        tag_id = tag_name.replace(' ', '_').lower()
+        # Chats carry tag tokens, not tag names; the same keyed token
+        # Tags.ensure_tags_exist derives for the tag row itself.
+        tag_token = tag_id(tag_name, user_id)
         await Tags.ensure_tags_exist([tag_name], user_id, db=db)
         try:
             async with get_async_db_context(db) as session:
@@ -2337,11 +2450,11 @@ class ChatTable:
                     return None
 
                 meta = row[0] or {}
-                if tag_id not in meta.get('tags', []):
+                if tag_token not in meta.get('tags', []):
                     await session.execute(
                         update(Chat)
                         .filter_by(id=id)
-                        .values(meta={**meta, 'tags': list(set(meta.get('tags', []) + [tag_id]))})
+                        .values(meta={**meta, 'tags': list(set(meta.get('tags', []) + [tag_token]))})
                     )
                     await session.commit()
         except Exception:
@@ -2350,9 +2463,9 @@ class ChatTable:
     async def count_chats_by_tag_name_and_user_id(
         self, tag_name: str, user_id: str, db: AsyncSession | None = None
     ) -> int:
-        tag_id = tag_name.replace(' ', '_').lower()
-        counts = await self.count_chats_by_tag_ids_and_user_id([tag_id], user_id, db=db)
-        return counts.get(tag_id, 0)
+        tag_token = tag_id(tag_name, user_id)
+        counts = await self.count_chats_by_tag_ids_and_user_id([tag_token], user_id, db=db)
+        return counts.get(tag_token, 0)
 
     async def count_chats_by_tag_ids_and_user_id(
         self, tag_ids: list[str], user_id: str, db: AsyncSession | None = None
@@ -2441,9 +2554,9 @@ class ChatTable:
             async with get_async_db_context(db) as session:
                 chat = await session.get(Chat, id)
                 tags = chat.meta.get('tags', [])
-                tag_id = tag_name.replace(' ', '_').lower()
+                tag_token = tag_id(tag_name, user_id)
 
-                tags = [tag for tag in tags if tag != tag_id]
+                tags = [tag for tag in tags if tag != tag_token]
                 chat.meta = {
                     **chat.meta,
                     'tags': list(set(tags)),

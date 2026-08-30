@@ -13,11 +13,8 @@ drift apart again.
 import time
 
 import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from conftest import run, sqlite_test_database
 
-from open_webui.internal import db as internal_db
-from open_webui.internal.db import Base
 from open_webui.models.chats import Chat, Chats
 from open_webui.utils import crypto_context
 from open_webui.utils.crypto_context import cache_dek, set_current_user_id
@@ -30,21 +27,17 @@ USER_ID = "list-user"
 
 
 @pytest.fixture
-def db(monkeypatch):
-    monkeypatch.setattr(internal_db, "DATABASE_ENABLE_SESSION_SHARING", True)
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine, tables=[Chat.__table__])
-    session = sessionmaker(bind=engine)()
+def db(monkeypatch, tmp_path):
+    with sqlite_test_database(
+        monkeypatch, tmp_path / "test.db", tables=[Chat.__table__]
+    ) as session:
+        cache_dek(USER_ID, generate_dek(), jti="jti-1", expires_at=time.time() + 3600)
+        set_current_user_id(USER_ID)
 
-    cache_dek(USER_ID, generate_dek(), jti="jti-1", expires_at=time.time() + 3600)
-    set_current_user_id(USER_ID)
+        yield session
 
-    yield session
-
-    set_current_user_id(None)
-    session.close()
-    engine.dispose()
-    crypto_context._dek_cache.clear()
+        set_current_user_id(None)
+        crypto_context._dek_cache.clear()
 
 
 def _add(db, chat_id, title, body="", archived=False, ts=None):
@@ -66,7 +59,7 @@ def _add(db, chat_id, title, body="", archived=False, ts=None):
 
 
 def _list(db, **kwargs):
-    return Chats.get_chat_list_by_user_id(USER_ID, db=db, **kwargs)
+    return run(Chats.get_chat_list_by_user_id(USER_ID, **kwargs))
 
 
 def _search(db, query, **kwargs):
