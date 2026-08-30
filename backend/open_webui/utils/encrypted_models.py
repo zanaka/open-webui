@@ -543,19 +543,27 @@ def _encrypt(target, policy: EncryptionPolicy) -> None:
     stash = {column: getattr(target, column) for column in policy.columns}
     setattr(target, _PLAINTEXT_STASH, stash)
 
+    # None stays None without entering the crypto layer, so an empty column
+    # costs nothing and the decrypt counters in the tests measure real work.
     for column in policy.text:
-        setattr(target, column, encrypt_text(stash[column], dek))
+        if stash[column] is not None:
+            setattr(target, column, encrypt_text(stash[column], dek))
     for column in policy.json:
-        setattr(target, column, encrypt_json_value(stash[column], dek))
+        if stash[column] is not None:
+            setattr(target, column, encrypt_json_value(stash[column], dek))
 
 
 def _decrypt(target, policy: EncryptionPolicy) -> None:
     dek = _key_for(target, policy)
 
     for column in policy.text:
-        setattr(target, column, decrypt_text(getattr(target, column), dek))
+        value = getattr(target, column)
+        if value is not None:
+            setattr(target, column, decrypt_text(value, dek))
     for column in policy.json:
-        setattr(target, column, decrypt_json_value(getattr(target, column), dek))
+        value = getattr(target, column)
+        if value is not None:
+            setattr(target, column, decrypt_json_value(value, dek))
 
 
 def _restore_plaintext(target) -> None:
