@@ -14,6 +14,7 @@ from open_webui.models.memories import Memories, MemoryModel
 from open_webui.models.users import Users
 from open_webui.retrieval.vector.async_client import ASYNC_VECTOR_DB_CLIENT
 from open_webui.utils.access_control import has_permission
+from open_webui.utils.vector_keys import owner_key
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.memory import (
     clean_memory_content,
@@ -164,13 +165,14 @@ async def reindex_memory_vectors_for_user(
             }
             for idx, memory in enumerate(memories)
         ],
+        key=owner_key(user.id),
     )
     return len(memories)
 
 
 async def upsert_memory_vectors_or_reindex(request: Request, user, items: list[dict]) -> None:
     try:
-        await ASYNC_VECTOR_DB_CLIENT.upsert(collection_name=f'user-memory-{user.id}', items=items)
+        await ASYNC_VECTOR_DB_CLIENT.upsert(collection_name=f'user-memory-{user.id}', items=items, key=owner_key(user.id))
     except Exception as e:
         message = str(e).lower()
         if 'dimension' not in message or 'embedding' not in message:
@@ -350,6 +352,7 @@ async def query_memory(
         collection_name=f'user-memory-{user.id}',
         vectors=[vector],
         limit=form_data.k,
+        key=owner_key(user.id),
     )
 
     # Filter results by relevance threshold to avoid returning unrelated
