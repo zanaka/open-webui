@@ -44,7 +44,14 @@ from open_webui.utils.auth import (
     revoke_user_tokens,
     validate_password,
 )
-from open_webui.utils.chat_variables import ChatVariablesError, normalize_user_variables, validate_user_variables
+from open_webui.utils.chat_variables import (
+    ChatVariablesError,
+    decrypt_user_variables,
+    normalize_user_variables,
+    validate_user_variables,
+)
+from open_webui.utils.crypto_context import require_cached_dek
+from open_webui.utils.crypto_utils import encrypt_json_value
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -641,7 +648,7 @@ class UserVariablesResponse(BaseModel):
 
 @router.get('/user/variables', response_model=UserVariablesResponse)
 async def get_user_variables_by_session_user(user=Depends(get_verified_user)):
-    return UserVariablesResponse(variables=normalize_user_variables(user.variables))
+    return UserVariablesResponse(variables=decrypt_user_variables(user))
 
 
 ############################
@@ -663,7 +670,12 @@ async def update_user_variables_by_session_user(
             detail=str(exc),
         )
 
-    updated = await Users.update_user_by_id(user.id, {'variables': variables}, db=db)
+    # Encrypted by hand rather than by the row hooks: the user table is exempt
+    # (rows are read across users for sign-in and admin screens), but these
+    # values are personal content, and both ends of this field live in
+    # self-scoped requests where the owner's key is in hand.
+    stored = encrypt_json_value(variables, require_cached_dek(user.id))
+    updated = await Users.update_user_by_id(user.id, {'variables': stored}, db=db)
     if not updated:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

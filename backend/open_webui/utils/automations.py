@@ -692,9 +692,14 @@ async def execute_automation(app, automation: AutomationModel) -> None:
 async def _check_calendar_alerts(app) -> None:
     """Check for upcoming calendar events and send alert notifications.
 
-    De-duplication is DB-backed via meta.alerted_at — survives restarts
-    and works across multiple instances.
+    Disabled in this deployment: event titles and times are encrypted with
+    their owner's key, and this runs headless with no key in memory — the
+    same reason automations are closed. Alerts return when scheduled work
+    gets a key path.
     """
+    return
+    # De-duplication is DB-backed via meta.alerted_at — survives restarts
+    # and works across multiple instances.
     from open_webui.models.calendar import CalendarEvents, CalendarEventUpdateForm
     from open_webui.socket.main import sio
 

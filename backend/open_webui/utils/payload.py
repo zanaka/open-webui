@@ -1,7 +1,7 @@
 import logging
 from typing import Callable, Optional
 
-from open_webui.utils.chat_variables import render_chat_variables, render_user_variables
+from open_webui.utils.chat_variables import decrypt_user_variables, render_chat_variables, render_user_variables
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.misc import (
     add_or_update_system_message,
@@ -29,7 +29,7 @@ async def resolve_system_prompt(
             required=False,
         )
 
-    system = render_user_variables(system, getattr(user, 'variables', {}) if user else {})
+    system = render_user_variables(system, decrypt_user_variables(user) if user else {})
 
     # Metadata (WebUI Usage)
     if metadata:

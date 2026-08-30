@@ -773,6 +773,18 @@ class CalendarEventAttendeeTable:
         attendee keeps their status, a newly added one starts 'pending'. A
         caller-supplied status is ignored so an organiser cannot set it for others.
         """
+        if attendees:
+            # An attendee would be another reader of an event encrypted with
+            # its owner's key, and there is no key path to hand them (see
+            # utils/encrypted_models.py). Refused here, at the single point
+            # where attendee rows are written, so events stay single-reader.
+            from open_webui.utils.resource_crypto import SharingNotSupportedError
+
+            raise SharingNotSupportedError(
+                'Inviting attendees is not available: an encrypted event is '
+                'readable only by its owner.'
+            )
+
         async with get_async_db_context(db) as db:
             existing_status = {
                 row.user_id: row.status

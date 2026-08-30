@@ -23,11 +23,12 @@ from open_webui.models.access_grants import (
     WILDCARD_PRINCIPAL_ID,
     AccessGrant,
 )
+from open_webui.models.calendar import Calendar, CalendarEvent
 from open_webui.models.chat_messages import ChatMessage
 from open_webui.models.chats import Chat
 from open_webui.models.files import File
 from open_webui.models.folders import Folder
-from open_webui.models.knowledge import Knowledge
+from open_webui.models.knowledge import Knowledge, KnowledgeDirectory
 from open_webui.models.memories import Memory
 from open_webui.models.notes import Note
 from open_webui.models.prompt_history import PromptHistory
@@ -114,6 +115,16 @@ ENCRYPTED_MODELS: dict[type, EncryptionPolicy] = {
     # administrator deleting without reading — who pass it around opaquely.
     File: EncryptionPolicy(owner="user_id", text=("filename",), json=("data", "meta")),
     Memory: EncryptionPolicy(owner="user_id", text=("content",)),
+    Calendar: EncryptionPolicy(owner="user_id", text=("name",), json=("data", "meta")),
+    # `rrule` is content too — a recurrence pattern says when someone is
+    # where. Dates stay clear: the range queries that page a calendar walk
+    # them in SQL. Attendee rows are refused at the single place they are
+    # written (models/calendar.py set_attendees), so events stay one-reader.
+    CalendarEvent: EncryptionPolicy(
+        owner="user_id",
+        text=("title", "description", "location", "rrule"),
+        json=("data", "meta"),
+    ),
     Folder: EncryptionPolicy(
         owner="user_id", text=("name",), json=("items", "meta", "data")
     ),
@@ -161,7 +172,19 @@ ENCRYPTED_MODELS: dict[type, EncryptionPolicy] = {
         json=("snapshot",),
         shared=True,
     ),
+    # A directory names part of a knowledge base's structure, so it rides on
+    # the knowledge base's key (BORROWED_KEYS): readable by exactly whoever
+    # can open the base.
+    KnowledgeDirectory: EncryptionPolicy(
+        owner="user_id",
+        text=("name",),
+        shared=True,
+    ),
 }
+
+
+def _knowledge_directory_key_of(session, target) -> tuple[str, Optional[str]]:
+    return ("Knowledge", target.knowledge_id)
 
 
 def _prompt_history_key_of(session, target) -> tuple[str, Optional[str]]:
@@ -176,6 +199,7 @@ def _prompt_history_key_of(session, target) -> tuple[str, Optional[str]]:
 # copies, so nothing is created on insert or cleaned up on delete.
 BORROWED_KEYS: dict[type, "object"] = {
     PromptHistory: _prompt_history_key_of,
+    KnowledgeDirectory: _knowledge_directory_key_of,
 }
 
 
@@ -623,20 +647,24 @@ NOT_ENCRYPTED: dict[str, str] = {
     "ChannelWebhook": "channels are closed; the token is compared by value anyway",
     "Message": "channels are closed; messages have many readers and no single owner",
     "MessageReaction": "channels are closed; emoji names",
-    # Models new in upstream v0.11.1, provisionally exempted so the merged app
-    # can boot. TODO(phase3): each gets its final decision — encrypt what holds
-    # user content (ChatMessage, Skill, PromptHistory, Calendar*), close what
-    # cannot be keyed (Automation runs headless with no DEK; SharedChat stores
-    # a plaintext snapshot of a chat).
-    "AccessGrant": "TODO(phase3): rows of ids and permissions only",
-    "Automation": "TODO(phase3): to be closed; scheduled runs execute with no DEK in cache",
-    "AutomationRun": "TODO(phase3): to be closed with Automation",
-    "Calendar": "TODO(phase3): to be encrypted with the owner's key",
-    "CalendarEvent": "TODO(phase3): to be encrypted with the owner's key",
-    "CalendarEventAttendee": "TODO(phase3): decide with Calendar; attendee rows",
-    "KnowledgeDirectory": "TODO(phase3): inspect columns, then encrypt or exempt",
-    "PinnedNote": "TODO(phase3): join table of ids",
-    "SharedChat": "TODO(phase3): to be closed; plaintext chat snapshots for sharing",
+    # Rows of identifiers and flags only.
+    "AccessGrant": "ids and permission names; drives the resource-key sync in this module",
+    "PinnedNote": "join table of ids",
+    # An attendee row is ids and an RSVP status. Writing one is refused at the
+    # single place it happens (models/calendar.py set_attendees): an attendee
+    # would be a second reader of an event encrypted with its owner's key.
+    "CalendarEventAttendee": "attendee rows are refused; ids and RSVP status only",
+    # Automations are closed here rather than encrypted: a scheduled run
+    # executes with nobody signed in, so no DEK is in memory to open the
+    # prompt it should send or write the chat it would produce. Every endpoint
+    # returns 501 (see routers/automations.py), so these tables stay empty.
+    # Reopening means designing key escrow for scheduled work first.
+    "Automation": "automations are closed; scheduled runs hold no key",
+    "AutomationRun": "automations are closed; run records only",
+    # Chat sharing is closed here rather than encrypted: a share link has no
+    # named recipient whose key could wrap the snapshot. The share endpoints
+    # return 501 (see routers/chats.py), so this table stays empty.
+    "SharedChat": "chat sharing is closed; a share link has no recipient to key for",
 }
 
 

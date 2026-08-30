@@ -4,6 +4,7 @@ import pytest
 from sqlalchemy import text
 
 from open_webui.crypto_exceptions import EncryptedDataAccessDeniedError
+from open_webui.models.calendar import Calendar, CalendarEvent
 from open_webui.models.chat_messages import ChatMessage
 from open_webui.models.chats import Chat
 from open_webui.models.files import File
@@ -130,6 +131,29 @@ BUILDERS = {
         description=f"{MARKER} description",
         content=f"{MARKER} content",
         meta={"note": MARKER},
+        created_at=_now(),
+        updated_at=_now(),
+    ),
+    Calendar: lambda owner: Calendar(
+        id="cal1",
+        user_id=owner,
+        name=f"{MARKER} calendar",
+        data={"note": MARKER},
+        meta={"note": MARKER},
+        created_at=_now(),
+        updated_at=_now(),
+    ),
+    CalendarEvent: lambda owner: CalendarEvent(
+        id="ev1",
+        calendar_id="cal1",
+        user_id=owner,
+        title=f"{MARKER} event",
+        description=f"{MARKER} description",
+        location=f"{MARKER} location",
+        rrule=f"FREQ=DAILY;{MARKER}",
+        data={"note": MARKER},
+        meta={"note": MARKER},
+        start_at=_now(),
         created_at=_now(),
         updated_at=_now(),
     ),
