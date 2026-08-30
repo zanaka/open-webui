@@ -201,8 +201,14 @@ class AuthsTable:
                 return
             if not await verify_password(credential.password):
                 return
-            kek = derive_kek(raw_password, credential.kdf_salt)
-            dek = unwrap_dek(credential.wrapped_dek, kek)
+            try:
+                kek = derive_kek(raw_password, credential.kdf_salt)
+                dek = unwrap_dek(credential.wrapped_dek, kek)
+            except Exception:
+                # A password that matches the hash but cannot unwrap the DEK
+                # (or a corrupted key column) is a failed login, not a crash.
+                log.exception('authenticate_user error')
+                return
             return UserWithDek(user=resolved, dek=dek)
 
     async def get_public_key(

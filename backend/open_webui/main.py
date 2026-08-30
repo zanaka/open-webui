@@ -203,6 +203,7 @@ from open_webui.socket.main import (
     get_event_emitter,
     get_models_in_use,
     get_user_id_from_session_pool,
+    periodic_expiring_cache_cleanup,
     periodic_session_pool_cleanup,
     periodic_usage_pool_cleanup,
 )
@@ -408,6 +409,7 @@ async def lifespan(app: FastAPI):
 
     app.state.periodic_usage_pool_cleanup = asyncio.create_task(periodic_usage_pool_cleanup())
     app.state.periodic_session_pool_cleanup = asyncio.create_task(periodic_session_pool_cleanup())
+    app.state.periodic_expiring_cache_cleanup = asyncio.create_task(periodic_expiring_cache_cleanup())
 
     from open_webui.utils.automations import scheduler_worker_loop
 
@@ -494,6 +496,7 @@ async def lifespan(app: FastAPI):
 
     app.state.periodic_usage_pool_cleanup.cancel()
     app.state.periodic_session_pool_cleanup.cancel()
+    app.state.periodic_expiring_cache_cleanup.cancel()
     app.state.scheduler_worker_loop.cancel()
 
     await publish_event(app, EVENTS.SYSTEM_SHUTDOWN_COMPLETED, source='system')

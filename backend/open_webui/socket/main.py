@@ -38,6 +38,8 @@ from open_webui.models.users import UserNameResponse, Users
 from open_webui.socket.utils import RedisDict, RedisLock, YdocManager
 from open_webui.tasks import create_task, stop_item_tasks
 from open_webui.utils.access_control import has_permission
+from open_webui.utils.crypto_context import purge_expired_sessions, set_current_user_id
+from open_webui.utils.vem_crypto import purge_expired_vems
 from open_webui.utils.auth import get_verified_user_by_token
 from open_webui.utils.chat_id import is_saved_chat_id
 from open_webui.utils.json_codec import SOCKETIO_JSON
@@ -217,6 +219,19 @@ async def periodic_session_pool_cleanup():
                     break
         finally:
             session_release_func()
+
+
+async def periodic_expiring_cache_cleanup():
+    # The DEK cache and the VEM cache both hold key material keyed to session
+    # expiry; sweep out what has expired so keys do not outlive their sessions.
+    from open_webui.env import EXPIRING_CACHE_CLEANUP_INTERVAL
+
+    while True:
+        now = time.time()
+        purge_expired_sessions(now)
+        purge_expired_vems(now)
+
+        await asyncio.sleep(EXPIRING_CACHE_CLEANUP_INTERVAL)
 
 
 async def periodic_usage_pool_cleanup():
@@ -488,7 +503,10 @@ async def join_note(sid, data):
     if not user:
         return
 
-    note = await Notes.get_note_by_id(data['note_id'])
+    # Only who owns it and who may reach it, not what it says: joining a
+    # room needs no key, and loading the row here would decrypt it — which
+    # fails outside a request, where no user context is set.
+    note = await Notes.get_note_access_by_id(data['note_id'])
     if not note:
         log.error(f'Note {data["note_id"]} not found for user {user.id}')
         return
@@ -499,15 +517,15 @@ async def join_note(sid, data):
         and not await AccessGrants.has_access(
             user_id=user.id,
             resource_type='note',
-            resource_id=note.id,
+            resource_id=data['note_id'],
             permission='read',
         )
     ):
         log.error(f'User {user.id} does not have access to note {data["note_id"]}')
         return
 
-    log.debug('Joining note %s for user %s', note.id, user.id)
-    await sio.enter_room(sid, f'note:{note.id}')
+    log.debug('Joining note %s for user %s', data['note_id'], user.id)
+    await sio.enter_room(sid, f'note:{data["note_id"]}')
 
 
 @sio.on('events:channel')
@@ -630,7 +648,8 @@ async def ydoc_document_join(sid, data):
 
         if document_id.startswith('note:'):
             note_id = document_id.split(':')[1]
-            note = await Notes.get_note_by_id(note_id)
+            # Ownership and reach only — see join_note.
+            note = await Notes.get_note_access_by_id(note_id)
             if not note:
                 log.error(f'Note {note_id} not found')
                 return
@@ -641,7 +660,7 @@ async def ydoc_document_join(sid, data):
                 and not await AccessGrants.has_access(
                     user_id=user.get('id'),
                     resource_type='note',
-                    resource_id=note.id,
+                    resource_id=note_id,
                     permission='read',
                 )
             ):
@@ -703,7 +722,8 @@ async def document_save_handler(document_id, data, user):
 
     if document_id.startswith('note:'):
         note_id = document_id.split(':')[1]
-        note = await Notes.get_note_by_id(note_id)
+        # Ownership and reach only — see join_note.
+        note = await Notes.get_note_access_by_id(note_id)
         if not note:
             log.error(f'Note {note_id} not found')
             return
@@ -714,14 +734,22 @@ async def document_save_handler(document_id, data, user):
             and not await AccessGrants.has_access(
                 user_id=user.get('id'),
                 resource_type='note',
-                resource_id=note.id,
+                resource_id=note_id,
                 permission='write',
             )
         ):
             log.error(f'User {user.get("id")} does not have write access to note {note_id}')
             return
 
-        await Notes.update_note_by_id(note_id, NoteUpdateForm(data=data))
+        # Writing re-encrypts the row, and outside a request no user context is
+        # set, so the save would run keyless and fail — edits would look saved
+        # but not be. The socket session's user holds the key (their DEK is
+        # cached while they are signed in), so act as them for the write.
+        set_current_user_id(user.get('id'))
+        try:
+            await Notes.update_note_by_id(note_id, NoteUpdateForm(data=data))
+        finally:
+            set_current_user_id(None)
 
 
 @sio.on('ydoc:document:state')
@@ -787,7 +815,8 @@ async def yjs_document_update(sid, data):
 
         if document_id.startswith('note:'):
             note_id = document_id.split(':')[1]
-            note = await Notes.get_note_by_id(note_id)
+            # Ownership and reach only — see join_note.
+            note = await Notes.get_note_access_by_id(note_id)
             if not note:
                 log.error(f'Note {note_id} not found')
                 return
@@ -798,7 +827,7 @@ async def yjs_document_update(sid, data):
                 and not await AccessGrants.has_access(
                     user_id=user.get('id'),
                     resource_type='note',
-                    resource_id=note.id,
+                    resource_id=note_id,
                     permission='write',
                 )
             ):

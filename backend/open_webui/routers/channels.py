@@ -55,7 +55,37 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 log = logging.getLogger(__name__)
 
-router = APIRouter()
+############################
+# Channels Closed Dependency
+############################
+
+
+CHANNELS_UNAVAILABLE = (
+    'Channels are unavailable in this deployment: their messages have many '
+    'readers and are written by unauthenticated webhooks, which the per-user '
+    'encryption model cannot express.'
+)
+
+
+def check_channels_access(request: Request = None):
+    """Channels are closed here, whatever the configuration says.
+
+    Every reader of a channel would need the key, the member set of a public
+    channel is everyone who ever signs up, and the inbound webhook writes
+    messages with no user at all. None of that fits a per-user key, so the
+    feature stays shut rather than accumulating conversation in the clear.
+    The setting is left in place so the admin screen keeps working, but it no
+    longer opens anything.
+    """
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail=CHANNELS_UNAVAILABLE,
+    )
+
+
+# Declared on the router rather than in each handler, so a route added later is
+# closed too.
+router = APIRouter(dependencies=[Depends(check_channels_access)])
 
 
 async def channel_has_access(
@@ -138,7 +168,7 @@ async def get_channel_member_user_ids(
 ############################
 
 
-async def check_channels_access(request: Request, user: Optional[UserModel] = None):
+async def check_channels_enabled(request: Request, user: Optional[UserModel] = None):
     """Dependency to ensure channels are globally enabled."""
     if not await Config.get('channels.enable'):
         raise HTTPException(
@@ -175,7 +205,7 @@ async def get_channels(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    await check_channels_access(request, user)
+    await check_channels_enabled(request, user)
 
     channels = await Channels.get_channels_by_user_id(user.id, db=db)
     channel_list = []
@@ -224,7 +254,7 @@ async def get_all_channels(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    await check_channels_access(request, user)
+    await check_channels_enabled(request, user)
     if user.role == 'admin':
         return await Channels.get_channels(db=db)
     return await Channels.get_channels_by_user_id(user.id, db=db)
@@ -242,7 +272,7 @@ async def get_dm_channel_by_user_id(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    await check_channels_access(request, user)
+    await check_channels_enabled(request, user)
     try:
         existing_channel = await Channels.get_dm_channel_by_user_ids([user.id, user_id], db=db)
         if existing_channel:
@@ -300,7 +330,7 @@ async def create_new_channel(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    await check_channels_access(request, user)
+    await check_channels_enabled(request, user)
 
     if form_data.type not in ['group', 'dm'] and user.role != 'admin':
         # Only admins can create standard channels (joined by default)
@@ -388,7 +418,7 @@ async def get_channel_by_id(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    await check_channels_access(request, user)
+    await check_channels_enabled(request, user)
     channel = await Channels.get_channel_by_id(id, db=db)
     if not channel:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
@@ -521,7 +551,7 @@ async def get_channel_members_by_id(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    await check_channels_access(request, user)
+    await check_channels_enabled(request, user)
 
     channel = await Channels.get_channel_by_id(id, db=db)
     if not channel:
@@ -596,7 +626,7 @@ async def update_is_active_member_by_id_and_user_id(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    await check_channels_access(request, user)
+    await check_channels_enabled(request, user)
     channel = await Channels.get_channel_by_id(id, db=db)
     if not channel:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
@@ -633,7 +663,7 @@ async def add_members_by_id(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    await check_channels_access(request, user)
+    await check_channels_enabled(request, user)
     channel = await Channels.get_channel_by_id(id, db=db)
     if not channel:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
@@ -676,7 +706,7 @@ async def remove_members_by_id(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    await check_channels_access(request, user)
+    await check_channels_enabled(request, user)
 
     channel = await Channels.get_channel_by_id(id, db=db)
     if not channel:
@@ -714,7 +744,7 @@ async def update_channel_by_id(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    await check_channels_access(request, user)
+    await check_channels_enabled(request, user)
 
     channel = await Channels.get_channel_by_id(id, db=db)
     if not channel:
@@ -758,7 +788,7 @@ async def delete_channel_by_id(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    await check_channels_access(request, user)
+    await check_channels_enabled(request, user)
 
     channel = await Channels.get_channel_by_id(id, db=db)
     if not channel:
@@ -809,7 +839,7 @@ async def get_channel_messages(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    await check_channels_access(request, user)
+    await check_channels_enabled(request, user)
     channel = await Channels.get_channel_by_id(id, db=db)
     if not channel:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
@@ -876,7 +906,7 @@ async def get_pinned_channel_messages(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    await check_channels_access(request, user)
+    await check_channels_enabled(request, user)
     channel = await Channels.get_channel_by_id(id, db=db)
     if not channel:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
@@ -1229,7 +1259,7 @@ async def post_new_message(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    await check_channels_access(request, user)
+    await check_channels_enabled(request, user)
 
     try:
         message, channel = await new_message_handler(request, id, form_data, user, db)
@@ -1290,7 +1320,7 @@ async def get_channel_message(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    await check_channels_access(request, user)
+    await check_channels_enabled(request, user)
     channel = await Channels.get_channel_by_id(id, db=db)
     if not channel:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
@@ -1331,7 +1361,7 @@ async def get_channel_message_data(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    await check_channels_access(request, user)
+    await check_channels_enabled(request, user)
     channel = await Channels.get_channel_by_id(id, db=db)
     if not channel:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
@@ -1371,7 +1401,7 @@ async def pin_channel_message(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    await check_channels_access(request, user)
+    await check_channels_enabled(request, user)
     channel = await Channels.get_channel_by_id(id, db=db)
     if not channel:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
@@ -1446,7 +1476,7 @@ async def get_channel_thread_messages(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    await check_channels_access(request, user)
+    await check_channels_enabled(request, user)
     channel = await Channels.get_channel_by_id(id, db=db)
     if not channel:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
@@ -1507,7 +1537,7 @@ async def update_message_by_id(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    await check_channels_access(request, user)
+    await check_channels_enabled(request, user)
     channel = await Channels.get_channel_by_id(id, db=db)
     if not channel:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
@@ -1585,7 +1615,7 @@ async def add_reaction_to_message(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    await check_channels_access(request, user)
+    await check_channels_enabled(request, user)
     channel = await Channels.get_channel_by_id(id, db=db)
     if not channel:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
@@ -1659,7 +1689,7 @@ async def remove_reaction_by_id_and_user_id_and_name(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    await check_channels_access(request, user)
+    await check_channels_enabled(request, user)
     channel = await Channels.get_channel_by_id(id, db=db)
     if not channel:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
@@ -1733,7 +1763,7 @@ async def delete_message_by_id(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    await check_channels_access(request, user)
+    await check_channels_enabled(request, user)
     channel = await Channels.get_channel_by_id(id, db=db)
     if not channel:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
@@ -1869,7 +1899,7 @@ async def get_channel_webhooks(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    await check_channels_access(request, user)
+    await check_channels_enabled(request, user)
     channel = await Channels.get_channel_by_id(id, db=db)
     if not channel:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
@@ -1889,7 +1919,7 @@ async def create_channel_webhook(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    await check_channels_access(request, user)
+    await check_channels_enabled(request, user)
     channel = await Channels.get_channel_by_id(id, db=db)
     if not channel:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
@@ -1921,7 +1951,7 @@ async def update_channel_webhook(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    await check_channels_access(request, user)
+    await check_channels_enabled(request, user)
     channel = await Channels.get_channel_by_id(id, db=db)
     if not channel:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
@@ -1956,7 +1986,7 @@ async def delete_channel_webhook(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    await check_channels_access(request, user)
+    await check_channels_enabled(request, user)
     channel = await Channels.get_channel_by_id(id, db=db)
     if not channel:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
@@ -1999,7 +2029,7 @@ async def post_webhook_message(
     db: AsyncSession = Depends(get_async_session),
 ):
     """Public endpoint to post messages via webhook. No authentication required."""
-    await check_channels_access(request)
+    await check_channels_enabled(request)
 
     # Validate webhook
     webhook = await Channels.get_webhook_by_id_and_token(webhook_id, token, db=db)
