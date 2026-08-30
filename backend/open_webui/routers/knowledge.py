@@ -46,6 +46,7 @@ from open_webui.storage.provider import Storage
 from open_webui.utils.access_control import filter_allowed_access_grants, has_permission
 from open_webui.utils.access_control.files import has_access_to_file
 from open_webui.utils.auth import get_admin_user, get_verified_user
+from open_webui.utils.vector_keys import knowledge_key
 from open_webui.utils.json_codec import JSONCodec
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -86,7 +87,13 @@ async def delete_file_resource(file: FileModel, db: AsyncSession) -> bool:
 
 # Knowledge that sits unread serves no one. Let what is
 # stored here find the ones who need it.
-KNOWLEDGE_BASES_COLLECTION = 'knowledge-bases'
+def kb_meta_collection(knowledge_base_id: str) -> str:
+    """Where a knowledge base's own name and description are indexed.
+
+    One collection per knowledge base rather than a single shared index, so it
+    can be protected by that knowledge base's key like the rest of its content.
+    """
+    return f'kbmeta-{knowledge_base_id}'
 
 
 async def embed_knowledge_base_metadata(
@@ -94,13 +101,15 @@ async def embed_knowledge_base_metadata(
     knowledge_base_id: str,
     name: str,
     description: str,
+    user_id: str,
 ) -> bool:
     """Generate and store embedding for knowledge base."""
     try:
         content = f'{name}\n\n{description}' if description else name
         embedding = await request.app.state.EMBEDDING_FUNCTION(content, prefix=RAG_EMBEDDING_CONTENT_PREFIX)
         await ASYNC_VECTOR_DB_CLIENT.upsert(
-            collection_name=KNOWLEDGE_BASES_COLLECTION,
+            collection_name=kb_meta_collection(knowledge_base_id),
+            key=knowledge_key(knowledge_base_id, user_id),
             items=[
                 {
                     'id': knowledge_base_id,
@@ -121,10 +130,9 @@ async def embed_knowledge_base_metadata(
 async def remove_knowledge_base_metadata_embedding(knowledge_base_id: str) -> bool:
     """Remove knowledge base embedding."""
     try:
-        await ASYNC_VECTOR_DB_CLIENT.delete(
-            collection_name=KNOWLEDGE_BASES_COLLECTION,
-            ids=[knowledge_base_id],
-        )
+        collection_name = kb_meta_collection(knowledge_base_id)
+        if await ASYNC_VECTOR_DB_CLIENT.has_collection(collection_name=collection_name):
+            await ASYNC_VECTOR_DB_CLIENT.delete_collection(collection_name=collection_name)
         return True
     except Exception as e:
         log.debug('Failed to remove embedding for %s: %s', knowledge_base_id, e)
@@ -165,11 +173,13 @@ async def get_knowledge_bases(
     groups = await Groups.get_groups_by_member_id(user.id, db=db)
     user_group_ids = {group.id for group in groups}
 
-    if not user.role == 'admin' or not BYPASS_ADMIN_ACCESS_CONTROL:
-        if groups:
-            filter['group_ids'] = [group.id for group in groups]
+    # Listed by what the person can open, administrator or not: knowledge bases
+    # are opened with a key their members hold, and an administrator holds no
+    # key for someone else's.
+    if groups:
+        filter['group_ids'] = [group.id for group in groups]
 
-        filter['user_id'] = user.id
+    filter['user_id'] = user.id
 
     result = await Knowledges.search_knowledge_bases(user.id, filter=filter, skip=skip, limit=limit, db=db)
 
@@ -189,9 +199,7 @@ async def get_knowledge_bases(
             KnowledgeAccessResponse(
                 **knowledge_base.model_dump(),
                 write_access=(
-                    user.id == knowledge_base.user_id
-                    or (user.role == 'admin' and BYPASS_ADMIN_ACCESS_CONTROL)
-                    or knowledge_base.id in writable_knowledge_base_ids
+                    user.id == knowledge_base.user_id or knowledge_base.id in writable_knowledge_base_ids
                 ),
             )
             for knowledge_base in result.items
@@ -230,11 +238,13 @@ async def search_knowledge_bases(
     groups = await Groups.get_groups_by_member_id(user.id, db=db)
     user_group_ids = {group.id for group in groups}
 
-    if not user.role == 'admin' or not BYPASS_ADMIN_ACCESS_CONTROL:
-        if groups:
-            filter['group_ids'] = [group.id for group in groups]
+    # Listed by what the person can open, administrator or not: knowledge bases
+    # are opened with a key their members hold, and an administrator holds no
+    # key for someone else's.
+    if groups:
+        filter['group_ids'] = [group.id for group in groups]
 
-        filter['user_id'] = user.id
+    filter['user_id'] = user.id
 
     result = await Knowledges.search_knowledge_bases(user.id, filter=filter, skip=skip, limit=limit, db=db)
 
@@ -254,9 +264,7 @@ async def search_knowledge_bases(
             KnowledgeAccessResponse(
                 **knowledge_base.model_dump(),
                 write_access=(
-                    user.id == knowledge_base.user_id
-                    or (user.role == 'admin' and BYPASS_ADMIN_ACCESS_CONTROL)
-                    or knowledge_base.id in writable_knowledge_base_ids
+                    user.id == knowledge_base.user_id or knowledge_base.id in writable_knowledge_base_ids
                 ),
             )
             for knowledge_base in result.items
@@ -323,6 +331,9 @@ async def create_new_knowledge(
         'sharing.public_knowledge',
     )
 
+    # No key handling here on purpose. Saving the row provisions its key and
+    # hands wrapped copies to whoever it is shared with, or refuses an audience
+    # that cannot be keyed. See utils/encrypted_models.py.
     knowledge = await Knowledges.insert_new_knowledge(user.id, form_data)
 
     if knowledge:
@@ -332,6 +343,7 @@ async def create_new_knowledge(
             knowledge.id,
             knowledge.name,
             knowledge.description,
+            user.id,
         )
         await publish_event(
             request,
@@ -353,6 +365,34 @@ async def create_new_knowledge(
 ############################
 
 
+async def _get_writable_knowledge_bases(user, db: Optional[AsyncSession] = None):
+    """The knowledge bases this person may rebuild.
+
+    Only what the caller holds a key for, administrator or not: reindexing
+    deletes a collection before rebuilding it, so running it over a knowledge
+    base whose files cannot be read would empty it and report success.
+    """
+    groups = await Groups.get_groups_by_member_id(user.id, db=db)
+    filter = {'user_id': user.id}
+    if groups:
+        filter['group_ids'] = [group.id for group in groups]
+
+    knowledge_bases = []
+    page_size = 100
+    skip = 0
+    while True:
+        result = await Knowledges.search_knowledge_bases(user.id, filter=filter, skip=skip, limit=page_size, db=db)
+        if not result.items:
+            break
+        for knowledge_base in result.items:
+            if await Knowledges.check_access_by_user_id(knowledge_base.id, user.id, permission='write', db=db):
+                knowledge_bases.append(knowledge_base)
+        skip += page_size
+        if len(result.items) < page_size:
+            break
+    return knowledge_bases
+
+
 @router.post('/reindex', response_model=bool)
 async def reindex_knowledge_files(
     request: Request,
@@ -365,7 +405,10 @@ async def reindex_knowledge_files(
             detail=ERROR_MESSAGES.UNAUTHORIZED,
         )
 
-    knowledge_bases = await Knowledges.get_knowledge_bases(db=db)
+    # Only what this administrator holds a key for. Reindexing deletes the
+    # collection before rebuilding it, so running it over a knowledge base
+    # whose files cannot be read would empty it and report success.
+    knowledge_bases = await _get_writable_knowledge_bases(user, db=db)
     knowledge_base_files = [
         (knowledge_base, await Knowledges.get_files_by_id(knowledge_base.id, db=db))
         for knowledge_base in knowledge_bases
@@ -453,23 +496,19 @@ async def reindex_knowledge_base_metadata_embeddings(
     request: Request,
     user=Depends(get_admin_user),
 ):
-    """Batch embed all existing knowledge bases. Admin only.
+    """Batch embed the knowledge bases this administrator can open.
 
     NOTE: We intentionally do NOT use Depends(get_async_session) here.
-    This endpoint loops through ALL knowledge bases and calls embed_knowledge_base_metadata()
+    This endpoint loops through the knowledge bases and calls embed_knowledge_base_metadata()
     for each one, making N external embedding API calls. Holding a session during
     this entire operation would exhaust the connection pool.
     """
-    knowledge_bases = await Knowledges.get_knowledge_bases()
+    knowledge_bases = await _get_writable_knowledge_bases(user)
     log.info('Reindexing embeddings for %s knowledge bases', len(knowledge_bases))
-    try:
-        await ASYNC_VECTOR_DB_CLIENT.delete_collection(collection_name=KNOWLEDGE_BASES_COLLECTION)
-    except Exception as e:
-        log.debug(e)
 
     success_count = 0
     for kb in knowledge_bases:
-        if await embed_knowledge_base_metadata(request, kb.id, kb.name, kb.description):
+        if await embed_knowledge_base_metadata(request, kb.id, kb.name, kb.description, user.id):
             success_count += 1
 
     log.info('Embedding reindex complete: %s/%s', success_count, len(knowledge_bases))
@@ -919,7 +958,7 @@ async def create_external_knowledge(
         },
     }
     knowledge = await Knowledges.update_knowledge_meta_by_id(knowledge.id, meta, db=db)
-    await embed_knowledge_base_metadata(request, knowledge.id, knowledge.name, knowledge.description)
+    await embed_knowledge_base_metadata(request, knowledge.id, knowledge.name, knowledge.description, user.id)
     return knowledge
 
 
@@ -984,7 +1023,7 @@ async def create_external_knowledge_source(
         },
     }
     knowledge = await Knowledges.update_knowledge_meta_by_id(knowledge.id, meta, db=db)
-    await embed_knowledge_base_metadata(request, knowledge.id, knowledge.name, knowledge.description)
+    await embed_knowledge_base_metadata(request, knowledge.id, knowledge.name, knowledge.description, user.id)
     return knowledge
 
 
@@ -1064,7 +1103,7 @@ async def update_external_knowledge_source(
         await _set_external_connections(connections)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=ERROR_MESSAGES.DEFAULT())
 
-    await embed_knowledge_base_metadata(request, id, updated.name, updated.description)
+    await embed_knowledge_base_metadata(request, id, updated.name, updated.description, user.id)
     return updated
 
 
@@ -1166,6 +1205,8 @@ async def update_knowledge_by_id(
         'sharing.public_knowledge',
     )
 
+    # As in create: saving brings the wrapped key copies in line with the new
+    # grants by itself, and refuses if this person holds no key.
     knowledge = await Knowledges.update_knowledge_by_id(id=id, form_data=form_data)
     if knowledge:
         # Re-embed knowledge base for semantic search
@@ -1174,6 +1215,7 @@ async def update_knowledge_by_id(
             knowledge.id,
             knowledge.name,
             knowledge.description,
+            user.id,
         )
         response = KnowledgeFilesResponse(
             **knowledge.model_dump(),
@@ -1647,7 +1689,9 @@ async def remove_file_from_knowledge_by_id(
         )  # Remove by file_id first
 
         await ASYNC_VECTOR_DB_CLIENT.delete(
-            collection_name=knowledge.id, filter={'hash': file.hash}
+            collection_name=knowledge.id,
+            filter={'hash': file.hash},
+            key=knowledge_key(knowledge.id, user.id),
         )  # Remove by hash as well in case of duplicates
     except Exception as e:
         log.debug('This was most likely caused by bypassing embedding processing')
@@ -1690,7 +1734,10 @@ async def delete_knowledge_by_id(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    knowledge = await Knowledges.get_knowledge_by_id(id=id, db=db)
+    # Only who owns it and who may reach it, not what it holds: deleting does
+    # not need the contents, so an administrator can remove a knowledge base
+    # they hold no key for. Reading it here would decrypt it and refuse.
+    knowledge = await Knowledges.get_knowledge_access_by_id(id=id, db=db)
     if not knowledge:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1713,7 +1760,11 @@ async def delete_knowledge_by_id(
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
 
-    log.info('Deleting knowledge base: %s (name: %s)', id, knowledge.name)
+    log.info('Deleting knowledge base: %s', id)
+
+    # The external-connection bookkeeping and the deletion event's name need
+    # the row's contents; a deleter who holds no key simply goes without them.
+    readable_knowledge = await Knowledges.get_knowledge_by_id(id=id, db=db)
 
     # Get all models
     models = await Models.get_all_models(db=db)
@@ -1734,8 +1785,8 @@ async def delete_knowledge_by_id(
                 await Models.update_model_by_id(model.id, model_form, db=db)
 
     # Clean up vector DB
-    if is_external_knowledge(knowledge):
-        connection_id = (knowledge.meta or {}).get('external', {}).get('connection_id')
+    if readable_knowledge and is_external_knowledge(readable_knowledge):
+        connection_id = (readable_knowledge.meta or {}).get('external', {}).get('connection_id')
         # Connections are admin-owned and shared across knowledge bases
         if (
             connection_id
@@ -1763,7 +1814,7 @@ async def delete_knowledge_by_id(
             EVENTS.KNOWLEDGE_DELETED,
             actor=user,
             subject_id=id,
-            data={'name': knowledge.name},
+            data={'name': readable_knowledge.name if readable_knowledge else id},
         )
     return result
 
@@ -1988,11 +2039,15 @@ async def sync_knowledge_cleanup(
 
         try:
             await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=id, filter={'file_id': file_id})
-            await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=id, filter={'hash': file.hash})
+            await ASYNC_VECTOR_DB_CLIENT.delete(
+                collection_name=id,
+                filter={'hash': file.hash},
+                key=knowledge_key(id, user.id),
+            )
         except Exception:
             pass
 
-        linked_knowledges = await Knowledges.get_knowledges_by_file_id(file_id, db=db)
+        linked_knowledges = await Knowledges.get_knowledges_by_file_id(file_id, user.id, db=db)
         if (
             not ENABLE_KNOWLEDGE_FILE_RETENTION
             and not linked_knowledges

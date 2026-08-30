@@ -2881,38 +2881,22 @@ async def view_knowledge_file(
     offset = max(offset, 0)
 
     try:
-        from open_webui.models.access_grants import AccessGrants
         from open_webui.models.files import Files
         from open_webui.models.knowledge import Knowledges
 
         user_id = __user__.get('id')
         user_role = __user__.get('role', 'user')
-        user_group_ids = [group.id for group in await Groups.get_groups_by_member_id(user_id)]
 
         file = await Files.get_file_by_id(file_id)
         if not file:
             return JSONCodec.dumps({'error': 'File not found'})
 
-        # Check access via any KB containing this file
-        knowledges = await Knowledges.get_knowledges_by_file_id(file_id)
-        has_knowledge_access = False
-        knowledge_info = None
-
-        for knowledge_base in knowledges:
-            if (
-                user_role == 'admin'
-                or knowledge_base.user_id == user_id
-                or await AccessGrants.has_access(
-                    user_id=user_id,
-                    resource_type='knowledge',
-                    resource_id=knowledge_base.id,
-                    permission='read',
-                    user_group_ids=set(user_group_ids),
-                )
-            ):
-                has_knowledge_access = True
-                knowledge_info = {'id': knowledge_base.id, 'name': knowledge_base.name}
-                break
+        # Check access via any KB containing this file. The query already
+        # returns only the knowledge bases this person may open, so there is
+        # nothing left to re-check here.
+        knowledges = await Knowledges.get_knowledges_by_file_id(file_id, user_id)
+        has_knowledge_access = bool(knowledges)
+        knowledge_info = {'id': knowledges[0].id, 'name': knowledges[0].name} if knowledges else None
 
         if not has_knowledge_access:
             if file.user_id != user_id and user_role != 'admin':
@@ -3174,7 +3158,8 @@ async def query_knowledge_files(
         from open_webui.models.knowledge import Knowledges
         from open_webui.models.notes import Notes
         from open_webui.retrieval.external import retrieve_external_knowledge
-        from open_webui.retrieval.utils import query_collection
+        from open_webui.retrieval.utils import KeyedCollection, query_collection
+        from open_webui.utils.vector_keys import knowledge_key, owner_key
 
         user_id = __user__.get('id')
         user_role = __user__.get('role', 'user')
@@ -3185,7 +3170,7 @@ async def query_knowledge_files(
             return JSONCodec.dumps({'error': 'Embedding function not configured'})
         user_model = UserModel(**__user__)
 
-        collection_names = []
+        collections = []
         external_knowledges = []
         note_results = []  # Notes aren't vectorized, handle separately
 
@@ -3212,13 +3197,14 @@ async def query_knowledge_files(
                         if (knowledge.meta or {}).get('source') == 'external':
                             external_knowledges.append(knowledge)
                         else:
-                            collection_names.append(item_id)
+                            collections.append(KeyedCollection(item_id, knowledge_key(item_id, user_id)))
 
                 elif item_type == 'file':
-                    # Individual file - use file-{id} as collection name
+                    # Individual file - use file-{id} as collection name,
+                    # opened with its owner's key.
                     file = await Files.get_file_by_id(item_id)
-                    if file:
-                        collection_names.append(f'file-{item_id}')
+                    if file and (user_role == 'admin' or file.user_id == user_id):
+                        collections.append(KeyedCollection(f'file-{item_id}', owner_key(user_id)))
 
                 elif item_type == 'note':
                     # Note - always return full content as context
@@ -3261,7 +3247,7 @@ async def query_knowledge_files(
                     if (knowledge.meta or {}).get('source') == 'external':
                         external_knowledges.append(knowledge)
                     else:
-                        collection_names.append(knowledge_id)
+                        collections.append(KeyedCollection(knowledge_id, knowledge_key(knowledge_id, user_id)))
         else:
             # No model knowledge and no specific IDs - search all accessible KBs
             result = await Knowledges.search_knowledge_bases(
@@ -3278,7 +3264,9 @@ async def query_knowledge_files(
                 if (knowledge_base.meta or {}).get('source') == 'external':
                     external_knowledges.append(knowledge_base)
                 else:
-                    collection_names.append(knowledge_base.id)
+                    collections.append(
+                        KeyedCollection(knowledge_base.id, knowledge_key(knowledge_base.id, user_id))
+                    )
 
         chunks = []
 
@@ -3286,10 +3274,10 @@ async def query_knowledge_files(
         chunks.extend(note_results)
 
         # Query vector collections if any
-        if collection_names:
+        if collections:
             query_results = await query_collection(
                 __request__,
-                collection_names=collection_names,
+                collections=collections,
                 queries=[query],
                 embedding_function=lambda queries, prefix: embedding_function(queries, prefix=prefix, user=user_model),
                 k=count,
@@ -3370,7 +3358,8 @@ async def query_knowledge_bases(
 
         from open_webui.models.knowledge import Knowledges
         from open_webui.retrieval.vector.async_client import ASYNC_VECTOR_DB_CLIENT
-        from open_webui.routers.knowledge import KNOWLEDGE_BASES_COLLECTION
+        from open_webui.routers.knowledge import kb_meta_collection
+        from open_webui.utils.vector_keys import knowledge_key
 
         user_id = __user__.get('id')
         user_group_ids = [group.id for group in await Groups.get_groups_by_member_id(user_id)]
@@ -3399,26 +3388,32 @@ async def query_knowledge_bases(
 
             accessible_ids = [kb.id for kb in accessible_knowledge_bases.items]
 
-            search_results = await ASYNC_VECTOR_DB_CLIENT.search(
-                collection_name=KNOWLEDGE_BASES_COLLECTION,
-                vectors=[query_embedding],
-                filter={'knowledge_base_id': {'$in': accessible_ids}},
-                limit=count,
-            )
+            # Each knowledge base indexes its own name and description, so this
+            # walks the ones the user can reach instead of one shared index.
+            for knowledge_base_id in accessible_ids:
+                if knowledge_base_id in seen_ids:
+                    continue
 
-            if search_results and search_results.ids and search_results.ids[0]:
-                result_ids = search_results.ids[0]
-                result_distances = search_results.distances[0] if search_results.distances else [0] * len(result_ids)
+                collection_name = kb_meta_collection(knowledge_base_id)
+                if not await ASYNC_VECTOR_DB_CLIENT.has_collection(collection_name=collection_name):
+                    continue
 
-                for knowledge_base_id, distance in zip(result_ids, result_distances):
-                    if knowledge_base_id in seen_ids:
-                        continue
-                    seen_ids.add(knowledge_base_id)
+                search_results = await ASYNC_VECTOR_DB_CLIENT.search(
+                    collection_name=collection_name,
+                    vectors=[query_embedding],
+                    key=knowledge_key(knowledge_base_id, user_id),
+                    limit=1,
+                )
+                if not (search_results and search_results.ids and search_results.ids[0]):
+                    continue
 
-                    if len(top_results_heap) < count:
-                        heapq.heappush(top_results_heap, (distance, knowledge_base_id))
-                    elif distance > top_results_heap[0][0]:
-                        heapq.heapreplace(top_results_heap, (distance, knowledge_base_id))
+                distance = search_results.distances[0][0] if search_results.distances else 0
+                seen_ids.add(knowledge_base_id)
+
+                if len(top_results_heap) < count:
+                    heapq.heappush(top_results_heap, (distance, knowledge_base_id))
+                elif distance > top_results_heap[0][0]:
+                    heapq.heapreplace(top_results_heap, (distance, knowledge_base_id))
 
             page_offset += page_size
             if len(accessible_knowledge_bases.items) < page_size:
