@@ -961,14 +961,10 @@ async def update_user_by_id(
                 )
 
         if form_data.password:
-            try:
-                validate_password(form_data.password)
-            except Exception as e:
-                raise HTTPException(400, detail=str(e))
-
-            hashed = await get_password_hash(form_data.password)
-            if await Auths.update_user_password_by_id(user_id, hashed, db=db):
-                await revoke_user_tokens(request, user_id)
+            raise HTTPException(
+                410,
+                detail='Admin password change is not available because the current password is required to re-wrap the DEK (Data Encryption Key).',
+            )
 
         # Build update dict from only the provided fields
         update_data = {}

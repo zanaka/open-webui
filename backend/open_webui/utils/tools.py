@@ -720,16 +720,8 @@ async def get_builtin_tools(
     ):
         builtin_functions.extend([search_notes, view_note, write_note, replace_note_content])
 
-    # Channels tools - search channels and messages
-    if is_builtin_tool_enabled('channels') and config.get('channels.enable') and await has_user_permission('channels'):
-        builtin_functions.extend(
-            [
-                search_channels,
-                search_channel_messages,
-                view_channel_thread,
-                view_channel_message,
-            ]
-        )
+    # Channels are closed in this deployment (see routers/channels.py), so the
+    # tools that read them are not offered to the model.
 
     # Skills tools - view_skill allows model to load full skill instructions on demand
     if extra_params.get('__skill_ids__'):
