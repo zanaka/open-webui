@@ -1105,14 +1105,15 @@ class ChatTable:
     ) -> Any | None:
         """Read one message metadata field without rebuilding the whole history."""
         async with get_async_db_context() as db:
-            # Read the column directly; some stored rows cannot be validated as full ChatMessageModel objects.
+            # Loaded as an entity, not a bare column: files/sources/embeds are
+            # encrypted at rest and only the ORM load hook decrypts them.
             result = await db.execute(
-                select(getattr(ChatMessage, metadata_key)).where(ChatMessage.id == f'{chat_id}-{message_id}')
+                select(ChatMessage).where(ChatMessage.id == f'{chat_id}-{message_id}')
             )
-            metadata_row = result.first()
+            metadata_row = result.scalars().first()
 
         if metadata_row is not None:
-            return metadata_row[0]
+            return getattr(metadata_row, metadata_key)
 
         chat = await self.get_chat_by_id(chat_id)
         if chat is None:

@@ -23,12 +23,14 @@ from open_webui.models.access_grants import (
     WILDCARD_PRINCIPAL_ID,
     AccessGrant,
 )
+from open_webui.models.chat_messages import ChatMessage
 from open_webui.models.chats import Chat
 from open_webui.models.files import File
 from open_webui.models.folders import Folder
 from open_webui.models.knowledge import Knowledge
 from open_webui.models.memories import Memory
 from open_webui.models.notes import Note
+from open_webui.models.prompt_history import PromptHistory
 from open_webui.models.prompts import Prompt
 from open_webui.models.resource_keys import ResourceKey
 from open_webui.models.skills import Skill
@@ -81,7 +83,30 @@ class EncryptionPolicy:
 
 
 ENCRYPTED_MODELS: dict[type, EncryptionPolicy] = {
-    Chat: EncryptionPolicy(owner="user_id", text=("title",), json=("chat",)),
+    # `tasks` and `summary` are upstream's chat auto-summary/task columns —
+    # conversation content, so they travel with the chat body.
+    Chat: EncryptionPolicy(
+        owner="user_id", text=("title", "summary"), json=("chat", "tasks")
+    ),
+    # The normalized message store upstream reads chat content from. `usage`,
+    # `role`, `model_id` and the tree columns stay clear: the admin usage
+    # dashboard aggregates them across users, and branch queries walk them in
+    # SQL — the same reasoning as File.hash. `context_summary` carries the
+    # compaction checkpoint, i.e. a distillation of the conversation.
+    ChatMessage: EncryptionPolicy(
+        owner="user_id",
+        text=("context_summary",),
+        json=(
+            "content",
+            "output",
+            "files",
+            "sources",
+            "embeds",
+            "meta",
+            "status_history",
+            "error",
+        ),
+    ),
     # `hash` is deliberately absent: it never holds a plain SHA-256. The
     # fingerprint is keyed to its owner where it is computed (file_hash_token in
     # rag_crypto), because it must stay readable to people without the owner's
@@ -127,6 +152,30 @@ ENCRYPTED_MODELS: dict[type, EncryptionPolicy] = {
         json=("meta",),
         shared=True,
     ),
+    # A history entry duplicates its prompt's content, so it is opened with the
+    # prompt's own key (see BORROWED_KEYS below): readable by exactly whoever
+    # can read the prompt, and sharing follows the prompt's grants with nothing
+    # extra stored or revoked.
+    PromptHistory: EncryptionPolicy(
+        owner="user_id",
+        json=("snapshot",),
+        shared=True,
+    ),
+}
+
+
+def _prompt_history_key_of(session, target) -> tuple[str, Optional[str]]:
+    row = (
+        session.query(Prompt.command).filter(Prompt.id == target.prompt_id).first()
+    )
+    return ("Prompt", row[0] if row else None)
+
+
+# Rows that duplicate another row's content are opened with that row's key
+# rather than one of their own. Provisioning skips them: they never own key
+# copies, so nothing is created on insert or cleaned up on delete.
+BORROWED_KEYS: dict[type, "object"] = {
+    PromptHistory: _prompt_history_key_of,
 }
 
 
@@ -135,6 +184,25 @@ _RESOURCE_KEY_STASH = "_resource_key"
 
 def _key_for(target, policy: EncryptionPolicy) -> bytes:
     """The key that opens this row."""
+    borrowed = BORROWED_KEYS.get(type(target))
+    if borrowed is not None:
+        actor = get_current_user_id()
+        if actor is None:
+            raise RuntimeError("No current user context. Cannot access encrypted data.")
+        session = object_session(target)
+        resource_type, resource_id = borrowed(session, target)
+        key = (
+            resolve_key(resource_type, resource_id, actor, db=session)
+            if resource_id is not None
+            else None
+        )
+        if key is None:
+            raise EncryptedDataAccessDeniedError(
+                f"{actor} holds no key for the {resource_type} behind "
+                f"{type(target).__name__} {getattr(target, policy.identity)}."
+            )
+        return key
+
     if not policy.shared:
         return require_current_user_dek(getattr(target, policy.owner))
 
@@ -298,7 +366,7 @@ def _provision_resource_keys(session, flush_context, instances) -> None:
 
     for target in written:
         policy = ENCRYPTED_MODELS.get(type(target))
-        if policy is None or not policy.shared:
+        if policy is None or not policy.shared or type(target) in BORROWED_KEYS:
             continue
 
         resource_type = type(target).__name__
@@ -334,7 +402,7 @@ def _provision_resource_keys(session, flush_context, instances) -> None:
     # content that no longer exists would be left behind.
     for target in session.deleted:
         policy = ENCRYPTED_MODELS.get(type(target))
-        if policy is None or not policy.shared:
+        if policy is None or not policy.shared or type(target) in BORROWED_KEYS:
             continue
         session.query(ResourceKey).filter_by(
             resource_type=type(target).__name__,
@@ -566,10 +634,8 @@ NOT_ENCRYPTED: dict[str, str] = {
     "Calendar": "TODO(phase3): to be encrypted with the owner's key",
     "CalendarEvent": "TODO(phase3): to be encrypted with the owner's key",
     "CalendarEventAttendee": "TODO(phase3): decide with Calendar; attendee rows",
-    "ChatMessage": "TODO(phase3): to be encrypted; primary message store",
     "KnowledgeDirectory": "TODO(phase3): inspect columns, then encrypt or exempt",
     "PinnedNote": "TODO(phase3): join table of ids",
-    "PromptHistory": "TODO(phase3): to be encrypted; snapshots duplicate prompt content",
     "SharedChat": "TODO(phase3): to be closed; plaintext chat snapshots for sharing",
 }
 
