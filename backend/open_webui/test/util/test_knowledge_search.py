@@ -1,6 +1,10 @@
 import time
 
+from conftest import run
+
+from open_webui.models.access_grants import AccessGrants
 from open_webui.models.knowledge import Knowledge, Knowledges
+from open_webui.utils.crypto_context import set_current_user_id
 
 
 def _add(
@@ -10,8 +14,11 @@ def _add(
     owner,
     description="",
     ts=None,
-    access_control=None,
+    access_grants=None,
 ):
+    # Written as its owner, because that is the only way it happens: wrapping
+    # key copies for named recipients needs the key in the writer's hands.
+    set_current_user_id(owner)
     now = ts if ts is not None else int(time.time())
     db.add(
         Knowledge(
@@ -20,18 +27,22 @@ def _add(
             name=name,
             description=description,
             meta=None,
-            access_control={} if access_control is None else access_control,
             created_at=now,
             updated_at=now,
         )
     )
     db.commit()
+    if access_grants:
+        run(AccessGrants.set_access_grants("knowledge", knowledge_id, access_grants))
     db.expunge_all()
 
 
 def _search(db, user_id, query, **kwargs):
-    return Knowledges.search_knowledge_bases(
-        user_id, filter={"query": query, "user_id": user_id}, db=db, **kwargs
+    set_current_user_id(user_id)
+    return run(
+        Knowledges.search_knowledge_bases(
+            user_id, filter={"query": query, "user_id": user_id}, **kwargs
+        )
     )
 
 
@@ -100,22 +111,32 @@ class TestSearch:
             "k1",
             "Their Falcon",
             accounts.intruder,
-            access_control={
-                "read": {"user_ids": [accounts.owner], "group_ids": []}
-            },
+            access_grants=[
+                {
+                    "principal_type": "user",
+                    "principal_id": accounts.owner,
+                    "permission": "read",
+                }
+            ],
         )
 
-        result = Knowledges.search_knowledge_bases(
-            accounts.owner, filter={"user_id": accounts.owner}, db=db
+        set_current_user_id(accounts.owner)
+        result = run(
+            Knowledges.search_knowledge_bases(
+                accounts.owner, filter={"user_id": accounts.owner}
+            )
         )
 
         assert [item.id for item in result.items] == ["k1"]
 
     def test_someone_elses_private_knowledge_base_is_not_listed(self, db, accounts):
-        _add(db, "k1", "Their Falcon", accounts.intruder, access_control={})
+        _add(db, "k1", "Their Falcon", accounts.intruder)
 
-        result = Knowledges.search_knowledge_bases(
-            accounts.owner, filter={"user_id": accounts.owner}, db=db
+        set_current_user_id(accounts.owner)
+        result = run(
+            Knowledges.search_knowledge_bases(
+                accounts.owner, filter={"user_id": accounts.owner}
+            )
         )
 
         assert result.items == []
@@ -124,8 +145,10 @@ class TestSearch:
         _add(db, "k1", "Project Falcon", accounts.owner)
         _add(db, "k2", "Something Else", accounts.owner)
 
-        result = Knowledges.search_knowledge_bases(
-            accounts.owner, filter={"user_id": accounts.owner}, db=db
+        result = run(
+            Knowledges.search_knowledge_bases(
+                accounts.owner, filter={"user_id": accounts.owner}
+            )
         )
 
         assert result.total == 2

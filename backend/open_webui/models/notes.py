@@ -9,7 +9,7 @@ from open_webui.models.groups import Groups
 from open_webui.models.users import User, UserModel, UserResponse, Users
 from open_webui.utils.json_codec import JSONCodec
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import JSON, BigInteger, Boolean, Column, ForeignKey, Text, delete, func, or_, select, update
+from sqlalchemy import JSON, BigInteger, Column, ForeignKey, Text, delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 ####################
@@ -186,18 +186,10 @@ class NoteTable:
             await AccessGrants.set_access_grants('note', note.id, form_data.access_grants, db=db)
             return await self._to_note_model(new_note, db=db)
 
-    async def get_notes(self, skip: int = 0, limit: int = 50, db: Optional[AsyncSession] = None) -> list[NoteModel]:
-        async with get_async_db_context(db) as db:
-            stmt = select(Note).order_by(Note.updated_at.desc())
-            if skip is not None:
-                stmt = stmt.offset(skip)
-            if limit is not None:
-                stmt = stmt.limit(limit)
-            result = await db.execute(stmt)
-            notes = result.scalars().all()
-            note_ids = [note.id for note in notes]
-            grants_map = await AccessGrants.get_grants_by_resources('note', note_ids, db=db)
-            return [await self._to_note_model(note, access_grants=grants_map.get(note.id, []), db=db) for note in notes]
+    @staticmethod
+    def _normalize(value: Optional[str]) -> str:
+        """Hyphens and spaces removed, so "todo" matches "to-do" and "to do"."""
+        return (value or '').replace('-', '').replace(' ', '').lower()
 
     async def search_notes(
         self,
@@ -209,25 +201,13 @@ class NoteTable:
     ) -> NoteListResponse:
         async with get_async_db_context(db) as db:
             stmt = select(Note, User).outerjoin(User, User.id == Note.user_id)
+
+            query_key = None
+            order_by = None
+            direction = None
+
             if filter:
                 query_key = filter.get('query')
-                if query_key:
-                    # Split query into individual words and normalize each
-                    # (strip hyphens so "todo" matches "to-do").
-                    # All words must match somewhere in title OR content (AND semantics).
-                    search_words = query_key.split()
-                    normalized_words = [w.replace('-', '') for w in search_words if w.replace('-', '')]
-                    for word in normalized_words:
-                        stmt = stmt.filter(
-                            or_(
-                                func.replace(func.replace(Note.title, '-', ''), ' ', '').ilike(f'%{word}%'),
-                                func.replace(
-                                    func.replace(Note.data['content']['md'].as_string(), '-', ''),
-                                    ' ',
-                                    '',
-                                ).ilike(f'%{word}%'),
-                            )
-                        )
 
                 view_option = filter.get('view_option')
                 if view_option == 'created':
@@ -236,53 +216,57 @@ class NoteTable:
                     stmt = stmt.filter(Note.user_id != user_id)
 
                 # Apply access control filtering
-                if 'permission' in filter:
-                    permission = filter['permission']
-                else:
-                    permission = 'write'
-
                 stmt = self._has_permission(
                     db,
                     stmt,
                     filter,
-                    permission=permission,
+                    permission=filter.get('permission', 'write'),
                 )
 
                 order_by = filter.get('order_by')
                 direction = filter.get('direction')
 
-                if order_by == 'name':
-                    if direction == 'asc':
-                        stmt = stmt.order_by(Note.title.asc())
-                    else:
-                        stmt = stmt.order_by(Note.title.desc())
-                elif order_by == 'created_at':
-                    if direction == 'asc':
-                        stmt = stmt.order_by(Note.created_at.asc())
-                    else:
-                        stmt = stmt.order_by(Note.created_at.desc())
-                elif order_by == 'updated_at':
-                    if direction == 'asc':
-                        stmt = stmt.order_by(Note.updated_at.asc())
-                    else:
-                        stmt = stmt.order_by(Note.updated_at.desc())
-                else:
-                    stmt = stmt.order_by(Note.updated_at.desc())
-
+            if order_by == 'created_at':
+                stmt = stmt.order_by(Note.created_at.asc() if direction == 'asc' else Note.created_at.desc())
+            elif order_by == 'updated_at':
+                stmt = stmt.order_by(Note.updated_at.asc() if direction == 'asc' else Note.updated_at.desc())
             else:
                 stmt = stmt.order_by(Note.updated_at.desc())
 
-            # Count BEFORE pagination
-            count_result = await db.execute(select(func.count()).select_from(stmt.subquery()))
-            total = count_result.scalar()
-
-            if skip:
-                stmt = stmt.offset(skip)
-            if limit:
-                stmt = stmt.limit(limit)
-
             result = await db.execute(stmt)
             items = result.all()
+
+            if query_key:
+                # The title and the note body are matched after they are read,
+                # because they are encrypted at rest. Every word must match
+                # somewhere in the title or the body (AND semantics), with
+                # hyphens and spaces ignored.
+                needles = [needle for needle in (self._normalize(word) for word in query_key.split()) if needle]
+                items = [
+                    (note, user)
+                    for note, user in items
+                    if all(
+                        needle in self._normalize(note.title)
+                        or needle in self._normalize(((note.data or {}).get('content') or {}).get('md'))
+                        for needle in needles
+                    )
+                ]
+
+            if order_by == 'name':
+                # Sorted on the decrypted title, which SQL never sees.
+                items = sorted(
+                    items,
+                    key=lambda item: (item[0].title or '').lower(),
+                    reverse=direction != 'asc',
+                )
+
+            # Counted after filtering, so the total matches what is returned.
+            total = len(items)
+
+            if skip:
+                items = items[skip:]
+            if limit:
+                items = items[:limit]
 
             note_ids = [note.id for note, _ in items]
             grants_map = await AccessGrants.get_grants_by_resources('note', note_ids, db=db)
@@ -335,6 +319,21 @@ class NoteTable:
             result = await db.execute(select(Note).filter(Note.id == id))
             note = result.scalars().first()
             return await self._to_note_model(note, db=db) if note else None
+
+    async def get_note_access_by_id(self, id: str, db: Optional[AsyncSession] = None):
+        """Who owns this note, without reading it.
+
+        For deciding whether an action is allowed — deleting, above all.
+        Deleting does not need the contents, so it must not need the key: an
+        administrator can remove someone's note without being able to open it,
+        and loading the row here would decrypt it and refuse. Who may reach it
+        lives in the access_grant table, keyless as well.
+        """
+        # See delete_note_by_id for why this import is not at the top.
+        from open_webui.utils.encrypted_models import read_without_decrypting_async
+
+        async with get_async_db_context(db) as db:
+            return await read_without_decrypting_async(db, Note, id, 'id', 'user_id')
 
     async def update_note_by_id(
         self, id: str, form_data: NoteUpdateForm, db: Optional[AsyncSession] = None
@@ -418,11 +417,18 @@ class NoteTable:
             return [await self._to_note_model(note, access_grants=grants_map.get(note.id, []), db=db) for note in notes]
 
     async def delete_note_by_id(self, id: str, db: Optional[AsyncSession] = None) -> bool:
+        # Deleting does not need the contents, so it must not need the key: the
+        # helper removes the row by statement — never loading, and therefore
+        # never decrypting, it — and takes the wrapped key copies with it.
+        # Imported here because the registry imports every model, this one
+        # included, so importing it at the top would close a cycle.
+        from open_webui.utils.encrypted_models import delete_without_reading_async
+
         try:
             async with get_async_db_context(db) as db:
                 await AccessGrants.revoke_all_access('note', id, db=db)
                 await db.execute(delete(PinnedNote).filter(PinnedNote.note_id == id))
-                await db.execute(delete(Note).filter(Note.id == id))
+                await delete_without_reading_async(db, Note, [id])
                 await db.commit()
                 return True
         except Exception:

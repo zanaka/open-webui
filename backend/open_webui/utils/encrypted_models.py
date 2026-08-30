@@ -31,6 +31,7 @@ from open_webui.models.memories import Memory
 from open_webui.models.notes import Note
 from open_webui.models.prompts import Prompt
 from open_webui.models.resource_keys import ResourceKey
+from open_webui.models.skills import Skill
 from open_webui.models.tags import Tag
 from open_webui.crypto_exceptions import EncryptedDataAccessDeniedError
 from open_webui.utils.crypto_context import (
@@ -114,6 +115,18 @@ ENCRYPTED_MODELS: dict[type, EncryptionPolicy] = {
         shared=True,
         identity="command",
     ),
+    # A skill is instructions a person wrote, loaded only inside requests where
+    # a signed-in user picked it — so unlike Tools and Functions it always has
+    # a key in hand. The grants-scoped listing keeps rows the requester cannot
+    # open out of every query, so a skill someone else attached to a model is
+    # simply unavailable rather than an error, exactly like encrypted
+    # knowledge attached to a model.
+    Skill: EncryptionPolicy(
+        owner="user_id",
+        text=("name", "description", "content"),
+        json=("meta",),
+        shared=True,
+    ),
 }
 
 
@@ -156,6 +169,7 @@ GRANTED_SHARED_MODELS: dict[str, type] = {
     "knowledge": Knowledge,
     "note": Note,
     "prompt": Prompt,
+    "skill": Skill,
 }
 
 
@@ -557,7 +571,6 @@ NOT_ENCRYPTED: dict[str, str] = {
     "PinnedNote": "TODO(phase3): join table of ids",
     "PromptHistory": "TODO(phase3): to be encrypted; snapshots duplicate prompt content",
     "SharedChat": "TODO(phase3): to be closed; plaintext chat snapshots for sharing",
-    "Skill": "TODO(phase3): to be encrypted like prompts",
 }
 
 

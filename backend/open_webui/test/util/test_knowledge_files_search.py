@@ -1,6 +1,7 @@
 import time
 
 import pytest
+from conftest import run
 from sqlalchemy import text
 
 from open_webui.models.files import File
@@ -19,7 +20,6 @@ def knowledge(db, accounts):
             name="Knowledge",
             description="Knowledge description",
             meta=None,
-            access_control={},
             created_at=now,
             updated_at=now,
         )
@@ -70,9 +70,10 @@ class TestSearchKnowledgeFiles:
         _insert_files(db, accounts.owner, ["report-alpha.txt", "memo-beta.txt"])
         assert "report-alpha" not in _raw_filename(db, "file-0")
 
-        result = Knowledges.search_knowledge_files(
-            filter={"user_id": accounts.owner, "query": "alpha"},
-            db=db,
+        result = run(
+            Knowledges.search_knowledge_files(
+                filter={"user_id": accounts.owner, "query": "alpha"},
+            )
         )
 
         assert result.total == 1
@@ -85,11 +86,12 @@ class TestSearchKnowledgeFiles:
             ["alpha-1.txt", "beta.txt", "alpha-2.txt", "alpha-3.txt"],
         )
 
-        result = Knowledges.search_knowledge_files(
-            filter={"user_id": accounts.owner, "query": "alpha"},
-            skip=1,
-            limit=1,
-            db=db,
+        result = run(
+            Knowledges.search_knowledge_files(
+                filter={"user_id": accounts.owner, "query": "alpha"},
+                skip=1,
+                limit=1,
+            )
         )
 
         assert result.total == 3
@@ -100,11 +102,12 @@ class TestSearchFilesById:
     def test_search_uses_decrypted_filename(self, db, accounts, knowledge):
         _insert_files(db, accounts.owner, ["report-alpha.txt", "memo-beta.txt"])
 
-        result = Knowledges.search_files_by_id(
-            KNOWLEDGE_ID,
-            accounts.owner,
-            filter={"query": "beta"},
-            db=db,
+        result = run(
+            Knowledges.search_files_by_id(
+                KNOWLEDGE_ID,
+                accounts.owner,
+                filter={"query": "beta"},
+            )
         )
 
         assert result.total == 1
@@ -113,11 +116,12 @@ class TestSearchFilesById:
     def test_name_sort_uses_decrypted_filename_ascending(self, db, accounts, knowledge):
         _insert_files(db, accounts.owner, ["charlie.txt", "alpha.txt", "bravo.txt"])
 
-        result = Knowledges.search_files_by_id(
-            KNOWLEDGE_ID,
-            accounts.owner,
-            filter={"order_by": "name", "direction": "asc"},
-            db=db,
+        result = run(
+            Knowledges.search_files_by_id(
+                KNOWLEDGE_ID,
+                accounts.owner,
+                filter={"order_by": "name", "direction": "asc"},
+            )
         )
 
         assert [item.filename for item in result.items] == [
@@ -129,11 +133,12 @@ class TestSearchFilesById:
     def test_name_sort_uses_decrypted_filename_descending(self, db, accounts, knowledge):
         _insert_files(db, accounts.owner, ["charlie.txt", "alpha.txt", "bravo.txt"])
 
-        result = Knowledges.search_files_by_id(
-            KNOWLEDGE_ID,
-            accounts.owner,
-            filter={"order_by": "name", "direction": "desc"},
-            db=db,
+        result = run(
+            Knowledges.search_files_by_id(
+                KNOWLEDGE_ID,
+                accounts.owner,
+                filter={"order_by": "name", "direction": "desc"},
+            )
         )
 
         assert [item.filename for item in result.items] == [
@@ -149,13 +154,14 @@ class TestSearchFilesById:
             ["alpha-1.txt", "beta.txt", "alpha-2.txt", "alpha-3.txt"],
         )
 
-        result = Knowledges.search_files_by_id(
-            KNOWLEDGE_ID,
-            accounts.owner,
-            filter={"query": "alpha"},
-            skip=1,
-            limit=1,
-            db=db,
+        result = run(
+            Knowledges.search_files_by_id(
+                KNOWLEDGE_ID,
+                accounts.owner,
+                filter={"query": "alpha"},
+                skip=1,
+                limit=1,
+            )
         )
 
         assert result.total == 3
