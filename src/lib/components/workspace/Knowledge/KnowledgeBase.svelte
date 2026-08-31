@@ -1194,6 +1194,7 @@
 		<AccessControlModal
 			bind:show={showAccessControlModal}
 			bind:accessGrants={knowledge.access_grants}
+			resourceType="Knowledge"
 			share={$user?.permissions?.sharing?.knowledge || $user?.role === 'admin'}
 			sharePublic={$user?.permissions?.sharing?.public_knowledge || $user?.role === 'admin'}
 			shareUsers={($user?.permissions?.access_grants?.allow_users ?? true) ||

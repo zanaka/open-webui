@@ -33,7 +33,6 @@
 	import NotesIcon from './Sidebar/icons/Notes.svelte';
 
 	import ChatMenu from './Sidebar/ChatMenu.svelte';
-	import ShareChatModal from '../chat/ShareChatModal.svelte';
 	import DeleteConfirmDialog from '../common/ConfirmDialog.svelte';
 	import Tooltip from '../common/Tooltip.svelte';
 	import Sparkles from '../icons/Sparkles.svelte';
@@ -46,7 +45,6 @@
 	export let show = false;
 	export let onClose = () => {};
 
-	let showShareChatModal = false;
 	let showDeleteConfirm = false;
 	let menuChatId = '';
 	let menuChatTitle = '';
@@ -559,8 +557,6 @@
 	});
 </script>
 
-<ShareChatModal bind:show={showShareChatModal} chatId={menuChatId} />
-
 <DeleteConfirmDialog
 	bind:show={showDeleteConfirm}
 	title={$i18n.t('Delete chat?')}
@@ -816,10 +812,6 @@
 										<div class="flex items-center">
 											<ChatMenu
 												chatId={chat.id}
-												shareHandler={() => {
-													menuChatId = chat.id;
-													showShareChatModal = true;
-												}}
 												{moveChatHandler}
 												cloneChatHandler={() => {
 													cloneChatHandler(chat.id);

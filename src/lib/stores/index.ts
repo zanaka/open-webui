@@ -331,7 +331,16 @@ type Config = {
 	default_models: string;
 	default_pinned_models?: string | null;
 	default_prompt_suggestions: PromptSuggestion[];
+	// Which resources can only be shared with people named one by one, as the
+	// server names them (Python model class names). Read off the server so the
+	// interface only offers audiences the save path will accept.
+	sharing?: {
+		named_recipients_only?: string[];
+	};
 	features: {
+		// While the deployment logs in debug mode, everyone who opens it is
+		// told that what they type may be recorded; see routes/+layout.svelte.
+		debug_mode?: boolean;
 		auth: boolean;
 		auth_trusted_header: boolean;
 		enable_api_keys: boolean;

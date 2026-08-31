@@ -26,13 +26,11 @@
 	import Messages from '$lib/components/chat/Messages.svelte';
 	import PinIcon from './icons/Pin.svelte';
 	import PinSlashIcon from './icons/PinSlash.svelte';
-	import ShareIcon from './icons/Share.svelte';
 	import TrashIcon from './icons/Trash.svelte';
 	import ChatCheckIcon from '$lib/components/icons/ChatCheck.svelte';
 
 	const i18n = getContext('i18n');
 
-	export let shareHandler: Function;
 	export let moveChatHandler: Function;
 
 	export let cloneChatHandler: Function;
@@ -308,18 +306,9 @@
 
 	<div slot="content">
 		<DropdownMenu className="select-none min-w-[12.5rem] transition">
-			{#if $user?.role === 'admin' || ($user.permissions?.chat?.share ?? true)}
-				<button
-					draggable="false"
-					class="flex h-[1.6875rem] gap-2 items-center rounded-xl px-2 text-[0.8125rem] cursor-pointer hover:bg-gray-50/40 dark:hover:bg-gray-800/40 w-full"
-					on:click={() => {
-						shareHandler();
-					}}
-				>
-					<ShareIcon className="size-3.5" strokeWidth="1.5" />
-					<div class="flex items-center">{$i18n.t('Share')}</div>
-				</button>
-			{/if}
+			<!-- Chat sharing is not offered: a share link has no named recipient
+			     whose key could wrap the chat's data encryption key, so the
+			     server refuses it (501). See routers/chats.py share_chat_by_id. -->
 
 			{#if $user?.role === 'admin' || ($user.permissions?.chat?.export ?? true)}
 				<DropdownSub contentClass="select-none z-50">

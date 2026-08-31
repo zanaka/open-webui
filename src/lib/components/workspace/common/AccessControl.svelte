@@ -5,6 +5,7 @@
 
 	import { getGroups, getGroupById, getGroupInfoById } from '$lib/apis/groups';
 	import { getUserInfoById } from '$lib/apis/users';
+	import { config } from '$lib/stores';
 	import { WEBUI_API_BASE_URL } from '$lib/constants';
 	import XMark from '$lib/components/icons/XMark.svelte';
 	import Badge from '$lib/components/common/Badge.svelte';
@@ -38,6 +39,15 @@
 	export let shareUsers = true;
 	export let allowGroups = true;
 	export let defaultPermission: 'read' | 'write' = 'read';
+
+	// Which model this resource is, as the server names it. The server says
+	// which of those can only be shared with people named one by one, so this
+	// only offers audiences that will actually be accepted.
+	export let resourceType: string | null = null;
+
+	$: namedOnly = (($config?.sharing?.named_recipients_only ?? []) as string[]).includes(
+		resourceType ?? ''
+	);
 
 	let groups: any[] = [];
 	const resolvingGroupIds = new Set<string>();
@@ -470,7 +480,7 @@
 <AddAccessModal
 	bind:show={showAddAccessModal}
 	{shareUsers}
-	{allowGroups}
+	allowGroups={allowGroups && !namedOnly}
 	{accessGrants}
 	onAdd={handleAddAccess}
 />
@@ -516,7 +526,9 @@
 
 			<div>
 				<Tooltip
-					content={!(share && sharePublic) && getVisibility(accessGrants ?? []) === 'private'
+					content={!namedOnly &&
+					!(share && sharePublic) &&
+					getVisibility(accessGrants ?? []) === 'private'
 						? $i18n.t('You do not have permission to make this public')
 						: ''}
 				>
@@ -529,17 +541,19 @@
 						}}
 					>
 						<option class=" text-gray-700" value="private">{$i18n.t('Private')}</option>
-						{#if (share && sharePublic) || hasPublicReadGrant(accessGrants ?? [])}
+						{#if !namedOnly && ((share && sharePublic) || hasPublicReadGrant(accessGrants ?? []))}
 							<option class=" text-gray-700" value="public">{$i18n.t('Public')}</option>
 						{/if}
-						{#if (share && shareOpen) || hasAnyoneReadGrant(accessGrants ?? [])}
+						{#if !namedOnly && ((share && shareOpen) || hasAnyoneReadGrant(accessGrants ?? []))}
 							<option class=" text-gray-700" value="open">{$i18n.t('Open')}</option>
 						{/if}
 					</select>
 				</Tooltip>
 
 				<div class=" text-xs text-gray-400 font-normal">
-					{#if getVisibility(accessGrants ?? []) === 'private'}
+					{#if namedOnly}
+						{$i18n.t('Encrypted content can only be shared with people you name')}
+					{:else if getVisibility(accessGrants ?? []) === 'private'}
 						{$i18n.t('Only select users and groups with permission can access')}
 					{:else if getVisibility(accessGrants ?? []) === 'public'}
 						{$i18n.t('Accessible to all users')}
