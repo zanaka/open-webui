@@ -439,10 +439,14 @@ def named_recipient_resources() -> list[str]:
 
     Handed to the interface so it can offer the audiences that will actually
     work. Read off the registry rather than written out again, so encrypting a
-    new model changes what is offered without anyone remembering to.
+    new model changes what is offered without anyone remembering to. Models
+    that borrow another row's key are left out: they are not shared on their
+    own, they follow the row they belong to.
     """
     return sorted(
-        model.__name__ for model, policy in ENCRYPTED_MODELS.items() if policy.shared
+        model.__name__
+        for model, policy in ENCRYPTED_MODELS.items()
+        if policy.shared and model not in BORROWED_KEYS
     )
 
 
