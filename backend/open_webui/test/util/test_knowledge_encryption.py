@@ -7,9 +7,11 @@ something, it would not be a rule.
 """
 
 import pytest
+from conftest import run
 from sqlalchemy import text
 
 from open_webui.crypto_exceptions import EncryptedDataAccessDeniedError
+from open_webui.models.access_grants import AccessGrants
 from open_webui.models.knowledge import Knowledge, KnowledgeForm, Knowledges
 from open_webui.models.resource_keys import ResourceKey
 from open_webui.utils.crypto_context import set_current_user_id
@@ -25,25 +27,32 @@ def _form(**overrides):
         **{
             "name": f"{MARKER} name",
             "description": f"{MARKER} description",
-            "access_control": {},
+            "access_grants": [],
             **overrides,
         }
     )
 
 
 def _shared_with(*user_ids, permission="read"):
-    return {permission: {"user_ids": list(user_ids), "group_ids": []}}
+    return [
+        {"principal_type": "user", "principal_id": user_id, "permission": permission}
+        for user_id in user_ids
+    ]
 
 
 def _create(db, owner, **overrides):
-    return Knowledges.insert_new_knowledge(owner, _form(**overrides), db=db)
+    set_current_user_id(owner)
+    try:
+        return run(Knowledges.insert_new_knowledge(owner, _form(**overrides)))
+    finally:
+        db.expunge_all()
 
 
 class TestOwner:
     def test_the_owner_reads_back_what_they_wrote(self, db, accounts):
         created = _create(db, accounts.owner)
 
-        read = Knowledges.get_knowledge_by_id(created.id, db=db)
+        read = run(Knowledges.get_knowledge_by_id(created.id))
 
         assert read.name == f"{MARKER} name"
         assert read.description == f"{MARKER} description"
@@ -70,15 +79,15 @@ class TestOwner:
 
 class TestNamedSharing:
     def test_a_named_recipient_can_open_it(self, db, accounts):
-        created = _create(db, accounts.owner, access_control=_shared_with(accounts.intruder))
+        created = _create(db, accounts.owner, access_grants=_shared_with(accounts.intruder))
 
         set_current_user_id(accounts.intruder)
         db.expunge_all()
 
-        assert Knowledges.get_knowledge_by_id(created.id, db=db).name == f"{MARKER} name"
+        assert run(Knowledges.get_knowledge_by_id(created.id)).name == f"{MARKER} name"
 
     def test_the_recipient_gets_the_same_key_wrapped_differently(self, db, accounts):
-        created = _create(db, accounts.owner, access_control=_shared_with(accounts.intruder))
+        created = _create(db, accounts.owner, access_grants=_shared_with(accounts.intruder))
 
         wrapped = {
             row.user_id: row.wrapped_key
@@ -109,18 +118,19 @@ class TestNamedSharing:
         created = _create(db, accounts.owner)
         assert resolve_key("Knowledge", created.id, accounts.intruder, db=db) is None
 
-        Knowledges.update_knowledge_by_id(
-            created.id,
-            _form(access_control=_shared_with(accounts.intruder)),
-            db=db,
+        run(
+            Knowledges.update_knowledge_by_id(
+                created.id,
+                _form(access_grants=_shared_with(accounts.intruder)),
+            )
         )
 
         assert resolve_key("Knowledge", created.id, accounts.intruder, db=db) is not None
 
     def test_unsharing_takes_the_key_back(self, db, accounts):
-        created = _create(db, accounts.owner, access_control=_shared_with(accounts.intruder))
+        created = _create(db, accounts.owner, access_grants=_shared_with(accounts.intruder))
 
-        Knowledges.update_knowledge_by_id(created.id, _form(access_control={}), db=db)
+        run(Knowledges.update_knowledge_by_id(created.id, _form(access_grants=[])))
 
         assert resolve_key("Knowledge", created.id, accounts.intruder, db=db) is None
 
@@ -129,38 +139,73 @@ class TestRefusedAudiences:
     """The feature side offers these; the save path is where they are refused."""
 
     def test_sharing_with_everyone_is_refused_on_create(self, db, accounts):
+        """A wildcard grant is Open WebUI's "public": there is nobody to wrap
+        a key for."""
         with pytest.raises(SharingNotSupportedError):
-            _create(db, accounts.owner, access_control=None)
+            _create(
+                db,
+                accounts.owner,
+                access_grants=[
+                    {"principal_type": "user", "principal_id": "*", "permission": "read"}
+                ],
+            )
 
     def test_sharing_with_a_group_is_refused_on_create(self, db, accounts):
         with pytest.raises(SharingNotSupportedError):
             _create(
                 db,
                 accounts.owner,
-                access_control={"read": {"user_ids": [], "group_ids": ["engineering"]}},
+                access_grants=[
+                    {
+                        "principal_type": "group",
+                        "principal_id": "engineering",
+                        "permission": "read",
+                    }
+                ],
             )
 
     def test_sharing_with_everyone_is_refused_on_update(self, db, accounts):
         created = _create(db, accounts.owner)
 
         with pytest.raises(SharingNotSupportedError):
-            Knowledges.update_knowledge_by_id(
-                created.id, _form(access_control=None), db=db
+            run(
+                Knowledges.update_knowledge_by_id(
+                    created.id,
+                    _form(
+                        access_grants=[
+                            {
+                                "principal_type": "user",
+                                "principal_id": "*",
+                                "permission": "read",
+                            }
+                        ]
+                    ),
+                )
             )
 
     def test_a_refused_update_leaves_the_row_alone(self, db, accounts):
         created = _create(db, accounts.owner)
 
         with pytest.raises(SharingNotSupportedError):
-            Knowledges.update_knowledge_by_id(
-                created.id,
-                _form(name="renamed", access_control=None),
-                db=db,
+            run(
+                Knowledges.update_knowledge_by_id(
+                    created.id,
+                    _form(
+                        name="renamed",
+                        access_grants=[
+                            {
+                                "principal_type": "user",
+                                "principal_id": "*",
+                                "permission": "read",
+                            }
+                        ],
+                    ),
+                )
             )
 
         db.rollback()
         db.expunge_all()
-        assert Knowledges.get_knowledge_by_id(created.id, db=db).name == f"{MARKER} name"
+        assert run(Knowledges.get_knowledge_by_id(created.id)).name == f"{MARKER} name"
 
 
 class TestDeletingWithoutReading:
@@ -171,10 +216,10 @@ class TestDeletingWithoutReading:
         db.expunge_all()
 
         set_current_user_id(accounts.intruder)
-        access = Knowledges.get_knowledge_access_by_id(created.id, db=db)
+        access = run(Knowledges.get_knowledge_access_by_id(created.id))
 
         assert access.user_id == accounts.owner
-        assert access.access_control == {}
+        assert run(AccessGrants.get_grants_by_resource("knowledge", created.id)) == []
 
     def test_asking_for_an_encrypted_column_that_way_is_refused(self, db, accounts):
         created = _create(db, accounts.owner)
@@ -187,14 +232,14 @@ class TestDeletingWithoutReading:
         db.expunge_all()
 
         set_current_user_id(accounts.intruder)
-        assert Knowledges.delete_knowledge_by_id(created.id, db=db) is True
+        assert run(Knowledges.delete_knowledge_by_id(created.id)) is True
 
         assert db.query(Knowledge).filter_by(id=created.id).count() == 0
 
     def test_deleting_takes_the_key_copies_with_it(self, db, accounts):
-        created = _create(db, accounts.owner, access_control=_shared_with(accounts.intruder))
+        created = _create(db, accounts.owner, access_grants=_shared_with(accounts.intruder))
 
-        Knowledges.delete_knowledge_by_id(created.id, db=db)
+        run(Knowledges.delete_knowledge_by_id(created.id))
 
         assert (
             db.query(ResourceKey)

@@ -4,6 +4,8 @@ import pytest
 from sqlalchemy import text
 
 from open_webui.crypto_exceptions import EncryptedDataAccessDeniedError
+from open_webui.models.calendar import Calendar, CalendarEvent
+from open_webui.models.chat_messages import ChatMessage
 from open_webui.models.chats import Chat
 from open_webui.models.files import File
 from open_webui.models.folders import Folder
@@ -11,10 +13,12 @@ from open_webui.models.knowledge import Knowledge
 from open_webui.models.memories import Memory
 from open_webui.models.notes import Note
 from open_webui.models.prompts import Prompt
+from open_webui.models.skills import Skill
 from open_webui.models.tags import Tag
 from open_webui.utils.crypto_context import set_current_user_id
 from open_webui.utils import encrypted_models
 from open_webui.utils.encrypted_models import (
+    BORROWED_KEYS,
     ENCRYPTED_MODELS,
     UnclassifiedModelError,
     assert_models_are_covered,
@@ -36,7 +40,26 @@ BUILDERS = {
         user_id=owner,
         title=f"{MARKER} title",
         chat={"messages": [{"role": "user", "content": f"{MARKER} body"}]},
+        summary=f"{MARKER} summary",
+        tasks={"note": f"{MARKER} task"},
         meta={"tags": []},
+        created_at=_now(),
+        updated_at=_now(),
+    ),
+    ChatMessage: lambda owner: ChatMessage(
+        id="c1-m1",
+        chat_id="c1",
+        user_id=owner,
+        role="user",
+        content=f"{MARKER} message",
+        output={"text": f"{MARKER} output"},
+        files=[{"name": f"{MARKER}.txt"}],
+        sources=[{"snippet": MARKER}],
+        embeds=[{"url": MARKER}],
+        meta={"note": MARKER},
+        status_history=[{"description": MARKER}],
+        error={"message": MARKER},
+        context_summary=f"{MARKER} checkpoint",
         created_at=_now(),
         updated_at=_now(),
     ),
@@ -80,17 +103,17 @@ BUILDERS = {
         title=f"{MARKER} note",
         data={"content": {"md": f"{MARKER} body", "html": "", "json": None}},
         meta={"tags": [MARKER]},
-        access_control={},
         created_at=_now(),
         updated_at=_now(),
     ),
     Prompt: lambda owner: Prompt(
+        id="p1",
         command="/marker",
         user_id=owner,
-        title=f"{MARKER} prompt",
+        name=f"{MARKER} prompt",
         content=f"{MARKER} content",
-        access_control={},
-        timestamp=_now(),
+        created_at=_now(),
+        updated_at=_now(),
     ),
     Knowledge: lambda owner: Knowledge(
         id="k1",
@@ -98,7 +121,39 @@ BUILDERS = {
         name=f"{MARKER} knowledge",
         description=f"{MARKER} description",
         meta={"note": MARKER},
-        access_control={},
+        created_at=_now(),
+        updated_at=_now(),
+    ),
+    Skill: lambda owner: Skill(
+        id="sk1",
+        user_id=owner,
+        name=f"{MARKER} skill",
+        description=f"{MARKER} description",
+        content=f"{MARKER} content",
+        meta={"note": MARKER},
+        created_at=_now(),
+        updated_at=_now(),
+    ),
+    Calendar: lambda owner: Calendar(
+        id="cal1",
+        user_id=owner,
+        name=f"{MARKER} calendar",
+        data={"note": MARKER},
+        meta={"note": MARKER},
+        created_at=_now(),
+        updated_at=_now(),
+    ),
+    CalendarEvent: lambda owner: CalendarEvent(
+        id="ev1",
+        calendar_id="cal1",
+        user_id=owner,
+        title=f"{MARKER} event",
+        description=f"{MARKER} description",
+        location=f"{MARKER} location",
+        rrule=f"FREQ=DAILY;{MARKER}",
+        data={"note": MARKER},
+        meta={"note": MARKER},
+        start_at=_now(),
         created_at=_now(),
         updated_at=_now(),
     ),
@@ -117,8 +172,13 @@ IDS = [model.__name__ for model in MODELS]
 
 
 def test_every_registered_model_is_covered_here():
-    """Adding a model to the registry must come with coverage."""
-    assert set(ENCRYPTED_MODELS) == set(BUILDERS)
+    """Adding a model to the registry must come with coverage.
+
+    Models that borrow another row's key cannot be built standalone — their
+    key comes from the row they duplicate — so each has a dedicated test file
+    instead (e.g. test_prompt_history_encryption.py for PromptHistory).
+    """
+    assert set(ENCRYPTED_MODELS) == set(BUILDERS) | set(BORROWED_KEYS)
 
 
 @pytest.mark.parametrize("model", MODELS, ids=IDS)

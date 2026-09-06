@@ -9,11 +9,8 @@ the same way the ordinary chat search already worked.
 import time
 
 import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from conftest import run, sqlite_test_database
 
-from open_webui.internal import db as internal_db
-from open_webui.internal.db import Base
 from open_webui.models.chats import Chat, Chats
 from open_webui.utils import crypto_context
 from open_webui.utils.crypto_context import cache_dek, set_current_user_id
@@ -26,21 +23,17 @@ USER_ID = "archive-user"
 
 
 @pytest.fixture
-def db(monkeypatch):
-    monkeypatch.setattr(internal_db, "DATABASE_ENABLE_SESSION_SHARING", True)
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine, tables=[Chat.__table__])
-    session = sessionmaker(bind=engine)()
+def db(monkeypatch, tmp_path):
+    with sqlite_test_database(
+        monkeypatch, tmp_path / "test.db", tables=[Chat.__table__]
+    ) as session:
+        cache_dek(USER_ID, generate_dek(), jti="jti-1", expires_at=time.time() + 3600)
+        set_current_user_id(USER_ID)
 
-    cache_dek(USER_ID, generate_dek(), jti="jti-1", expires_at=time.time() + 3600)
-    set_current_user_id(USER_ID)
+        yield session
 
-    yield session
-
-    set_current_user_id(None)
-    session.close()
-    engine.dispose()
-    crypto_context._dek_cache.clear()
+        set_current_user_id(None)
+        crypto_context._dek_cache.clear()
 
 
 def _add(db, chat_id, title, body="", archived=True, ts=None):
@@ -66,8 +59,8 @@ def _add(db, chat_id, title, body="", archived=True, ts=None):
 
 
 def _search(db, query, **kwargs):
-    return Chats.get_archived_chat_list_by_user_id(
-        USER_ID, filter={"query": query}, db=db, **kwargs
+    return run(
+        Chats.get_archived_chat_list_by_user_id(USER_ID, filter={"query": query}, **kwargs)
     )
 
 
@@ -142,10 +135,11 @@ class TestOrdering:
     def _ordered(self, db, direction):
         return [
             chat.title
-            for chat in Chats.get_archived_chat_list_by_user_id(
-                USER_ID,
-                filter={"order_by": "title", "direction": direction},
-                db=db,
+            for chat in run(
+                Chats.get_archived_chat_list_by_user_id(
+                    USER_ID,
+                    filter={"order_by": "title", "direction": direction},
+                )
             )
         ]
 
@@ -166,10 +160,11 @@ class TestOrdering:
         _add(db, "old", "old", ts=100)
         _add(db, "new", "new", ts=200)
 
-        result = Chats.get_archived_chat_list_by_user_id(
-            USER_ID,
-            filter={"order_by": "updated_at", "direction": "asc"},
-            db=db,
+        result = run(
+            Chats.get_archived_chat_list_by_user_id(
+                USER_ID,
+                filter={"order_by": "updated_at", "direction": "asc"},
+            )
         )
 
         assert [chat.id for chat in result] == ["old", "new"]
@@ -179,8 +174,8 @@ class TestOrdering:
         _add(db, "old", "old", ts=100)
         _add(db, "new", "new", ts=200)
 
-        result = Chats.get_archived_chat_list_by_user_id(
-            USER_ID, filter={"order_by": "title"}, db=db
+        result = run(
+            Chats.get_archived_chat_list_by_user_id(USER_ID, filter={"order_by": "title"})
         )
 
         assert [chat.id for chat in result] == ["new", "old"]
@@ -189,8 +184,10 @@ class TestOrdering:
         _add(db, "old", "old", ts=100)
         _add(db, "new", "new", ts=200)
 
-        result = Chats.get_archived_chat_list_by_user_id(
-            USER_ID, filter={"order_by": "updated_at"}, db=db
+        result = run(
+            Chats.get_archived_chat_list_by_user_id(
+                USER_ID, filter={"order_by": "updated_at"}
+            )
         )
 
         assert [chat.id for chat in result] == ["new", "old"]
@@ -199,26 +196,28 @@ class TestOrdering:
         _add(db, "old", "old", ts=100)
         _add(db, "new", "new", ts=200)
 
-        result = Chats.get_archived_chat_list_by_user_id(
-            USER_ID, filter={"direction": "asc"}, db=db
+        result = run(
+            Chats.get_archived_chat_list_by_user_id(USER_ID, filter={"direction": "asc"})
         )
 
         assert [chat.id for chat in result] == ["new", "old"]
 
     def test_an_unknown_column_is_refused(self, db):
         with pytest.raises(ValueError):
-            Chats.get_archived_chat_list_by_user_id(
-                USER_ID,
-                filter={"order_by": "nonsense", "direction": "asc"},
-                db=db,
+            run(
+                Chats.get_archived_chat_list_by_user_id(
+                    USER_ID,
+                    filter={"order_by": "nonsense", "direction": "asc"},
+                )
             )
 
     def test_an_unknown_direction_is_refused(self, db):
         with pytest.raises(ValueError):
-            Chats.get_archived_chat_list_by_user_id(
-                USER_ID,
-                filter={"order_by": "title", "direction": "sideways"},
-                db=db,
+            run(
+                Chats.get_archived_chat_list_by_user_id(
+                    USER_ID,
+                    filter={"order_by": "title", "direction": "sideways"},
+                )
             )
 
 
@@ -249,8 +248,8 @@ class TestHowMuchIsDecrypted:
     def test_a_plain_page_only_reads_its_own_page(self, counted):
         db, counts = counted
 
-        page = Chats.get_archived_chat_list_by_user_id(
-            USER_ID, filter={}, skip=0, limit=5, db=db
+        page = run(
+            Chats.get_archived_chat_list_by_user_id(USER_ID, filter={}, skip=0, limit=5)
         )
 
         assert len(page) == 5
@@ -259,12 +258,13 @@ class TestHowMuchIsDecrypted:
     def test_a_sql_ordered_page_only_reads_its_own_page(self, counted):
         db, counts = counted
 
-        Chats.get_archived_chat_list_by_user_id(
-            USER_ID,
-            filter={"order_by": "updated_at", "direction": "desc"},
-            skip=0,
-            limit=5,
-            db=db,
+        run(
+            Chats.get_archived_chat_list_by_user_id(
+                USER_ID,
+                filter={"order_by": "updated_at", "direction": "desc"},
+                skip=0,
+                limit=5,
+            )
         )
 
         assert counts["bodies"] == 5
@@ -273,8 +273,10 @@ class TestHowMuchIsDecrypted:
         """Not a regression — a match cannot be found without the plaintext."""
         db, counts = counted
 
-        Chats.get_archived_chat_list_by_user_id(
-            USER_ID, filter={"query": "hello"}, skip=0, limit=5, db=db
+        run(
+            Chats.get_archived_chat_list_by_user_id(
+                USER_ID, filter={"query": "hello"}, skip=0, limit=5
+            )
         )
 
         assert counts["bodies"] == 20

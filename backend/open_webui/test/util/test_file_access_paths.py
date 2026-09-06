@@ -39,7 +39,7 @@ class TestTheGrantIsGone:
     def test_nothing_in_the_router_asks_for_shared_chats(self):
         source = inspect.getsource(files_router)
 
-        assert "get_shared_chats_by_file_id" not in source
+        assert "get_shared_chat_ids_by_file_id" not in source
 
 
 class TestWhyItWasUnreachable:
@@ -59,7 +59,7 @@ class TestWhyItWasUnreachable:
 
     def test_the_shared_chat_lookup_only_finds_shared_chats(self):
         """Which is why it can never return anything while sharing is closed."""
-        source = inspect.getsource(Chats.get_shared_chats_by_file_id)
+        source = inspect.getsource(Chats.get_shared_chat_ids_by_file_id)
 
         assert "share_id.isnot(None)" in source
 

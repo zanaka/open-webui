@@ -15,12 +15,31 @@
 	import AddMembersModal from './ChannelInfoModal/AddMembersModal.svelte';
 
 	export let show = false;
-	export let channel = null;
+	export let channel: any = null;
 
 	export let onUpdate = () => {};
 
 	let showAddMembersModal = false;
 	const submitHandler = async () => {};
+
+	const hasPublicReadGrant = (grants: any) =>
+		Array.isArray(grants) &&
+		grants.some(
+			(grant) =>
+				grant?.principal_type === 'user' &&
+				grant?.principal_id === '*' &&
+				grant?.permission === 'read'
+		);
+
+	const isPublicChannel = (channel: any): boolean => {
+		if (channel?.type === 'group') {
+			if (typeof channel?.is_private === 'boolean') {
+				return !channel.is_private;
+			}
+			return hasPublicReadGrant(channel?.access_grants);
+		}
+		return hasPublicReadGrant(channel?.access_grants);
+	};
 
 	const removeMemberHandler = async (userId) => {
 		const res = await removeMembersById(localStorage.token, channel.id, {
@@ -53,7 +72,7 @@
 	<AddMembersModal bind:show={showAddMembersModal} {channel} {onUpdate} />
 	<Modal size="sm" bind:show>
 		<div>
-			<div class=" flex justify-between dark:text-gray-100 px-5 pt-4 mb-1.5">
+			<div class=" flex justify-between dark:text-gray-100 px-4 pt-3 mb-1">
 				<div class="self-center text-base">
 					<div class="flex items-center gap-0.5 shrink-0">
 						{#if channel?.type === 'dm'}
@@ -62,7 +81,7 @@
 							</div>
 						{:else}
 							<div class=" size-4 justify-center flex items-center">
-								{#if channel?.type === 'group' ? !channel?.is_private : channel?.access_control === null}
+								{#if isPublicChannel(channel)}
 									<Hashtag className="size-3.5" strokeWidth="2.5" />
 								{:else}
 									<Lock className="size-5.5" strokeWidth="2" />
@@ -76,12 +95,12 @@
 					</div>
 				</div>
 				<button
-					class="self-center"
+					class="self-center rounded-lg p-1 text-gray-500 transition hover:bg-gray-50 hover:text-gray-700 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-200"
 					on:click={() => {
 						show = false;
 					}}
 				>
-					<XMark className={'size-5'} />
+					<XMark className={'size-4'} />
 				</button>
 			</div>
 

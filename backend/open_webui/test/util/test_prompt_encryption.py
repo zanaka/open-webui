@@ -1,11 +1,12 @@
 """Prompts, the first registered model not identified by a column called "id".
 
-A prompt is reached by the command a person types, which is also its primary
-key. That is why EncryptionPolicy carries an `identity` field: the registry has
-to know which column names a row before it can ask who holds its key.
+A prompt is reached by the command a person types. That is why
+EncryptionPolicy carries an `identity` field: the registry has to know which
+column names a row before it can ask who holds its key.
 """
 
 import pytest
+from conftest import run
 from sqlalchemy import text
 
 from open_webui.crypto_exceptions import EncryptedDataAccessDeniedError
@@ -19,17 +20,20 @@ MARKER = "OBSIDIAN-CANARY"
 COMMAND = "/report"
 
 
-def _form(command=COMMAND, access_control=None):
+def _form(command=COMMAND, access_grants=None):
     return PromptForm(
         command=command,
-        title=f"{MARKER} title",
+        name=f"{MARKER} title",
         content=f"{MARKER} content",
-        access_control={} if access_control is None else access_control,
+        access_grants=[] if access_grants is None else access_grants,
     )
 
 
 def _shared_with(*user_ids, permission="read"):
-    return {permission: {"user_ids": list(user_ids), "group_ids": []}}
+    return [
+        {"principal_type": "user", "principal_id": user_id, "permission": permission}
+        for user_id in user_ids
+    ]
 
 
 def _add(db, owner, **kwargs):
@@ -40,7 +44,7 @@ def _add(db, owner, **kwargs):
     """
     set_current_user_id(owner)
     try:
-        return Prompts.insert_new_prompt(owner, _form(**kwargs), db=db)
+        return run(Prompts.insert_new_prompt(owner, _form(**kwargs)))
     finally:
         db.expunge_all()
 
@@ -61,10 +65,10 @@ class TestIdentity:
 
 
 class TestAtRest:
-    def test_the_title_and_content_are_ciphertext(self, db, accounts):
+    def test_the_name_and_content_are_ciphertext(self, db, accounts):
         _add(db, accounts.owner)
 
-        stored = db.execute(text("SELECT title, content FROM prompt")).first()
+        stored = db.execute(text("SELECT name, content FROM prompt")).first()
 
         assert MARKER not in f"{stored[0]} {stored[1]}"
 
@@ -79,21 +83,21 @@ class TestAtRest:
         _add(db, accounts.owner)
         db.expunge_all()
 
-        prompt = Prompts.get_prompt_by_command(COMMAND, db=db)
+        prompt = run(Prompts.get_prompt_by_command(COMMAND))
 
-        assert prompt.title == f"{MARKER} title"
+        assert prompt.name == f"{MARKER} title"
         assert prompt.content == f"{MARKER} content"
 
 
 class TestNamedSharing:
     def test_a_named_recipient_can_open_it(self, db, accounts):
-        _add(db, accounts.owner, access_control=_shared_with(accounts.intruder))
+        _add(db, accounts.owner, access_grants=_shared_with(accounts.intruder))
         db.expunge_all()
 
         set_current_user_id(accounts.intruder)
 
         assert (
-            Prompts.get_prompt_by_command(COMMAND, db=db).content
+            run(Prompts.get_prompt_by_command(COMMAND)).content
             == f"{MARKER} content"
         )
 
@@ -106,10 +110,10 @@ class TestNamedSharing:
             db.query(Prompt).filter_by(command=COMMAND).one()
 
     def test_a_prompt_shared_with_me_by_name_is_listed(self, db, accounts):
-        _add(db, accounts.intruder, access_control=_shared_with(accounts.owner))
+        _add(db, accounts.intruder, access_grants=_shared_with(accounts.owner))
         set_current_user_id(accounts.owner)
 
-        listed = Prompts.get_prompts_by_user_id(accounts.owner, "read", db=db)
+        listed = run(Prompts.get_prompts_by_user_id(accounts.owner, "read"))
 
         assert [prompt.command for prompt in listed] == [COMMAND]
 
@@ -117,26 +121,32 @@ class TestNamedSharing:
         _add(db, accounts.intruder)
         set_current_user_id(accounts.owner)
 
-        assert Prompts.get_prompts_by_user_id(accounts.owner, "read", db=db) == []
+        assert run(Prompts.get_prompts_by_user_id(accounts.owner, "read")) == []
 
     def test_unsharing_takes_the_key_back(self, db, accounts):
-        _add(db, accounts.owner, access_control=_shared_with(accounts.intruder))
+        _add(db, accounts.owner, access_grants=_shared_with(accounts.intruder))
         assert resolve_key("Prompt", COMMAND, accounts.intruder, db=db) is not None
 
-        Prompts.update_prompt_by_command(COMMAND, _form(access_control={}), db=db)
+        run(
+            Prompts.update_prompt_by_command(
+                COMMAND, _form(access_grants=[]), accounts.owner
+            )
+        )
 
         assert resolve_key("Prompt", COMMAND, accounts.intruder, db=db) is None
 
 
 class TestRefusedAudiences:
     def test_sharing_with_everyone_is_refused(self, db, accounts):
+        """A wildcard grant is Open WebUI's "public": there is nobody to wrap
+        a key for."""
         with pytest.raises(SharingNotSupportedError):
-            Prompts.insert_new_prompt(
+            _add(
+                db,
                 accounts.owner,
-                PromptForm(
-                    command=COMMAND, title="t", content="c", access_control=None
-                ),
-                db=db,
+                access_grants=[
+                    {"principal_type": "user", "principal_id": "*", "permission": "read"}
+                ],
             )
 
     def test_sharing_with_a_group_is_refused(self, db, accounts):
@@ -144,7 +154,13 @@ class TestRefusedAudiences:
             _add(
                 db,
                 accounts.owner,
-                access_control={"read": {"user_ids": [], "group_ids": ["engineering"]}},
+                access_grants=[
+                    {
+                        "principal_type": "group",
+                        "principal_id": "engineering",
+                        "permission": "read",
+                    }
+                ],
             )
 
 
@@ -156,7 +172,7 @@ class TestDeletingWithoutReading:
         db.expunge_all()
 
         set_current_user_id(accounts.intruder)
-        access = Prompts.get_prompt_access_by_command(COMMAND, db=db)
+        access = run(Prompts.get_prompt_access_by_command(COMMAND))
 
         assert access.user_id == accounts.owner
 
@@ -165,13 +181,13 @@ class TestDeletingWithoutReading:
         db.expunge_all()
 
         set_current_user_id(accounts.intruder)
-        assert Prompts.delete_prompt_by_command(COMMAND, db=db) is True
+        assert run(Prompts.delete_prompt_by_command(COMMAND)) is True
         assert db.query(Prompt).filter_by(command=COMMAND).count() == 0
 
     def test_deleting_takes_the_key_copies_with_it(self, db, accounts):
-        _add(db, accounts.owner, access_control=_shared_with(accounts.intruder))
+        _add(db, accounts.owner, access_grants=_shared_with(accounts.intruder))
 
-        Prompts.delete_prompt_by_command(COMMAND, db=db)
+        run(Prompts.delete_prompt_by_command(COMMAND))
 
         assert (
             db.query(ResourceKey)

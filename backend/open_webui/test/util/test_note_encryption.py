@@ -9,9 +9,11 @@ was invisible to them. Both are covered here.
 import time
 
 import pytest
+from conftest import run
 from sqlalchemy import text
 
 from open_webui.crypto_exceptions import EncryptedDataAccessDeniedError
+from open_webui.models.access_grants import AccessGrants
 from open_webui.models.notes import Note, NoteForm, NoteUpdateForm, Notes
 from open_webui.models.resource_keys import ResourceKey
 from open_webui.utils.crypto_context import set_current_user_id
@@ -20,28 +22,41 @@ from open_webui.utils.resource_crypto import SharingNotSupportedError, resolve_k
 MARKER = "GRANITE-CANARY"
 
 
-def _form(title=f"{MARKER} title", body=f"{MARKER} body", access_control=None):
+def _form(title=f"{MARKER} title", body=f"{MARKER} body", access_grants=None):
     return NoteForm(
         title=title,
         data={"content": {"md": body, "html": body, "json": None}},
         meta=None,
-        access_control={} if access_control is None else access_control,
+        access_grants=[] if access_grants is None else access_grants,
     )
 
 
 def _shared_with(*user_ids, permission="read"):
-    return {permission: {"user_ids": list(user_ids), "group_ids": []}}
+    return [
+        {"principal_type": "user", "principal_id": user_id, "permission": permission}
+        for user_id in user_ids
+    ]
 
 
 def _add(db, owner, **kwargs):
-    return Notes.insert_new_note(owner, _form(**kwargs), db=db)
+    """Created by its owner, because that is the only way it happens.
+
+    Wrapping key copies for the named recipients needs the key in the hands of
+    whoever the request is running as, so the creator has to be that person.
+    """
+    set_current_user_id(owner)
+    try:
+        return run(Notes.insert_new_note(owner, _form(**kwargs)))
+    finally:
+        db.expunge_all()
 
 
 def _search(db, user_id, query=None, **kwargs):
+    set_current_user_id(user_id)
     filter = {"user_id": user_id, "permission": "read"}
     if query is not None:
         filter["query"] = query
-    return Notes.search_notes(user_id, filter=filter, db=db, **kwargs)
+    return run(Notes.search_notes(user_id, filter=filter, **kwargs))
 
 
 class TestAtRest:
@@ -56,7 +71,7 @@ class TestAtRest:
         created = _add(db, accounts.owner)
         db.expunge_all()
 
-        note = Notes.get_note_by_id(created.id, db=db)
+        note = run(Notes.get_note_by_id(created.id))
 
         assert note.title == f"{MARKER} title"
         assert note.data["content"]["md"] == f"{MARKER} body"
@@ -123,15 +138,16 @@ class TestSearch:
         for name in ("charlie", "alpha", "bravo"):
             _add(db, accounts.owner, title=name)
 
-        result = Notes.search_notes(
-            accounts.owner,
-            filter={
-                "user_id": accounts.owner,
-                "permission": "read",
-                "order_by": "name",
-                "direction": "asc",
-            },
-            db=db,
+        result = run(
+            Notes.search_notes(
+                accounts.owner,
+                filter={
+                    "user_id": accounts.owner,
+                    "permission": "read",
+                    "order_by": "name",
+                    "direction": "asc",
+                },
+            )
         )
 
         assert [item.title for item in result.items] == ["alpha", "bravo", "charlie"]
@@ -144,7 +160,7 @@ class TestNamedSharing:
         shared = _add(
             db,
             accounts.intruder,
-            access_control=_shared_with(accounts.owner),
+            access_grants=_shared_with(accounts.owner),
         )
 
         result = _search(db, accounts.owner)
@@ -157,12 +173,12 @@ class TestNamedSharing:
         assert _search(db, accounts.owner).items == []
 
     def test_a_named_recipient_can_open_it(self, db, accounts):
-        created = _add(db, accounts.owner, access_control=_shared_with(accounts.intruder))
+        created = _add(db, accounts.owner, access_grants=_shared_with(accounts.intruder))
         db.expunge_all()
 
         set_current_user_id(accounts.intruder)
 
-        assert Notes.get_note_by_id(created.id, db=db).title == f"{MARKER} title"
+        assert run(Notes.get_note_by_id(created.id)).title == f"{MARKER} title"
 
     def test_someone_not_named_cannot_open_it(self, db, accounts):
         created = _add(db, accounts.owner)
@@ -173,23 +189,25 @@ class TestNamedSharing:
             db.query(Note).filter_by(id=created.id).one()
 
     def test_unsharing_takes_the_key_back(self, db, accounts):
-        created = _add(db, accounts.owner, access_control=_shared_with(accounts.intruder))
+        created = _add(db, accounts.owner, access_grants=_shared_with(accounts.intruder))
         assert resolve_key("Note", created.id, accounts.intruder, db=db) is not None
 
-        Notes.update_note_by_id(
-            created.id, NoteUpdateForm(access_control={}), db=db
-        )
+        run(Notes.update_note_by_id(created.id, NoteUpdateForm(access_grants=[])))
 
         assert resolve_key("Note", created.id, accounts.intruder, db=db) is None
 
 
 class TestRefusedAudiences:
     def test_sharing_with_everyone_is_refused(self, db, accounts):
+        """A wildcard grant is Open WebUI's "public": there is nobody to wrap
+        a key for."""
         with pytest.raises(SharingNotSupportedError):
-            Notes.insert_new_note(
+            _add(
+                db,
                 accounts.owner,
-                NoteForm(title="t", data={}, meta=None, access_control=None),
-                db=db,
+                access_grants=[
+                    {"principal_type": "user", "principal_id": "*", "permission": "read"}
+                ],
             )
 
     def test_sharing_with_a_group_is_refused(self, db, accounts):
@@ -197,7 +215,13 @@ class TestRefusedAudiences:
             _add(
                 db,
                 accounts.owner,
-                access_control={"read": {"user_ids": [], "group_ids": ["engineering"]}},
+                access_grants=[
+                    {
+                        "principal_type": "group",
+                        "principal_id": "engineering",
+                        "permission": "read",
+                    }
+                ],
             )
 
 
@@ -209,23 +233,23 @@ class TestDeleting:
         db.expunge_all()
 
         set_current_user_id(accounts.intruder)
-        access = Notes.get_note_access_by_id(created.id, db=db)
+        access = run(Notes.get_note_access_by_id(created.id))
 
         assert access.user_id == accounts.owner
-        assert access.access_control == {}
+        assert run(AccessGrants.get_grants_by_resource("note", created.id)) == []
 
     def test_someone_holding_no_key_can_still_delete_it(self, db, accounts):
         created = _add(db, accounts.owner)
         db.expunge_all()
 
         set_current_user_id(accounts.intruder)
-        assert Notes.delete_note_by_id(created.id, db=db) is True
+        assert run(Notes.delete_note_by_id(created.id)) is True
         assert db.query(Note).filter_by(id=created.id).count() == 0
 
     def test_deleting_takes_the_key_copies_with_it(self, db, accounts):
-        created = _add(db, accounts.owner, access_control=_shared_with(accounts.intruder))
+        created = _add(db, accounts.owner, access_grants=_shared_with(accounts.intruder))
 
-        Notes.delete_note_by_id(created.id, db=db)
+        run(Notes.delete_note_by_id(created.id))
 
         assert (
             db.query(ResourceKey)

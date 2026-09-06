@@ -20,6 +20,9 @@
 		const manifest = extractFrontmatter(data.content);
 		if (compareVersion(manifest?.required_open_webui_version ?? '0.0.0', WEBUI_VERSION)) {
 			console.log('Version is lower than required');
+			// LICENSE covers this Open WebUI wordmark.
+			// Do not alter, remove, obscure, or replace it except as LICENSE permits:
+			// https://docs.openwebui.com/license.
 			toast.error(
 				$i18n.t(
 					'Open WebUI version (v{{OPEN_WEBUI_VERSION}}) is lower than required version (v{{REQUIRED_VERSION}})',
@@ -37,7 +40,7 @@
 			name: data.name,
 			meta: data.meta,
 			content: data.content,
-			access_control: data.access_control
+			access_grants: data.access_grants
 		}).catch((error) => {
 			toast.error(`${error}`);
 			return null;
@@ -82,16 +85,18 @@
 
 {#if mounted}
 	{#key tool?.content}
-		<ToolkitEditor
-			id={tool?.id ?? ''}
-			name={tool?.name ?? ''}
-			meta={tool?.meta ?? { description: '' }}
-			content={tool?.content ?? ''}
-			accessControl={tool?.access_control !== undefined ? tool.access_control : {}}
-			{clone}
-			onSave={(value) => {
-				saveHandler(value);
-			}}
-		/>
+		<div class="h-full min-w-0 overflow-x-hidden">
+			<ToolkitEditor
+				id={tool?.id ?? ''}
+				name={tool?.name ?? ''}
+				meta={tool?.meta ?? { description: '' }}
+				content={tool?.content ?? ''}
+				accessGrants={tool?.access_grants !== undefined ? tool.access_grants : []}
+				{clone}
+				onSave={(value) => {
+					saveHandler(value);
+				}}
+			/>
+		</div>
 	{/key}
 {/if}

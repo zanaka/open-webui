@@ -1,11 +1,9 @@
 import time
 
 import pytest
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
+from conftest import run, sqlite_test_database
+from sqlalchemy import text
 
-from open_webui.internal import db as internal_db
-from open_webui.internal.db import Base
 from open_webui.models.chats import Chat, Chats, _extract_chat_search_text
 from open_webui.models.users import User
 from open_webui.utils import crypto_context
@@ -31,24 +29,19 @@ def _current_user():
 
 
 @pytest.fixture
-def db(monkeypatch):
-    monkeypatch.setattr(internal_db, "DATABASE_ENABLE_SESSION_SHARING", True)
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(
-        engine,
+def db(monkeypatch, tmp_path):
+    with sqlite_test_database(
+        monkeypatch,
+        tmp_path / "test.db",
         tables=[
             User.__table__,
             Chat.__table__,
         ],
-    )
-    SessionLocal = sessionmaker(bind=engine)
-    session = SessionLocal()
-    cache_dek(USER_ID, generate_dek(), jti="jti-1", expires_at=time.time() + 3600)
-    _insert_user(session)
-    yield session
-    session.close()
-    engine.dispose()
-    crypto_context._dek_cache.clear()
+    ) as session:
+        cache_dek(USER_ID, generate_dek(), jti="jti-1", expires_at=time.time() + 3600)
+        _insert_user(session)
+        yield session
+        crypto_context._dek_cache.clear()
 
 
 def _insert_user(db):
@@ -118,9 +111,7 @@ def _raw_title(db, chat_id):
 
 
 def _search(db, query, **kwargs):
-    return Chats.get_chats_by_user_id_and_search_text(
-        USER_ID, query, db=db, **kwargs
-    )
+    return run(Chats.get_chats_by_user_id_and_search_text(USER_ID, query, **kwargs))
 
 
 class TestTitleSearch:

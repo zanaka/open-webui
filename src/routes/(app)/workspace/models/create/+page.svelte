@@ -1,5 +1,4 @@
-<script>
-	import { v4 as uuidv4 } from 'uuid';
+<script lang="ts">
 	import { toast } from 'svelte-sonner';
 	import { goto } from '$app/navigation';
 	import { config, models, settings } from '$lib/stores';
@@ -34,6 +33,9 @@
 				...modelInfo,
 				meta: {
 					...modelInfo.meta,
+					// LICENSE covers this Open WebUI fallback logo.
+					// Do not alter, remove, obscure, or replace it except as LICENSE permits:
+					// https://docs.openwebui.com/license.
 					profile_image_url:
 						modelInfo.meta.profile_image_url ?? `${WEBUI_BASE_URL}/static/favicon.png`,
 					suggestion_prompts: modelInfo.meta.suggestion_prompts
@@ -61,8 +63,8 @@
 
 	let model = null;
 
-	onMount(async () => {
-		window.addEventListener('message', async (event) => {
+	onMount(() => {
+		const handleMessageEvent = async (event: MessageEvent) => {
 			if (
 				!['https://openwebui.com', 'https://www.openwebui.com', 'http://localhost:9999'].includes(
 					event.origin
@@ -82,7 +84,8 @@
 			} catch (e) {
 				console.error('Failed to parse message data:', e);
 			}
-		});
+		};
+		window.addEventListener('message', handleMessageEvent);
 
 		if (window.opener ?? false) {
 			window.opener.postMessage('loaded', '*');
@@ -92,9 +95,19 @@
 			model = JSON.parse(sessionStorage.model);
 			sessionStorage.removeItem('model');
 		}
+
+		return () => {
+			window.removeEventListener('message', handleMessageEvent);
+		};
 	});
 </script>
 
 {#key model}
-	<ModelEditor {model} {onSubmit} />
+	<ModelEditor
+		{model}
+		{onSubmit}
+		onBack={async () => {
+			await goto('/workspace/models');
+		}}
+	/>
 {/key}
