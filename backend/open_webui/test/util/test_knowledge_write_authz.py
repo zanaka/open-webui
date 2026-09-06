@@ -3,8 +3,10 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from conftest import run
 from fastapi import HTTPException
 
+from open_webui.models.access_grants import AccessGrants
 from open_webui.models.auths import Auths
 from open_webui.models.files import File, Files
 from open_webui.models.knowledge import Knowledge
@@ -43,13 +45,14 @@ def people(accounts):
         ("writer", "writer-correct-horse"),
         ("reader", "reader-battery-staple"),
     ):
-        auth = Auths.insert_new_auth(
-            email=f"kb-authz-{name}@example.com",
-            hashed_password=f"hashed::{name}",
-            name=name,
-            raw_password=password,
-            role="user",
-            db=accounts.session,
+        auth = run(
+            Auths.insert_new_auth(
+                email=f"kb-authz-{name}@example.com",
+                hashed_password=f"hashed::{name}",
+                name=name,
+                raw_password=password,
+                role="user",
+            )
         )
         cache_dek(auth.user.id, auth.dek, f"jti-kb-authz-{name}", time.time() + 3600)
         ids[name] = auth.user.id
@@ -72,11 +75,6 @@ def db(db):
             name="Shared knowledge",
             description="",
             meta=None,
-            # Shared for reading with READER, for writing with WRITER.
-            access_control={
-                "read": {"user_ids": [READER], "group_ids": []},
-                "write": {"user_ids": [WRITER], "group_ids": []},
-            },
             created_at=now,
             updated_at=now,
         )
@@ -94,36 +92,47 @@ def db(db):
         )
     )
     db.commit()
+
+    # Shared for reading with READER, for writing with WRITER.
+    run(
+        AccessGrants.set_access_grants(
+            "knowledge",
+            KB_ID,
+            [
+                {"principal_type": "user", "principal_id": READER, "permission": "read"},
+                {"principal_type": "user", "principal_id": WRITER, "permission": "write"},
+            ],
+        )
+    )
     db.expire_all()
 
     return db
-    crypto_context._dek_cache.clear()
 
 
 class TestRequireKnowledgeWriteAccess:
     def test_owner_may_write(self, db):
-        require_knowledge_write_access(KB_ID, _user(OWNER), db=db)
+        run(require_knowledge_write_access(KB_ID, _user(OWNER), db=db))
 
     def test_write_member_may_write(self, db):
-        require_knowledge_write_access(KB_ID, _user(WRITER), db=db)
+        run(require_knowledge_write_access(KB_ID, _user(WRITER), db=db))
 
     def test_admin_may_write(self, db):
-        require_knowledge_write_access(KB_ID, _user(STRANGER, role="admin"), db=db)
+        run(require_knowledge_write_access(KB_ID, _user(STRANGER, role="admin"), db=db))
 
     def test_read_only_member_is_refused(self, db):
         """Read members hold the same key as writers, so the key cannot be the check."""
         with pytest.raises(HTTPException) as raised:
-            require_knowledge_write_access(KB_ID, _user(READER), db=db)
+            run(require_knowledge_write_access(KB_ID, _user(READER), db=db))
         assert raised.value.status_code == 403
 
     def test_unrelated_user_is_refused(self, db):
         with pytest.raises(HTTPException) as raised:
-            require_knowledge_write_access(KB_ID, _user(STRANGER), db=db)
+            run(require_knowledge_write_access(KB_ID, _user(STRANGER), db=db))
         assert raised.value.status_code == 403
 
     def test_missing_knowledge_base_is_not_found(self, db):
         with pytest.raises(HTTPException) as raised:
-            require_knowledge_write_access("no-such-kb", _user(OWNER), db=db)
+            run(require_knowledge_write_access("no-such-kb", _user(OWNER), db=db))
         assert raised.value.status_code == 404
 
 
@@ -142,7 +151,7 @@ class TestProcessFilesBatch:
 
     def test_read_only_member_cannot_add_chunks(self, db, monkeypatch):
         monkeypatch.setattr(retrieval, "knowledge_key", lambda *a, **kw: b"k" * 32)
-        stored = Files.get_file_by_id(FILE_ID, db=db)
+        stored = run(Files.get_file_by_id(FILE_ID))
 
         with pytest.raises(HTTPException) as raised:
             self._run(db, _user(READER), [stored])
@@ -160,7 +169,7 @@ class TestProcessFilesBatch:
         monkeypatch.setattr(retrieval, "save_docs_to_vector_db", _fake_save)
         monkeypatch.setattr(retrieval, "knowledge_key", lambda *a, **kw: b"k" * 32)
 
-        stored = Files.get_file_by_id(FILE_ID, db=db)
+        stored = run(Files.get_file_by_id(FILE_ID))
         tampered = stored.model_copy(
             update={
                 "data": {"content": "INJECTED CONTENT"},
@@ -188,7 +197,7 @@ class TestProcessFilesBatch:
         )
         monkeypatch.setattr(retrieval, "knowledge_key", lambda *a, **kw: b"k" * 32)
 
-        stored = Files.get_file_by_id(FILE_ID, db=db)
+        stored = run(Files.get_file_by_id(FILE_ID))
         someone_elses = stored.model_copy(update={"id": "file-not-mine"})
 
         response = self._run(db, _user(OWNER), [someone_elses])

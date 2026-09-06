@@ -1,5 +1,8 @@
 <script lang="ts">
+	import { getContext } from 'svelte';
 	import { decodeString } from '$lib/utils';
+
+	const i18n = getContext('i18n');
 
 	export let id;
 
@@ -37,7 +40,8 @@
 
 {#if title !== 'N/A'}
 	<button
-		class="text-[10px] w-fit translate-y-[2px] px-2 py-0.5 dark:bg-white/5 dark:text-white/80 dark:hover:text-white bg-gray-50 text-black/80 hover:text-black transition rounded-xl"
+		aria-label={$i18n.t('View source: {{title}}', { title: formattedTitle(decodeString(title)) })}
+		class="text-[0.625rem] w-fit translate-y-[2px] px-2 py-0.5 dark:bg-white/5 dark:text-white/80 dark:hover:text-white bg-gray-50 text-black/80 hover:text-black transition rounded-xl"
 		on:click={() => {
 			onClick(id);
 		}}

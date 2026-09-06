@@ -1,52 +1,54 @@
 <script>
 	import { toast } from 'svelte-sonner';
-	import dayjs from 'dayjs';
-	import relativeTime from 'dayjs/plugin/relativeTime';
-	dayjs.extend(relativeTime);
-
 	import { onMount, getContext } from 'svelte';
 	import { goto } from '$app/navigation';
 
-	import { WEBUI_NAME, config, user, showSidebar, knowledge } from '$lib/stores';
-	import { WEBUI_BASE_URL } from '$lib/constants';
+	import { adminGroupCount, user } from '$lib/stores';
 
-	import Tooltip from '$lib/components/common/Tooltip.svelte';
-	import Plus from '$lib/components/icons/Plus.svelte';
-	import Badge from '$lib/components/common/Badge.svelte';
-	import UsersSolid from '$lib/components/icons/UsersSolid.svelte';
-	import ChevronRight from '$lib/components/icons/ChevronRight.svelte';
-	import EllipsisHorizontal from '$lib/components/icons/EllipsisHorizontal.svelte';
 	import Search from '$lib/components/icons/Search.svelte';
-	import User from '$lib/components/icons/User.svelte';
-	import UserCircleSolid from '$lib/components/icons/UserCircleSolid.svelte';
 	import EditGroupModal from './Groups/EditGroupModal.svelte';
-	import Pencil from '$lib/components/icons/Pencil.svelte';
 	import GroupItem from './Groups/GroupItem.svelte';
+	import XMark from '$lib/components/icons/XMark.svelte';
+	import ChevronDown from '$lib/components/icons/ChevronDown.svelte';
+	import Check from '$lib/components/icons/Check.svelte';
+	import Select from '$lib/components/common/Select.svelte';
 	import { createNewGroup, getGroups } from '$lib/apis/groups';
-	import {
-		getUserDefaultPermissions,
-		getAllUsers,
-		updateUserDefaultPermissions
-	} from '$lib/apis/users';
+	import { getUserDefaultPermissions, updateUserDefaultPermissions } from '$lib/apis/users';
 
 	const i18n = getContext('i18n');
 
 	let loaded = false;
 
+	/** @type {any[]} */
 	let groups = [];
-	let filteredGroups;
 
-	$: filteredGroups = groups.filter((user) => {
-		if (search === '') {
-			return true;
-		} else {
-			let name = user.name.toLowerCase();
-			const query = search.toLowerCase();
-			return name.includes(query);
-		}
-	});
+	let query = '';
+	let sortBy = 'members';
 
-	let search = '';
+	const sortItems = [
+		{ value: 'members', label: $i18n.t('Members') },
+		{ value: 'name', label: $i18n.t('Name') }
+	];
+
+	$: filteredGroups = groups
+		.filter((group) => {
+			if (query === '') {
+				return true;
+			} else {
+				let name = group.name.toLowerCase();
+				const q = query.toLowerCase();
+				return name.includes(q);
+			}
+		})
+		.sort((a, b) => {
+			if (sortBy === 'name') {
+				return a.name.localeCompare(b.name);
+			}
+
+			return (b.member_count ?? 0) - (a.member_count ?? 0) || a.name.localeCompare(b.name);
+		});
+
+	/** @type {any} */
 	let defaultPermissions = {};
 
 	let showAddGroupModal = false;
@@ -54,8 +56,15 @@
 
 	const setGroups = async () => {
 		groups = await getGroups(localStorage.token);
+		adminGroupCount.set(groups.length);
 	};
 
+	/** @param {any} updatedGroup */
+	const updateGroup = (updatedGroup) => {
+		groups = groups.map((group) => (group.id === updatedGroup.id ? updatedGroup : group));
+	};
+
+	/** @param {any} group */
 	const addGroupHandler = async (group) => {
 		const res = await createNewGroup(localStorage.token, group).catch((error) => {
 			toast.error(`${error}`);
@@ -64,10 +73,11 @@
 
 		if (res) {
 			toast.success($i18n.t('Group created successfully'));
-			groups = await getGroups(localStorage.token);
+			await setGroups();
 		}
 	};
 
+	/** @param {any} group */
 	const updateDefaultPermissionsHandler = async (group) => {
 		console.debug(group.permissions);
 
@@ -105,120 +115,128 @@
 		onSubmit={addGroupHandler}
 	/>
 
-	<div class="mt-0.5 mb-2 gap-1 flex flex-col md:flex-row justify-between">
-		<div class="flex items-center md:self-center text-xl font-medium px-0.5 gap-2 shrink-0">
-			<div>
-				{$i18n.t('Groups')}
-			</div>
-
-			<div class="text-lg font-medium text-gray-500 dark:text-gray-500">
-				{groups.length}
-			</div>
-		</div>
-
-		<div class="flex gap-1">
-			<div class=" flex w-full space-x-2">
-				<div class="flex flex-1">
-					<div class=" self-center ml-1 mr-3">
-						<Search />
+	<div>
+		<div class="sticky top-0 z-10 bg-white dark:bg-gray-900">
+			<div class="flex h-8 flex-1 items-center w-full gap-2">
+				<div class="flex min-w-0 flex-1 items-center">
+					<div class="self-center ml-1 mr-3">
+						<Search className="size-3.5" />
 					</div>
 					<input
-						class=" w-full text-sm pr-4 py-1 rounded-r-xl outline-hidden bg-transparent"
-						bind:value={search}
-						placeholder={$i18n.t('Search')}
+						class="w-full text-sm pr-4 py-1 rounded-r-xl outline-hidden bg-transparent"
+						bind:value={query}
+						aria-label={$i18n.t('Search Groups')}
+						placeholder={$i18n.t('Search Groups')}
 					/>
+					{#if query}
+						<div class="self-center pl-1.5 translate-y-[0.5px] rounded-l-xl bg-transparent">
+							<button
+								class="p-0.5 rounded-full hover:bg-gray-100 dark:hover:bg-gray-900 transition"
+								aria-label={$i18n.t('Clear search')}
+								on:click={() => {
+									query = '';
+								}}
+							>
+								<XMark className="size-3" strokeWidth="2" />
+							</button>
+						</div>
+					{/if}
 				</div>
 
-				<div>
-					<Tooltip content={$i18n.t('Create Group')}>
-						<button
-							class=" p-2 rounded-xl hover:bg-gray-100 dark:bg-gray-900 dark:hover:bg-gray-850 transition font-medium text-sm flex items-center space-x-1"
-							on:click={() => {
-								showAddGroupModal = !showAddGroupModal;
-							}}
+				<Select
+					bind:value={sortBy}
+					items={sortItems}
+					placeholder={$i18n.t('Sort')}
+					triggerClass="relative h-8 shrink-0 flex items-center gap-1 px-1.5 py-1.5 bg-transparent rounded-xl text-[0.8125rem] font-normal text-gray-700 transition hover:text-gray-900 dark:text-gray-200 dark:hover:text-gray-100"
+					labelClass="inline-flex h-input outline-hidden bg-transparent truncate placeholder-gray-400 focus:outline-hidden"
+					align="end"
+				>
+					<svelte:fragment slot="trigger" let:selectedLabel>
+						<span
+							class="inline-flex h-input outline-hidden bg-transparent truncate placeholder-gray-400 focus:outline-hidden"
 						>
-							<Plus className="size-3.5" />
-						</button>
-					</Tooltip>
-				</div>
+							{selectedLabel}
+						</span>
+						<ChevronDown className="size-3.5" strokeWidth="2.5" />
+					</svelte:fragment>
+
+					<svelte:fragment slot="item" let:item let:selected>
+						{item.label}
+						<div class="ml-auto {selected ? '' : 'invisible'}">
+							<Check />
+						</div>
+					</svelte:fragment>
+				</Select>
+
+				<button
+					class="ml-1 shrink-0 rounded-lg bg-gray-50 px-2.5 py-1 text-xs text-gray-900 transition ring-1 ring-gray-200 hover:bg-gray-100 dark:bg-gray-850 dark:text-gray-100 dark:ring-gray-800 dark:hover:bg-gray-800"
+					on:click={() => {
+						showAddGroupModal = !showAddGroupModal;
+					}}
+				>
+					{$i18n.t('New Group')}
+				</button>
 			</div>
 		</div>
-	</div>
 
-	<div>
-		{#if filteredGroups.length === 0}
-			<div class="flex flex-col items-center justify-center h-40">
-				<div class=" text-xl font-medium">
-					{$i18n.t('Organize your users')}
-				</div>
-
-				<div class="mt-1 text-sm dark:text-gray-300">
-					{$i18n.t('Use groups to group your users and assign permissions.')}
-				</div>
-
-				<div class="mt-3">
-					<button
-						class=" px-4 py-1.5 text-sm rounded-full bg-black hover:bg-gray-800 text-white dark:bg-white dark:text-black dark:hover:bg-gray-100 transition font-medium flex items-center space-x-1"
-						aria-label={$i18n.t('Create Group')}
-						on:click={() => {
-							showAddGroupModal = true;
-						}}
-					>
-						{$i18n.t('Create Group')}
-					</button>
-				</div>
+		{#if filteredGroups.length !== 0}
+			<div class="mt-1 grid grid-cols-1">
+				{#each filteredGroups as group, idx (group.id)}
+					<GroupItem {group} {setGroups} {updateGroup} {defaultPermissions} />
+					{#if idx < filteredGroups.length - 1}
+						<hr class="border-gray-50 dark:border-gray-850/40" />
+					{/if}
+				{/each}
 			</div>
 		{:else}
-			<div>
-				<div class=" flex items-center gap-3 justify-between text-xs uppercase px-1 font-medium">
-					<div class="w-full basis-3/5">{$i18n.t('Group')}</div>
-
-					<div class="w-full basis-2/5 text-right">{$i18n.t('Users')}</div>
-				</div>
-
-				<hr class="mt-1.5 border-gray-100/30 dark:border-gray-850/30" />
-
-				{#each filteredGroups as group}
-					<div class="my-2">
-						<GroupItem {group} {setGroups} {defaultPermissions} />
+			<div class="flex w-full flex-col items-center justify-center py-16 pb-24">
+				<div class="max-w-sm text-center text-gray-900 dark:text-gray-100">
+					<div class="mb-1.5 text-sm">{$i18n.t('No groups found')}</div>
+					<div class="text-center text-xs leading-5 text-gray-500">
+						{$i18n.t('Use groups to organize your users and assign permissions.')}
 					</div>
-				{/each}
+				</div>
 			</div>
 		{/if}
 
-		<hr class="mb-2 border-gray-100/30 dark:border-gray-850/30" />
-
-		<EditGroupModal
-			bind:show={showDefaultPermissionsModal}
-			tabs={['permissions']}
-			bind:permissions={defaultPermissions}
-			custom={false}
-			onSubmit={updateDefaultPermissionsHandler}
-		/>
+		<hr class="my-1 border-gray-50 dark:border-gray-850/40" />
 
 		<button
-			class="flex items-center justify-between rounded-lg w-full transition pt-1"
+			class="group flex cursor-pointer text-left w-full px-2.5 py-2"
+			aria-haspopup="dialog"
 			on:click={() => {
 				showDefaultPermissionsModal = true;
 			}}
 		>
-			<div class="flex items-center gap-2.5">
-				<div class="p-1.5 bg-black/5 dark:bg-white/10 rounded-full">
-					<UsersSolid className="size-4" />
-				</div>
+			<div class="w-full">
+				<div class="flex items-center gap-3">
+					<div class="flex min-w-0 flex-1 flex-col gap-0.5 pl-1">
+						<div class="text-sm font-normal text-gray-900 group-hover:underline dark:text-gray-100">
+							{$i18n.t('Default permissions')}
+						</div>
 
-				<div class="text-left">
-					<div class=" text-sm font-medium">{$i18n.t('Default permissions')}</div>
+						<div class="line-clamp-1 text-xs text-gray-500">
+							{$i18n.t('applies to all users with the "user" role')}
+						</div>
+					</div>
 
-					<div class="flex text-xs mt-0.5">
-						{$i18n.t('applies to all users with the "user" role')}
+					<div
+						class="shrink-0 px-1.5 text-xs text-gray-500 transition group-hover:text-gray-800 dark:text-gray-400 dark:group-hover:text-gray-200"
+					>
+						{$i18n.t('Edit')}
 					</div>
 				</div>
 			</div>
-
-			<div>
-				<ChevronRight strokeWidth="2.5" />
-			</div>
 		</button>
 	</div>
+
+	{#if showDefaultPermissionsModal}
+		<EditGroupModal
+			bind:show={showDefaultPermissionsModal}
+			tabs={['permissions']}
+			permissions={defaultPermissions}
+			custom={false}
+			onSubmit={updateDefaultPermissionsHandler}
+		/>
+	{/if}
 {/if}

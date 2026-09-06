@@ -3,22 +3,44 @@
 	import { tick, getContext, onMount, onDestroy } from 'svelte';
 	import { toast } from 'svelte-sonner';
 
+	import { getPrompts } from '$lib/apis/prompts';
+
 	const i18n = getContext('i18n');
 
 	export let query = '';
-	export let prompts = [];
 	export let onSelect = (e) => {};
 
 	let selectedPromptIdx = 0;
 	export let filteredItems = [];
+	let searchDebounceTimer: ReturnType<typeof setTimeout>;
 
-	$: filteredItems = prompts
+	let items = [];
+
+	$: if (query !== undefined) {
+		clearTimeout(searchDebounceTimer);
+		searchDebounceTimer = setTimeout(() => {
+			getItems();
+		}, 200);
+	}
+
+	onDestroy(() => {
+		clearTimeout(searchDebounceTimer);
+	});
+
+	$: filteredItems = items
 		.filter((p) => p.command.toLowerCase().includes(query.toLowerCase()))
-		.sort((a, b) => a.title.localeCompare(b.title));
+		.sort((a, b) => a.name.localeCompare(b.name));
 
 	$: if (query) {
 		selectedPromptIdx = 0;
 	}
+
+	const getItems = async () => {
+		const res = await getPrompts(localStorage.token).catch(() => null);
+		if (res) {
+			items = res;
+		}
+	};
 
 	export const selectUp = () => {
 		selectedPromptIdx = Math.max(0, selectedPromptIdx - 1);
@@ -35,18 +57,19 @@
 	};
 </script>
 
-<div class="px-2 text-xs text-gray-500 py-1">
+<div class="px-2 py-1 text-[0.6875rem] text-gray-500 dark:text-gray-400">
 	{$i18n.t('Prompts')}
 </div>
 
 {#if filteredItems.length > 0}
-	<div class=" space-y-0.5 scrollbar-hidden">
+	<div class="scrollbar-hidden">
 		{#each filteredItems as promptItem, promptIdx}
-			<Tooltip content={promptItem.title} placement="top-start">
+			<Tooltip content={promptItem.name} placement="top-start">
 				<button
-					class=" px-3 py-1 rounded-xl w-full text-left {promptIdx === selectedPromptIdx
-						? '  bg-gray-50 dark:bg-gray-800 selected-command-option-button'
-						: ''} truncate"
+					class="flex h-[1.6875rem] w-full items-center gap-1.5 rounded-xl px-2 text-left text-[0.8125rem] hover:bg-gray-50/40 dark:hover:bg-gray-800/40 {promptIdx ===
+					selectedPromptIdx
+						? 'bg-gray-50/40 dark:bg-gray-800/40 selected-command-option-button'
+						: ''}"
 					type="button"
 					on:click={() => {
 						onSelect({ type: 'prompt', data: promptItem });
@@ -57,12 +80,12 @@
 					on:focus={() => {}}
 					data-selected={promptIdx === selectedPromptIdx}
 				>
-					<span class=" font-medium text-black dark:text-gray-100">
+					<span class="shrink-0 font-normal text-black dark:text-gray-100">
 						{promptItem.command}
 					</span>
 
-					<span class=" text-xs text-gray-600 dark:text-gray-100">
-						{promptItem.title}
+					<span class="min-w-0 truncate text-xs text-gray-500 dark:text-gray-400">
+						{promptItem.name}
 					</span>
 				</button>
 			</Tooltip>

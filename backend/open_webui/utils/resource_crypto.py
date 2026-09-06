@@ -16,7 +16,8 @@ from typing import Optional
 from sqlalchemy.orm import Session
 
 from open_webui.crypto_exceptions import CryptoPolicyError
-from open_webui.models.auths import Auths
+from open_webui.internal.db import get_db_context
+from open_webui.models.auths import Auth
 from open_webui.models.resource_keys import ResourceKey, ResourceKeys
 from open_webui.utils.crypto_context import require_cached_dek
 from open_webui.utils.crypto_utils import (
@@ -70,7 +71,10 @@ def _add_key(
     session: Session, resource_type: str, resource_id: str, user_id: str, key: bytes
 ) -> None:
     """Add a wrapped copy to the session; the caller's flush writes it."""
-    public_key = Auths.get_public_key(user_id, db=session)
+    # Queried on the caller's own sync session: this runs inside ORM event
+    # hooks, where the async table APIs must not be entered.
+    auth = session.query(Auth).filter_by(id=user_id).first()
+    public_key = auth.public_key if auth else None
     if public_key is None:
         raise SharingNotSupportedError(
             f"User {user_id} has no public key to hand a copy of the key to."
@@ -105,7 +109,9 @@ def resolve_key(
         return None
 
     dek = require_cached_dek(user_id)
-    wrapped_private_key = Auths.get_wrapped_private_key(user_id, db=db)
+    with get_db_context(db) as session:
+        auth = session.query(Auth).filter_by(id=user_id).first()
+        wrapped_private_key = auth.wrapped_private_key if auth else None
     if wrapped_private_key is None:
         raise RuntimeError(f"No wrapped private key for user {user_id}.")
 
@@ -113,43 +119,3 @@ def resolve_key(
     return rsa_unwrap_key(wrapped_key, private_der)
 
 
-def sync_shared_keys(
-    resource_type: str,
-    resource_id: str,
-    owner_id: str,
-    access_control: Optional[dict],
-    key: Optional[bytes],
-    session: Session,
-) -> None:
-    """Bring the stored key copies in line with who the resource is shared with."""
-    wanted = named_recipients(access_control) - {owner_id}
-    existing = {
-        row.user_id
-        for row in session.query(ResourceKey).filter_by(
-            resource_type=resource_type, resource_id=resource_id
-        )
-    } - {owner_id}
-    # Copies added earlier in this same flush are not in the table yet.
-    existing |= {
-        obj.user_id
-        for obj in session.new
-        if isinstance(obj, ResourceKey)
-        and obj.resource_type == resource_type
-        and obj.resource_id == resource_id
-    } - {owner_id}
-
-    added = wanted - existing
-    removed = existing - wanted
-
-    if (added or removed) and key is None:
-        raise ResourceKeyAccessError(
-            "Cannot change who this is shared with without holding its key."
-        )
-
-    for user_id in added:
-        _add_key(session, resource_type, resource_id, user_id, key)
-
-    for user_id in removed:
-        session.query(ResourceKey).filter_by(
-            resource_type=resource_type, resource_id=resource_id, user_id=user_id
-        ).delete(synchronize_session=False)

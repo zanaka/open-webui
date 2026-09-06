@@ -3,22 +3,42 @@
 
 	const i18n = getContext('i18n');
 
-	import { getGroups } from '$lib/apis/groups';
-	import { getUserById, searchUsers } from '$lib/apis/users';
+	import { getGroups, getGroupById, getGroupInfoById } from '$lib/apis/groups';
+	import { getUserInfoById } from '$lib/apis/users';
 	import { config } from '$lib/stores';
-	import Tooltip from '$lib/components/common/Tooltip.svelte';
-	import Plus from '$lib/components/icons/Plus.svelte';
-	import UserCircleSolid from '$lib/components/icons/UserCircleSolid.svelte';
+	import { WEBUI_API_BASE_URL } from '$lib/constants';
 	import XMark from '$lib/components/icons/XMark.svelte';
 	import Badge from '$lib/components/common/Badge.svelte';
+	import GlobeAlt from '$lib/components/icons/GlobeAlt.svelte';
+	import Plus from '$lib/components/icons/Plus.svelte';
+	import AddAccessModal from './AddAccessModal.svelte';
+	import Tooltip from '$lib/components/common/Tooltip.svelte';
+	import Switch from '$lib/components/common/Switch.svelte';
+
+	type AccessGrant = {
+		id?: string;
+		principal_type: 'user' | 'group' | 'anyone';
+		principal_id: string;
+		permission: 'read' | 'write';
+	};
+
+	type LegacyAccessControl = {
+		read: { group_ids: string[]; user_ids: string[] };
+		write: { group_ids: string[]; user_ids: string[] };
+	};
 
 	export let onChange: Function = () => {};
 
 	export let accessRoles = ['read'];
-	export let accessControl = {};
+	export let accessGrants: AccessGrant[] | any = [];
+	export let accessControl: any = undefined;
 
 	export let share = true;
 	export let sharePublic = true;
+	export let shareOpen = false;
+	export let shareUsers = true;
+	export let allowGroups = true;
+	export let defaultPermission: 'read' | 'write' = 'read';
 
 	// Which model this resource is, as the server names it. The server says
 	// which of those can only be shared with people named one by one, so this
@@ -29,117 +49,455 @@
 		resourceType ?? ''
 	);
 
-	// Public needs both the permission and a resource whose readers are not
-	// enumerated as key holders.
-	$: canBePublic = sharePublic && !namedOnly;
+	let groups: any[] = [];
+	const resolvingGroupIds = new Set<string>();
+	let userById: Record<string, any> = {};
+	const resolvingUserIds = new Set<string>();
 
-	let selectedGroupId = '';
-	let groups = [];
+	let showAddAccessModal = false;
 
-	let userQuery = '';
-	let userResults = [];
-	let knownUsers: Record<string, { id: string; name: string; email: string }> = {};
-
-	$: if (!canBePublic && accessControl === null) {
-		initPublicAccess();
-	}
-
-	const initPublicAccess = () => {
-		if (!canBePublic && accessControl === null) {
-			accessControl = {
-				read: {
-					group_ids: [],
-					user_ids: []
-				},
-				write: {
-					group_ids: [],
-					user_ids: []
-				}
-			};
-			onChange(accessControl);
+	const dedupeAccessGrants = (grants: AccessGrant[] | null | undefined): AccessGrant[] => {
+		if (!Array.isArray(grants)) return [];
+		const map = new Map<string, AccessGrant>();
+		for (const grant of grants) {
+			if (!grant) continue;
+			const key = `${grant.principal_type}:${grant.principal_id}:${grant.permission}`;
+			if (!grant.principal_type || !grant.principal_id || !grant.permission) continue;
+			map.set(key, {
+				id: grant.id,
+				principal_type: grant.principal_type,
+				principal_id: grant.principal_id,
+				permission: grant.permission
+			});
 		}
+		return Array.from(map.values());
 	};
 
-	const rememberUser = async (userId: string) => {
-		if (knownUsers[userId]) {
-			return;
-		}
-		const user = await getUserById(localStorage.token, userId).catch(() => null);
-		if (user) {
-			knownUsers = { ...knownUsers, [userId]: user };
-		}
-	};
-
-	const findUsers = async () => {
-		if (userQuery.trim() === '') {
-			userResults = [];
-			return;
-		}
-		const res = await searchUsers(localStorage.token, userQuery).catch(() => null);
-		userResults = res?.users ?? [];
-	};
-
-	const addUser = async (user) => {
-		accessControl.read.user_ids = [...(accessControl?.read?.user_ids ?? []), user.id];
-		knownUsers = { ...knownUsers, [user.id]: user };
-
-		userQuery = '';
-		userResults = [];
-		onChange(accessControl);
-	};
-
-	const removeUser = (userId: string) => {
-		accessControl.read.user_ids = (accessControl?.read?.user_ids ?? []).filter(
-			(id) => id !== userId
-		);
-		accessControl.write.user_ids = (accessControl?.write?.user_ids ?? []).filter(
-			(id) => id !== userId
-		);
-		onChange(accessControl);
-	};
-
-	onMount(async () => {
-		groups = await getGroups(localStorage.token, true);
-
+	const legacyAccessControlToGrants = (accessControl: any): AccessGrant[] => {
 		if (accessControl === null) {
-			initPublicAccess();
-		} else {
-			accessControl = {
-				read: {
-					group_ids: accessControl?.read?.group_ids ?? [],
-					user_ids: accessControl?.read?.user_ids ?? []
-				},
-				write: {
-					group_ids: accessControl?.write?.group_ids ?? [],
-					user_ids: accessControl?.write?.user_ids ?? []
+			return [
+				{
+					principal_type: 'user',
+					principal_id: '*',
+					permission: 'read'
 				}
-			};
+			];
+		}
 
-			for (const userId of [
-				...(accessControl?.read?.user_ids ?? []),
-				...(accessControl?.write?.user_ids ?? [])
-			]) {
-				rememberUser(userId);
+		if (!accessControl || typeof accessControl !== 'object') {
+			return [];
+		}
+
+		const grants: AccessGrant[] = [];
+		for (const permission of ['read', 'write'] as const) {
+			const entry = accessControl?.[permission] ?? {};
+			for (const groupId of entry?.group_ids ?? []) {
+				grants.push({
+					principal_type: 'group',
+					principal_id: groupId,
+					permission
+				});
+			}
+			for (const userId of entry?.user_ids ?? []) {
+				grants.push({
+					principal_type: 'user',
+					principal_id: userId,
+					permission
+				});
 			}
 		}
+
+		return dedupeAccessGrants(grants);
+	};
+
+	const grantsToLegacyAccessControl = (grants: AccessGrant[]): null | LegacyAccessControl => {
+		const normalized = dedupeAccessGrants(grants);
+		if (hasPublicReadGrant(normalized)) {
+			return null;
+		}
+
+		const result: LegacyAccessControl = {
+			read: { group_ids: [], user_ids: [] },
+			write: { group_ids: [], user_ids: [] }
+		};
+
+		for (const grant of normalized) {
+			if (!['read', 'write'].includes(grant.permission)) {
+				continue;
+			}
+
+			if (grant.principal_type === 'group') {
+				if (!result[grant.permission].group_ids.includes(grant.principal_id)) {
+					result[grant.permission].group_ids = [
+						...result[grant.permission].group_ids,
+						grant.principal_id
+					];
+				}
+			} else if (grant.principal_type === 'user' && grant.principal_id !== '*') {
+				if (!result[grant.permission].user_ids.includes(grant.principal_id)) {
+					result[grant.permission].user_ids = [
+						...result[grant.permission].user_ids,
+						grant.principal_id
+					];
+				}
+			}
+		}
+
+		return result;
+	};
+
+	const normalizeInputToGrants = (value: any): AccessGrant[] => {
+		if (value === null) {
+			return legacyAccessControlToGrants(null);
+		}
+		if (Array.isArray(value)) {
+			return dedupeAccessGrants(value);
+		}
+		if (value && typeof value === 'object' && ('read' in value || 'write' in value)) {
+			return legacyAccessControlToGrants(value);
+		}
+		return [];
+	};
+
+	const stableStringify = (value: any): string => {
+		try {
+			return JSON.stringify(value ?? null);
+		} catch {
+			return '';
+		}
+	};
+
+	const hasPublicReadGrant = (grants: AccessGrant[]): boolean =>
+		grants.some(
+			(grant) =>
+				grant.principal_type === 'user' && grant.principal_id === '*' && grant.permission === 'read'
+		);
+
+	const hasAnyoneReadGrant = (grants: AccessGrant[]): boolean =>
+		grants.some(
+			(grant) =>
+				grant.principal_type === 'anyone' &&
+				grant.principal_id === '*' &&
+				grant.permission === 'read'
+		);
+
+	const hasPublicWriteGrant = (grants: AccessGrant[]): boolean =>
+		grants.some(
+			(grant) =>
+				grant.principal_type === 'user' &&
+				grant.principal_id === '*' &&
+				grant.permission === 'write'
+		);
+
+	const currentGrants = (grants: AccessGrant[] | any = accessGrants): AccessGrant[] =>
+		Array.isArray(grants) ? (grants as AccessGrant[]) : [];
+
+	const getPrincipalIdsByPermission = (
+		principalType: 'user' | 'group',
+		permission: 'read' | 'write',
+		grants: AccessGrant[] | any = accessGrants
+	): string[] =>
+		Array.from(
+			new Set(
+				currentGrants(grants)
+					.filter(
+						(grant) => grant.principal_type === principalType && grant.permission === permission
+					)
+					.map((grant) => grant.principal_id)
+			)
+		);
+
+	const hasPrincipalGrant = (
+		principalType: 'user' | 'group' | 'anyone',
+		principalId: string,
+		permission: 'read' | 'write'
+	): boolean =>
+		currentGrants().some(
+			(grant) =>
+				grant.principal_type === principalType &&
+				grant.principal_id === principalId &&
+				grant.permission === permission
+		);
+
+	const commitAccessGrants = (nextGrants: AccessGrant[]) => {
+		accessGrants = dedupeAccessGrants(nextGrants);
+		onChange(accessGrants);
+	};
+
+	const getVisibility = (grants: AccessGrant[]): 'private' | 'public' | 'open' => {
+		if (hasAnyoneReadGrant(grants)) return 'open';
+		if (hasPublicReadGrant(grants)) return 'public';
+		return 'private';
+	};
+
+	const setVisibility = (visibility: 'private' | 'public' | 'open') => {
+		const filtered = currentGrants().filter(
+			(grant) =>
+				!(
+					(grant.principal_type === 'user' || grant.principal_type === 'anyone') &&
+					grant.principal_id === '*'
+				)
+		);
+		if (visibility === 'public') {
+			filtered.push({
+				principal_type: 'user',
+				principal_id: '*',
+				permission: 'read'
+			});
+		} else if (visibility === 'open') {
+			filtered.push({
+				principal_type: 'anyone',
+				principal_id: '*',
+				permission: 'read'
+			});
+		}
+		commitAccessGrants(filtered);
+	};
+
+	const togglePublicWrite = () => {
+		let next = [...currentGrants()];
+		if (hasPublicWriteGrant(next)) {
+			next = next.filter(
+				(grant) =>
+					!(
+						grant.principal_type === 'user' &&
+						grant.principal_id === '*' &&
+						grant.permission === 'write'
+					)
+			);
+		} else {
+			next = upsertPrincipalGrant('user', '*', 'write', next);
+		}
+		commitAccessGrants(next);
+	};
+
+	const upsertPrincipalGrant = (
+		principalType: 'user' | 'group' | 'anyone',
+		principalId: string,
+		permission: 'read' | 'write',
+		grants: AccessGrant[]
+	): AccessGrant[] => {
+		if (
+			grants.some(
+				(grant) =>
+					grant.principal_type === principalType &&
+					grant.principal_id === principalId &&
+					grant.permission === permission
+			)
+		) {
+			return grants;
+		}
+		return [
+			...grants,
+			{
+				principal_type: principalType,
+				principal_id: principalId,
+				permission
+			}
+		];
+	};
+
+	const removePrincipalGrant = (
+		principalType: 'user' | 'group' | 'anyone',
+		principalId: string,
+		permission: 'read' | 'write',
+		grants: AccessGrant[]
+	): AccessGrant[] =>
+		grants.filter(
+			(grant) =>
+				!(
+					grant.principal_type === principalType &&
+					grant.principal_id === principalId &&
+					grant.permission === permission
+				)
+		);
+
+	const removePrincipal = (principalType: 'user' | 'group' | 'anyone', principalId: string) => {
+		let next = [...currentGrants()];
+		next = removePrincipalGrant(principalType, principalId, 'read', next);
+		next = removePrincipalGrant(principalType, principalId, 'write', next);
+		commitAccessGrants(next);
+	};
+
+	const togglePrincipalWrite = (
+		principalType: 'user' | 'group' | 'anyone',
+		principalId: string
+	) => {
+		let next = [...currentGrants()];
+		const hasWrite = hasPrincipalGrant(principalType, principalId, 'write');
+		if (hasWrite) {
+			next = removePrincipalGrant(principalType, principalId, 'write', next);
+		} else {
+			next = upsertPrincipalGrant(principalType, principalId, 'read', next);
+			next = upsertPrincipalGrant(principalType, principalId, 'write', next);
+		}
+		commitAccessGrants(next);
+	};
+
+	const ensureUsersByIds = async (userIds: string[]) => {
+		const pendingIds = userIds.filter((id) => !userById[id] && !resolvingUserIds.has(id));
+		if (!pendingIds.length) return;
+
+		for (const id of pendingIds) {
+			resolvingUserIds.add(id);
+		}
+
+		const fetched = await Promise.all(
+			pendingIds.map(async (id) => {
+				const user = await getUserInfoById(localStorage.token, id).catch((error) => {
+					console.error(error);
+					return null;
+				});
+				return { id, user };
+			})
+		);
+
+		const nextUserById = { ...userById };
+		for (const item of fetched) {
+			if (item.user?.id) {
+				nextUserById[item.id] = item.user;
+			}
+			resolvingUserIds.delete(item.id);
+		}
+		userById = nextUserById;
+	};
+
+	const handleAddAccess = ({ userIds, groupIds }: { userIds: string[]; groupIds: string[] }) => {
+		let next = [...currentGrants()];
+
+		for (const groupId of groupIds) {
+			if (defaultPermission === 'write') {
+				next = upsertPrincipalGrant('group', groupId, 'read', next);
+			}
+			next = upsertPrincipalGrant('group', groupId, defaultPermission, next);
+		}
+		for (const userId of userIds) {
+			if (defaultPermission === 'write') {
+				next = upsertPrincipalGrant('user', userId, 'read', next);
+			}
+			next = upsertPrincipalGrant('user', userId, defaultPermission, next);
+		}
+		commitAccessGrants(next);
+	};
+
+	// NOTE: We must reference `accessGrants` directly in each reactive
+	// expression so Svelte tracks the dependency.
+	const ensureGroupsByIds = async (groupIds: string[]) => {
+		const pendingIds = groupIds.filter(
+			(id) => !groups.find((g) => g.id === id) && !resolvingGroupIds.has(id)
+		);
+		if (!pendingIds.length) return;
+
+		for (const id of pendingIds) {
+			resolvingGroupIds.add(id);
+		}
+
+		const fetched = await Promise.all(
+			pendingIds.map(async (id) => {
+				const group = await getGroupInfoById(localStorage.token, id).catch((error) => {
+					console.error(error);
+					return null;
+				});
+				return group;
+			})
+		);
+
+		const newGroups = fetched.filter((g) => g);
+		if (newGroups.length > 0) {
+			groups = [...groups, ...newGroups].filter(
+				(g, index, self) => index === self.findIndex((t) => t.id === g.id)
+			);
+		}
+
+		for (const id of pendingIds) {
+			resolvingGroupIds.delete(id);
+		}
+	};
+
+	$: if (readGroupIds.length > 0 || writeGroupIds.length > 0) {
+		void ensureGroupsByIds([...readGroupIds, ...writeGroupIds]);
+	}
+	$: readGroupIds = getPrincipalIdsByPermission('group', 'read', accessGrants);
+	$: writeGroupIds = getPrincipalIdsByPermission('group', 'write', accessGrants);
+	$: readUserIds = getPrincipalIdsByPermission('user', 'read', accessGrants).filter(
+		(id) => id !== '*'
+	);
+	$: writeUserIds = getPrincipalIdsByPermission('user', 'write', accessGrants).filter(
+		(id) => id !== '*'
+	);
+
+	$: selectedUserIds = Array.from(new Set([...readUserIds, ...writeUserIds]));
+
+	$: selectedUsers = selectedUserIds
+		.map((id) => {
+			return userById[id] ?? { id, name: id, email: '' };
+		})
+		.sort((a, b) => a.name.localeCompare(b.name));
+
+	$: accessGroups = groups
+		.filter((group) => readGroupIds.includes(group.id) || writeGroupIds.includes(group.id))
+		.sort((a, b) => a.name.localeCompare(b.name));
+
+	$: if (selectedUserIds.length > 0) {
+		void ensureUsersByIds(selectedUserIds);
+	}
+
+	$: {
+		if (accessControl !== undefined) {
+			const normalizedGrants = normalizeInputToGrants(accessControl);
+			if (stableStringify(normalizedGrants) !== stableStringify(accessGrants)) {
+				accessGrants = normalizedGrants;
+			}
+		}
+	}
+
+	$: {
+		const normalizedGrants = normalizeInputToGrants(accessGrants);
+		if (stableStringify(normalizedGrants) !== stableStringify(accessGrants)) {
+			accessGrants = normalizedGrants;
+		}
+
+		if (accessControl !== undefined) {
+			const nextAccessControl = grantsToLegacyAccessControl(normalizedGrants);
+			if (stableStringify(nextAccessControl) !== stableStringify(accessControl)) {
+				accessControl = nextAccessControl;
+			}
+		}
+	}
+
+	onMount(async () => {
+		const res = await getGroups(localStorage.token, true).catch((error) => {
+			console.error(error);
+			return [];
+		});
+
+		groups = [...groups, ...res].filter(
+			(g, index, self) => index === self.findIndex((t) => t.id === g.id)
+		);
 	});
 </script>
 
-<div class=" rounded-lg flex flex-col gap-2">
-	<div class="">
-		<div class=" text-xs font-medium mb-2.5 text-gray-500">{$i18n.t('Visibility')}</div>
+<AddAccessModal
+	bind:show={showAddAccessModal}
+	{shareUsers}
+	allowGroups={allowGroups && !namedOnly}
+	{accessGrants}
+	onAdd={handleAddAccess}
+/>
 
-		<div class="flex gap-2.5 items-center mb-1">
+<div class="rounded-lg flex flex-col gap-1">
+	<div class="py-1.5">
+		<div class="flex gap-2 items-center">
 			<div>
-				<div class=" p-2 bg-black/5 dark:bg-white/5 rounded-full">
-					{#if accessControl !== null}
+				<div class="p-2 bg-black/5 dark:bg-white/5 rounded-full">
+					{#if getVisibility(accessGrants ?? []) === 'private'}
 						<svg
 							xmlns="http://www.w3.org/2000/svg"
 							fill="none"
 							viewBox="0 0 24 24"
 							stroke-width="1.5"
 							stroke="currentColor"
-							class="w-5 h-5"
+							class="size-5"
 						>
 							<path
 								stroke-linecap="round"
@@ -154,7 +512,7 @@
 							viewBox="0 0 24 24"
 							stroke-width="1.5"
 							stroke="currentColor"
-							class="w-5 h-5"
+							class="size-5"
 						>
 							<path
 								stroke-linecap="round"
@@ -167,245 +525,195 @@
 			</div>
 
 			<div>
-				<select
-					id="models"
-					class="dark:bg-gray-900 outline-hidden bg-transparent text-sm font-medium block w-fit pr-10 max-w-full placeholder-gray-400"
-					value={accessControl !== null ? 'private' : 'public'}
-					on:change={(e) => {
-						if (e.target.value === 'public') {
-							accessControl = null;
-						} else {
-							accessControl = {
-								read: {
-									group_ids: [],
-									user_ids: []
-								},
-								write: {
-									group_ids: [],
-									user_ids: []
-								}
-							};
-						}
-						onChange(accessControl);
-					}}
+				<Tooltip
+					content={!namedOnly &&
+					!(share && sharePublic) &&
+					getVisibility(accessGrants ?? []) === 'private'
+						? $i18n.t('You do not have permission to make this public')
+						: ''}
 				>
-					<option class=" text-gray-700" value="private" selected>{$i18n.t('Private')}</option>
-					{#if share && canBePublic}
-						<option class=" text-gray-700" value="public" selected>{$i18n.t('Public')}</option>
-					{/if}
-				</select>
+					<select
+						id="models"
+						class="outline-none bg-transparent text-sm font-normal block w-fit pr-8 max-w-full placeholder-gray-400"
+						value={getVisibility(accessGrants ?? [])}
+						on:change={(e) => {
+							setVisibility((e.target as HTMLSelectElement).value as 'private' | 'public' | 'open');
+						}}
+					>
+						<option class=" text-gray-700" value="private">{$i18n.t('Private')}</option>
+						{#if !namedOnly && ((share && sharePublic) || hasPublicReadGrant(accessGrants ?? []))}
+							<option class=" text-gray-700" value="public">{$i18n.t('Public')}</option>
+						{/if}
+						{#if !namedOnly && ((share && shareOpen) || hasAnyoneReadGrant(accessGrants ?? []))}
+							<option class=" text-gray-700" value="open">{$i18n.t('Open')}</option>
+						{/if}
+					</select>
+				</Tooltip>
 
-				<div class=" text-xs text-gray-400 font-medium">
+				<div class=" text-xs text-gray-400 font-normal">
 					{#if namedOnly}
 						{$i18n.t('Encrypted content can only be shared with people you name')}
-					{:else if accessControl !== null}
+					{:else if getVisibility(accessGrants ?? []) === 'private'}
 						{$i18n.t('Only select users and groups with permission can access')}
-					{:else}
+					{:else if getVisibility(accessGrants ?? []) === 'public'}
 						{$i18n.t('Accessible to all users')}
+					{:else}
+						{$i18n.t('Anyone with the link can view')}
 					{/if}
 				</div>
 			</div>
 		</div>
+
+		{#if hasPublicReadGrant(accessGrants ?? []) && !hasAnyoneReadGrant(accessGrants ?? []) && accessRoles.includes('write')}
+			<div class="flex w-full justify-between mt-1.5 ml-0.5">
+				<div class="self-center text-xs">
+					{$i18n.t('Allow public write access')}
+				</div>
+				<Switch
+					state={hasPublicWriteGrant(accessGrants ?? [])}
+					on:change={() => {
+						togglePublicWrite();
+					}}
+				/>
+			</div>
+		{/if}
 	</div>
 
-	{#if share && namedOnly && accessControl !== null}
-		{@const memberIds = accessControl?.read?.user_ids ?? []}
-		<div>
-			<div class="flex justify-between mb-2.5">
-				<div class="text-xs font-medium text-gray-500">
-					{$i18n.t('People')}
-				</div>
+	{#if share}
+		<div class="flex items-center justify-between text-xs font-normal text-gray-500 my-0.5">
+			<div>
+				{$i18n.t('Access List')}
 			</div>
+			<div class="flex gap-1">
+				<button
+					class="px-2 py-1 bg-transparent hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition text-xs font-normal flex items-center gap-1"
+					type="button"
+					on:click={() => {
+						showAddAccessModal = true;
+					}}
+				>
+					<Plus className="size-3" />
+					{$i18n.t('Add Access')}
+				</button>
+			</div>
+		</div>
 
-			{#if memberIds.length > 0}
-				<div class="flex flex-col gap-1.5 mb-2 px-0.5 mx-0.5">
-					{#each memberIds as userId}
-						<div class="flex items-center gap-3 justify-between text-sm w-full transition">
-							<div class="flex items-center gap-1.5 w-full">
-								<div>
-									{knownUsers[userId]?.name ?? userId}
-									<span class="text-xs text-gray-500">{knownUsers[userId]?.email ?? ''}</span>
-								</div>
+		<!-- List -->
+		<div class="flex flex-col gap-1">
+			<!-- Groups -->
+			{#each accessGroups as group}
+				<div class="flex items-center gap-2 justify-between text-sm w-full transition pb-1">
+					<div class="flex items-center gap-2 min-w-0 flex-1">
+						<!-- Placeholder for group icon vs user icon -->
+						<div
+							class="size-5 rounded-full bg-gray-100 dark:bg-gray-850 flex items-center justify-center text-xs"
+						>
+							{group.name.charAt(0).toUpperCase()}
+						</div>
+
+						<div class="truncate text-sm flex items-center gap-2">
+							{group.name}
+							<span class="text-xs text-gray-400 font-normal"
+								>{group?.member_count} {$i18n.t('members')}</span
+							>
+						</div>
+					</div>
+
+					<div class="flex justify-end items-center gap-1.5 shrink-0">
+						{#if accessRoles.includes('write')}
+							<select
+								aria-label={$i18n.t('Access level')}
+								class="bg-transparent text-sm outline-none"
+								value={writeGroupIds.includes(group.id) ? 'write' : 'read'}
+								on:change={(e) => {
+									if (
+										((e.target as HTMLSelectElement).value === 'write') !==
+										writeGroupIds.includes(group.id)
+									) {
+										togglePrincipalWrite('group', group.id);
+									}
+								}}
+							>
+								<option value="read">{$i18n.t('Read')}</option>
+								<option value="write">{$i18n.t('Write')}</option>
+							</select>
+						{:else}
+							<Badge type={'info'} content={$i18n.t('Read')} />
+						{/if}
+
+						<button
+							class="rounded-full p-1 hover:bg-gray-100 dark:hover:bg-gray-850 transition"
+							type="button"
+							on:click={() => {
+								removePrincipal('group', group.id);
+							}}
+						>
+							<XMark className="size-4" />
+						</button>
+					</div>
+				</div>
+			{/each}
+
+			<!-- Users -->
+			{#if shareUsers}
+				{#each selectedUsers as user}
+					<div
+						class="flex items-center gap-2 justify-between text-sm w-full transition border-b border-gray-50 dark:border-gray-850 pb-1.5 last:border-0"
+					>
+						<div class="flex items-center gap-2 min-w-0 flex-1">
+							<img
+								class="rounded-full size-5 object-cover"
+								src={`${WEBUI_API_BASE_URL}/users/${user.id}/profile/image`}
+								alt={user.name ?? user.id}
+							/>
+							<div class="min-w-0 flex-1">
+								<Tooltip content={user.email} placement="top-start">
+									<div class="truncate text-sm">{user.name ?? user.id}</div>
+								</Tooltip>
 							</div>
+						</div>
 
-							<div class="w-full flex justify-end items-center gap-0.5">
-								<button
-									class=""
-									type="button"
-									on:click={() => {
-										if (accessRoles.includes('write')) {
-											if ((accessControl?.write?.user_ids ?? []).includes(userId)) {
-												accessControl.write.user_ids = (
-													accessControl?.write?.user_ids ?? []
-												).filter((id) => id !== userId);
-											} else {
-												accessControl.write.user_ids = [
-													...(accessControl?.write?.user_ids ?? []),
-													userId
-												];
-											}
-											onChange(accessControl);
+						<div class="flex justify-end items-center gap-1.5 shrink-0">
+							{#if accessRoles.includes('write')}
+								<select
+									aria-label={$i18n.t('Access level')}
+									class="bg-transparent text-sm outline-none"
+									value={writeUserIds.includes(user.id) ? 'write' : 'read'}
+									on:change={(e) => {
+										if (
+											((e.target as HTMLSelectElement).value === 'write') !==
+											writeUserIds.includes(user.id)
+										) {
+											togglePrincipalWrite('user', user.id);
 										}
 									}}
 								>
-									{#if (accessControl?.write?.user_ids ?? []).includes(userId)}
-										<Badge type={'success'} content={$i18n.t('Write')} />
-									{:else}
-										<Badge type={'info'} content={$i18n.t('Read')} />
-									{/if}
-								</button>
+									<option value="read">{$i18n.t('Read')}</option>
+									<option value="write">{$i18n.t('Write')}</option>
+								</select>
+							{:else}
+								<Badge type={'info'} content={$i18n.t('Read')} />
+							{/if}
 
-								<button
-									class=" rounded-full p-1 hover:bg-gray-100 dark:hover:bg-gray-850 transition"
-									type="button"
-									on:click={() => removeUser(userId)}
-								>
-									<XMark />
-								</button>
-							</div>
+							<button
+								class="rounded-full p-1 hover:bg-gray-100 dark:hover:bg-gray-850 transition"
+								type="button"
+								on:click={() => {
+									removePrincipal('user', user.id);
+								}}
+							>
+								<XMark className="size-4" />
+							</button>
 						</div>
-					{/each}
-				</div>
+					</div>
+				{/each}
 			{/if}
 
-			<div class="mb-1 px-0.5">
-				<input
-					class="w-full text-sm bg-transparent outline-hidden dark:placeholder-gray-500"
-					placeholder={$i18n.t('Search for a person to share with')}
-					bind:value={userQuery}
-					on:input={findUsers}
-				/>
-
-				{#if userResults.length > 0}
-					<div class="flex flex-col gap-1 mt-2">
-						{#each userResults.filter((user) => !memberIds.includes(user.id)) as user}
-							<button
-								class="flex items-center gap-1.5 text-sm text-left px-1 py-1 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-850 transition"
-								type="button"
-								on:click={() => addUser(user)}
-							>
-								<Plus className="size-3" />
-								<span>{user.name}</span>
-								<span class="text-xs text-gray-500">{user.email}</span>
-							</button>
-						{/each}
-					</div>
-				{/if}
-			</div>
-		</div>
-	{/if}
-
-	{#if share && !namedOnly}
-		{#if accessControl !== null}
-			{@const accessGroups = groups.filter((group) =>
-				(accessControl?.read?.group_ids ?? []).includes(group.id)
-			)}
-			<div>
-				<div class="">
-					<div class="flex justify-between mb-2.5">
-						<div class="text-xs font-medium text-gray-500">
-							{$i18n.t('Groups')}
-						</div>
-					</div>
-
-					{#if accessGroups.length > 0}
-						<div class="flex flex-col gap-1.5 mb-2 px-0.5 mx-0.5">
-							{#each accessGroups as group}
-								<div class="flex items-center gap-3 justify-between text-sm w-full transition">
-									<div class="flex items-center gap-1.5 w-full">
-										<div>
-											{group.name} <span class="text-xs text-gray-500">{group?.member_count}</span>
-										</div>
-									</div>
-
-									<div class="w-full flex justify-end items-center gap-0.5">
-										<button
-											class=""
-											type="button"
-											on:click={() => {
-												if (accessRoles.includes('write')) {
-													if ((accessControl?.write?.group_ids ?? []).includes(group.id)) {
-														accessControl.write.group_ids = (
-															accessControl?.write?.group_ids ?? []
-														).filter((group_id) => group_id !== group.id);
-													} else {
-														accessControl.write.group_ids = [
-															...(accessControl?.write?.group_ids ?? []),
-															group.id
-														];
-													}
-													onChange(accessControl);
-												}
-											}}
-										>
-											{#if (accessControl?.write?.group_ids ?? []).includes(group.id)}
-												<Badge type={'success'} content={$i18n.t('Write')} />
-											{:else}
-												<Badge type={'info'} content={$i18n.t('Read')} />
-											{/if}
-										</button>
-
-										<button
-											class=" rounded-full p-1 hover:bg-gray-100 dark:hover:bg-gray-850 transition"
-											type="button"
-											on:click={() => {
-												accessControl.read.group_ids = (
-													accessControl?.read?.group_ids ?? []
-												).filter((id) => id !== group.id);
-												accessControl.write.group_ids = (
-													accessControl?.write?.group_ids ?? []
-												).filter((id) => id !== group.id);
-												onChange(accessControl);
-											}}
-										>
-											<XMark />
-										</button>
-									</div>
-								</div>
-							{/each}
-						</div>
-					{/if}
-
-					<!-- <div class="flex items-center justify-center">
-						<div class="text-gray-500 text-xs text-center py-2 px-10">
-							{$i18n.t('No groups with access, add a group to grant access')}
-						</div>
-					</div> -->
-
-					<div class="mb-1">
-						<div class="flex w-full">
-							<div class="flex flex-1 items-center">
-								<div class="w-full px-0.5">
-									<select
-										class=" outline-hidden bg-transparent text-sm block w-full pr-10 max-w-full
-									{selectedGroupId ? '' : 'text-gray-500'}
-									dark:placeholder-gray-500"
-										bind:value={selectedGroupId}
-										on:change={() => {
-											if (selectedGroupId !== '') {
-												accessControl.read.group_ids = [
-													...(accessControl?.read?.group_ids ?? []),
-													selectedGroupId
-												];
-
-												selectedGroupId = '';
-												onChange(accessControl);
-											}
-										}}
-									>
-										<option class=" text-gray-700" value="" disabled selected
-											>{$i18n.t('Select a group')}</option
-										>
-										{#each groups.filter((group) => !(accessControl?.read?.group_ids ?? []).includes(group.id)) as group}
-											<option class=" text-gray-700" value={group.id}>{group.name}</option>
-										{/each}
-									</select>
-								</div>
-							</div>
-						</div>
-					</div>
+			{#if getVisibility(accessGrants ?? []) === 'private' && accessGroups.length === 0 && selectedUsers.length === 0}
+				<div class="text-xs text-gray-500 text-center py-3">
+					{$i18n.t('No access grants. Private to you.')}
 				</div>
-			</div>
-		{/if}
+			{/if}
+		</div>
 	{/if}
 </div>
