@@ -170,7 +170,10 @@
 								placement="top"
 								className=" flex items-center min-w-0 "
 							>
-								<span class="line-clamp-1">
+								<!-- text-left: when the name is clamped its box fills the row, and the
+								     page-level text-center would strand the text mid-box, away from
+								     the model icon. -->
+								<span class="line-clamp-1 text-left">
 									{models[selectedModelIdx]?.name}
 								</span>
 							</Tooltip>
