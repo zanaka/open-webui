@@ -42,6 +42,7 @@ BUILDERS = {
         chat={"messages": [{"role": "user", "content": f"{MARKER} body"}]},
         summary=f"{MARKER} summary",
         tasks={"note": f"{MARKER} task"},
+        variables={"secret": f"{MARKER} value"},
         meta={"tags": []},
         created_at=_now(),
         updated_at=_now(),

@@ -84,10 +84,11 @@ class EncryptionPolicy:
 
 
 ENCRYPTED_MODELS: dict[type, EncryptionPolicy] = {
-    # `tasks` and `summary` are upstream's chat auto-summary/task columns —
-    # conversation content, so they travel with the chat body.
+    # `tasks` and `summary` are upstream's chat auto-summary/task columns, and
+    # `variables` holds the person's own substitution values — conversation
+    # content all three, so they travel with the chat body.
     Chat: EncryptionPolicy(
-        owner="user_id", text=("title", "summary"), json=("chat", "tasks")
+        owner="user_id", text=("title", "summary"), json=("chat", "tasks", "variables")
     ),
     # The normalized message store upstream reads chat content from. `usage`,
     # `role`, `model_id` and the tree columns stay clear: the admin usage
