@@ -1,11 +1,9 @@
 import time
 
 import pytest
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
+from conftest import run, sqlite_test_database
+from sqlalchemy import text
 
-from open_webui.internal import db as internal_db
-from open_webui.internal.db import Base
 from open_webui.models.folders import Folder, FolderForm, FolderUpdateForm, Folders
 from open_webui.utils import crypto_context
 from open_webui.utils.crypto_context import cache_dek, set_current_user_id
@@ -18,25 +16,21 @@ USER_ID = "folder-user"
 
 
 @pytest.fixture
-def db(monkeypatch):
-    monkeypatch.setattr(internal_db, "DATABASE_ENABLE_SESSION_SHARING", True)
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine, tables=[Folder.__table__])
-    session = sessionmaker(bind=engine)()
+def db(monkeypatch, tmp_path):
+    with sqlite_test_database(
+        monkeypatch, tmp_path / "test.db", tables=[Folder.__table__]
+    ) as session:
+        cache_dek(USER_ID, generate_dek(), jti="jti-1", expires_at=time.time() + 3600)
+        set_current_user_id(USER_ID)
 
-    cache_dek(USER_ID, generate_dek(), jti="jti-1", expires_at=time.time() + 3600)
-    set_current_user_id(USER_ID)
+        yield session
 
-    yield session
-
-    set_current_user_id(None)
-    session.close()
-    engine.dispose()
-    crypto_context._dek_cache.clear()
+        set_current_user_id(None)
+        crypto_context._dek_cache.clear()
 
 
 def _add(db, name):
-    return Folders.insert_new_folder(USER_ID, FolderForm(name=name), db=db)
+    return run(Folders.insert_new_folder(USER_ID, FolderForm(name=name)))
 
 
 def _raw_names(db):
@@ -53,9 +47,9 @@ class TestAtRest:
         created = _add(db, "Project Falcon")
 
         assert created.name == "Project Falcon"
-        assert Folders.get_folder_by_id_and_user_id(created.id, USER_ID, db=db).name == (
-            "Project Falcon"
-        )
+        assert run(
+            Folders.get_folder_by_id_and_user_id(created.id, USER_ID)
+        ).name == ("Project Falcon")
 
 
 class TestLookupByName:
@@ -66,8 +60,10 @@ class TestLookupByName:
         created = _add(db, "Project Falcon")
         _add(db, "Something Else")
 
-        found = Folders.get_folder_by_parent_id_and_user_id_and_name(
-            None, USER_ID, "Project Falcon", db=db
+        found = run(
+            Folders.get_folder_by_parent_id_and_user_id_and_name(
+                None, USER_ID, "Project Falcon"
+            )
         )
 
         assert found.id == created.id
@@ -75,8 +71,10 @@ class TestLookupByName:
     def test_is_case_insensitive(self, db):
         created = _add(db, "Project Falcon")
 
-        found = Folders.get_folder_by_parent_id_and_user_id_and_name(
-            None, USER_ID, "project falcon", db=db
+        found = run(
+            Folders.get_folder_by_parent_id_and_user_id_and_name(
+                None, USER_ID, "project falcon"
+            )
         )
 
         assert found.id == created.id
@@ -85,8 +83,10 @@ class TestLookupByName:
         _add(db, "Project Falcon")
 
         assert (
-            Folders.get_folder_by_parent_id_and_user_id_and_name(
-                None, USER_ID, "No Such Folder", db=db
+            run(
+                Folders.get_folder_by_parent_id_and_user_id_and_name(
+                    None, USER_ID, "No Such Folder"
+                )
             )
             is None
         )
@@ -97,8 +97,10 @@ class TestRenameCollision:
         _add(db, "Project Falcon")
         other = _add(db, "Something Else")
 
-        result = Folders.update_folder_by_id_and_user_id(
-            other.id, USER_ID, FolderUpdateForm(name="Project Falcon"), db=db
+        result = run(
+            Folders.update_folder_by_id_and_user_id(
+                other.id, USER_ID, FolderUpdateForm(name="Project Falcon")
+            )
         )
 
         assert result is None
@@ -106,8 +108,10 @@ class TestRenameCollision:
     def test_renaming_to_a_free_name_works(self, db):
         folder = _add(db, "Project Falcon")
 
-        result = Folders.update_folder_by_id_and_user_id(
-            folder.id, USER_ID, FolderUpdateForm(name="Project Condor"), db=db
+        result = run(
+            Folders.update_folder_by_id_and_user_id(
+                folder.id, USER_ID, FolderUpdateForm(name="Project Condor")
+            )
         )
 
         assert result.name == "Project Condor"
@@ -116,8 +120,10 @@ class TestRenameCollision:
     def test_keeping_its_own_name_is_allowed(self, db):
         folder = _add(db, "Project Falcon")
 
-        result = Folders.update_folder_by_id_and_user_id(
-            folder.id, USER_ID, FolderUpdateForm(name="Project Falcon"), db=db
+        result = run(
+            Folders.update_folder_by_id_and_user_id(
+                folder.id, USER_ID, FolderUpdateForm(name="Project Falcon")
+            )
         )
 
         assert result is not None
@@ -125,8 +131,10 @@ class TestRenameCollision:
     def test_updating_only_data_leaves_the_name_alone(self, db):
         folder = _add(db, "Project Falcon")
 
-        result = Folders.update_folder_by_id_and_user_id(
-            folder.id, USER_ID, FolderUpdateForm(data={"colour": "red"}), db=db
+        result = run(
+            Folders.update_folder_by_id_and_user_id(
+                folder.id, USER_ID, FolderUpdateForm(data={"colour": "red"})
+            )
         )
 
         assert result.name == "Project Falcon"
@@ -138,7 +146,7 @@ class TestSearch:
         created = _add(db, "Project Falcon")
         _add(db, "Something Else")
 
-        found = Folders.search_folders_by_names(USER_ID, ["project falcon"], db=db)
+        found = run(Folders.search_folders_by_names(USER_ID, ["project falcon"]))
 
         assert [folder.id for folder in found] == [created.id]
 
@@ -146,6 +154,6 @@ class TestSearch:
         created = _add(db, "Project Falcon")
         _add(db, "Something Else")
 
-        found = Folders.search_folders_by_name_contains(USER_ID, "falcon", db=db)
+        found = run(Folders.search_folders_by_name_contains(USER_ID, "falcon"))
 
         assert [folder.id for folder in found] == [created.id]

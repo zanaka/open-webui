@@ -39,6 +39,7 @@ from open_webui.models.auths import Auths
 from open_webui.models.config import Config
 from open_webui.models.users import Users
 from open_webui.utils.access_control import has_permission
+from open_webui.utils.crypto_context import get_cached_dek, set_current_user_id
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.misc import parse_duration
 from pytz import UTC
@@ -226,14 +227,20 @@ async def verify_password(plain_password: str, hashed_password: str) -> bool:
 # Let the one who signed this token be remembered at every gate,
 # and may the claims therein honor the creator long after
 # the session has closed.
-def create_token(data: dict, expires_delta: Union[timedelta, None] = None) -> str:
+def create_token(
+    data: dict,
+    expires_delta: Union[timedelta, None] = None,
+    jti: Union[str, None] = None,
+) -> str:
     payload = data.copy()
 
     if expires_delta:
         expire = datetime.now(UTC) + expires_delta
         payload.update({'exp': expire})
 
-    jti = str(uuid.uuid4())
+    # The caller may fix the jti so the DEK cache can be keyed to this session.
+    if jti is None:
+        jti = str(uuid.uuid4())
     payload.update({'jti': jti, 'iat': datetime.now(UTC)})
 
     encoded_jwt = jwt.encode(payload, SESSION_SECRET, algorithm=ALGORITHM)
@@ -372,6 +379,7 @@ async def get_current_user(
     # auth by api key
     if token.startswith('sk-'):
         user = await get_current_user_by_api_key(request, token)
+        set_current_user_id(user.id)
 
         # Add user info to current span
         if ENABLE_OTEL:
@@ -412,6 +420,7 @@ async def get_current_user(
                     detail=ERROR_MESSAGES.INVALID_TOKEN,
                 )
             else:
+                set_current_user_id(user.id)
                 if WEBUI_AUTH_TRUSTED_EMAIL_HEADER:
                     trusted_email = request.headers.get(WEBUI_AUTH_TRUSTED_EMAIL_HEADER, '').lower()
                     if trusted_email and user.email != trusted_email:
@@ -525,6 +534,13 @@ def get_verified_user(user=Depends(get_current_user)):
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
+    # Without the DEK nothing of this user's can be read or written; the only
+    # way to get it back into the cache is to log in again.
+    if get_cached_dek(user.id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail='Session expired. Please log in again.',
+        )
     return user
 
 
@@ -580,6 +596,11 @@ def get_admin_user(user=Depends(get_current_user)):
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
+    if get_cached_dek(user.id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail='Session expired. Please log in again.',
+        )
     return user
 
 
@@ -600,15 +621,16 @@ async def create_admin_user(email: str, password: str, name: str = 'Admin'):
     log.info('Creating admin account from environment variables: %s', email)
     try:
         hashed = await get_password_hash(password)
-        user = await Auths.insert_new_auth(
+        user_with_dek = await Auths.insert_new_auth(
             email=email.lower(),
-            password=hashed,
+            hashed_password=hashed,
             name=name,
+            raw_password=password,
             role='admin',
         )
-        if user:
+        if user_with_dek:
             log.info('Admin account created successfully: %s', email)
-            return user
+            return user_with_dek.user
         else:
             log.error('Failed to create admin account from environment variables')
             return None

@@ -2092,6 +2092,14 @@ class OAuthManager:
                         log.warning('Username claim is missing, using email as name')
                         name = email
 
+                    # An OAuth login carries no password, so there is nothing
+                    # to derive the key-encryption key from: the account could
+                    # be created, but its encrypted data could never be opened.
+                    raise HTTPException(
+                        501,
+                        detail='To use OAuth, provide data encryption key to raw_password argument.',
+                    )
+
                     user = await Auths.insert_new_auth(
                         email=email,
                         password=await get_password_hash(str(uuid.uuid4())),  # Random password, not used

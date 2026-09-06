@@ -46,7 +46,7 @@ async def has_access_to_file(
     # An object (knowledge base or workspace model) confers write/delete on a file only when
     # the object's OWNER owns that file; otherwise a read-only file laundered into an object
     # the user controls would gain write/delete on it (CWE-863). Read access is unaffected.
-    knowledge_bases = await Knowledges.get_knowledges_by_file_id(file_id, db=db)
+    knowledge_bases = await Knowledges.get_knowledges_by_file_id(file_id, user.id, db=db)
     if user_group_ids is None:
         user_group_ids = {group.id for group in await Groups.get_groups_by_member_id(user.id, db=db)}
     for knowledge_base in knowledge_bases:

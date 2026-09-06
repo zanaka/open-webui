@@ -84,7 +84,10 @@ class AsyncVectorDBClient:
 
     @property
     def supports_hybrid_search(self) -> bool:
-        return type(self._sync).hybrid_search is not VectorDBBase.hybrid_search
+        # The encrypting wrapper exposes no hybrid_search: server-side BM25
+        # cannot match over ciphertext, so a wrapped client never supports it.
+        hybrid_search = getattr(type(self._sync), "hybrid_search", None)
+        return hybrid_search is not None and hybrid_search is not VectorDBBase.hybrid_search
 
     async def has_collection(self, collection_name: str) -> bool:
         return await asyncio.to_thread(self._sync.has_collection, collection_name)
@@ -92,20 +95,24 @@ class AsyncVectorDBClient:
     async def delete_collection(self, collection_name: str) -> None:
         return await asyncio.to_thread(self._sync.delete_collection, collection_name)
 
-    async def insert(self, collection_name: str, items: List[VectorItem]) -> None:
-        return await asyncio.to_thread(self._sync.insert, collection_name, items)
+    async def insert(self, collection_name: str, items: List[VectorItem], *, key: bytes) -> None:
+        return await asyncio.to_thread(self._sync.insert, collection_name, items, key=key)
 
-    async def upsert(self, collection_name: str, items: List[VectorItem]) -> None:
-        return await asyncio.to_thread(self._sync.upsert, collection_name, items)
+    async def upsert(self, collection_name: str, items: List[VectorItem], *, key: bytes) -> None:
+        return await asyncio.to_thread(self._sync.upsert, collection_name, items, key=key)
 
     async def search(
         self,
         collection_name: str,
         vectors: List[List[Union[float, int]]],
+        *,
+        key: bytes,
         filter: Optional[Dict] = None,
         limit: int = 10,
     ) -> Optional[SearchResult]:
-        return await asyncio.to_thread(self._sync.search, collection_name, vectors, filter, limit)
+        return await asyncio.to_thread(
+            self._sync.search, collection_name, vectors, key=key, filter=filter, limit=limit
+        )
 
     async def hybrid_search(
         self,
@@ -130,20 +137,24 @@ class AsyncVectorDBClient:
         self,
         collection_name: str,
         filter: Dict,
+        *,
+        key: bytes,
         limit: Optional[int] = None,
     ) -> Optional[GetResult]:
-        return await asyncio.to_thread(self._sync.query, collection_name, filter, limit)
+        return await asyncio.to_thread(self._sync.query, collection_name, filter, key=key, limit=limit)
 
-    async def get(self, collection_name: str) -> Optional[GetResult]:
-        return await asyncio.to_thread(self._sync.get, collection_name)
+    async def get(self, collection_name: str, *, key: bytes) -> Optional[GetResult]:
+        return await asyncio.to_thread(self._sync.get, collection_name, key=key)
 
     async def delete(
         self,
         collection_name: str,
         ids: Optional[List[str]] = None,
         filter: Optional[Dict] = None,
+        *,
+        key: Optional[bytes] = None,
     ) -> None:
-        return await asyncio.to_thread(self._sync.delete, collection_name, ids, filter)
+        return await asyncio.to_thread(self._sync.delete, collection_name, ids, filter, key=key)
 
     async def reset(self) -> None:
         return await asyncio.to_thread(self._sync.reset)

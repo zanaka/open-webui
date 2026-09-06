@@ -2,6 +2,7 @@ import logging
 import time
 from typing import Optional
 
+from open_webui.crypto_exceptions import CryptoPolicyError
 from open_webui.internal.db import Base, get_async_db_context
 from open_webui.models.access_grants import AccessGrantModel, AccessGrants
 from open_webui.models.groups import Groups
@@ -142,6 +143,10 @@ class SkillsTable:
                     return await self._to_skill_model(result, db=db)
                 else:
                     return None
+            except CryptoPolicyError:
+                # A refused audience is an answer for the caller, not a failure
+                # to write, so it must not be flattened into None here.
+                raise
             except Exception as e:
                 log.exception(f'Error creating a new skill: {e}')
                 return None
@@ -228,18 +233,12 @@ class SkillsTable:
                 # Join with User table for user filtering
                 stmt = select(Skill, User).outerjoin(User, User.id == Skill.user_id)
 
+                query_key = None
                 if filter:
+                    # Skill.name/description are encrypted at rest, so their
+                    # ciphertext is not matchable in SQL; the query is applied
+                    # in Python once the rows are loaded and decrypted.
                     query_key = filter.get('query')
-                    if query_key:
-                        stmt = stmt.filter(
-                            or_(
-                                Skill.name.ilike(f'%{query_key}%'),
-                                Skill.description.ilike(f'%{query_key}%'),
-                                Skill.id.ilike(f'%{query_key}%'),
-                                User.name.ilike(f'%{query_key}%'),
-                                User.email.ilike(f'%{query_key}%'),
-                            )
-                        )
 
                     view_option = filter.get('view_option')
                     if view_option == 'created':
@@ -260,12 +259,8 @@ class SkillsTable:
                 order_by = filter.get('order_by')
                 direction = filter.get('direction')
 
-                if order_by == 'name':
-                    if direction == 'asc':
-                        stmt = stmt.order_by(Skill.name.asc())
-                    else:
-                        stmt = stmt.order_by(Skill.name.desc())
-                elif order_by == 'created_at':
+                # Name ordering happens in Python below, on decrypted names.
+                if order_by == 'created_at':
                     if direction == 'asc':
                         stmt = stmt.order_by(Skill.created_at.asc())
                     else:
@@ -278,17 +273,32 @@ class SkillsTable:
                 else:
                     stmt = stmt.order_by(Skill.updated_at.desc())
 
-                # Count BEFORE pagination
-                count_result = await db.execute(select(func.count()).select_from(stmt.subquery()))
-                total = count_result.scalar()
-
-                if skip:
-                    stmt = stmt.offset(skip)
-                if limit:
-                    stmt = stmt.limit(limit)
-
                 result = await db.execute(stmt)
                 items = result.all()
+
+                if query_key:
+                    lowered = query_key.lower()
+                    items = [
+                        (skill, user)
+                        for skill, user in items
+                        if lowered in (skill.name or '').lower()
+                        or lowered in (skill.description or '').lower()
+                        or lowered in skill.id.lower()
+                        or (user and lowered in (user.name or '').lower())
+                        or (user and lowered in (user.email or '').lower())
+                    ]
+
+                if order_by == 'name':
+                    items.sort(
+                        key=lambda pair: (pair[0].name or '').lower(),
+                        reverse=direction != 'asc',
+                    )
+
+                total = len(items)
+                if skip:
+                    items = items[skip:]
+                if limit:
+                    items = items[:limit]
 
                 skill_ids = [skill.id for skill, _ in items]
                 grants_map = await AccessGrants.get_grants_by_resources('skill', skill_ids, db=db)
@@ -319,14 +329,21 @@ class SkillsTable:
         try:
             async with get_async_db_context(db) as db:
                 access_grants = updated.pop('access_grants', None)
-                await db.execute(update(Skill).filter_by(id=id).values(**updated, updated_at=int(time.time())))
+                # Loaded and mutated through the ORM: a Core UPDATE would slip
+                # past the encryption hooks and write the new values in clear.
+                skill = await db.get(Skill, id)
+                if not skill:
+                    return None
+                for field, value in updated.items():
+                    setattr(skill, field, value)
+                skill.updated_at = int(time.time())
                 await db.commit()
                 if access_grants is not None:
                     await AccessGrants.set_access_grants('skill', id, access_grants, db=db)
 
-                # populate_existing: the Core update above bypasses any identity-map copy
-                skill = await db.get(Skill, id, populate_existing=True)
                 return await self._to_skill_model(skill, db=db)
+        except CryptoPolicyError:
+            raise
         except Exception:
             return None
 
@@ -349,8 +366,12 @@ class SkillsTable:
     async def delete_skill_by_id(self, id: str, db: Optional[AsyncSession] = None) -> bool:
         try:
             async with get_async_db_context(db) as db:
+                from open_webui.utils.encrypted_models import delete_without_reading_async
+
                 await AccessGrants.revoke_all_access('skill', id, db=db)
-                await db.execute(delete(Skill).filter_by(id=id))
+                # Deletes by statement (no load, no decrypt) and removes the
+                # wrapped resource-key copies alongside the row.
+                await delete_without_reading_async(db, Skill, [id])
                 await db.commit()
 
                 return True

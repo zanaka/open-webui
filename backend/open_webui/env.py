@@ -360,6 +360,12 @@ except ValueError:
     DATABASE_USER_ACTIVE_STATUS_UPDATE_INTERVAL = 60.0
 
 DATABASE_ENABLE_SESSION_SHARING = os.getenv('DATABASE_ENABLE_SESSION_SHARING', 'False').lower() == 'true'
+
+####################################
+# EXPIRING CACHE CLEANUP OPTIONS
+####################################
+
+EXPIRING_CACHE_CLEANUP_INTERVAL = int(os.environ.get('EXPIRING_CACHE_CLEANUP_INTERVAL', 60 * 60 * 24))
 ENABLE_PUBLIC_ACTIVE_USERS_COUNT = os.getenv('ENABLE_PUBLIC_ACTIVE_USERS_COUNT', 'True').lower() == 'true'
 RESET_CONFIG_ON_START = os.getenv('RESET_CONFIG_ON_START', 'False').lower() == 'true'
 ENABLE_REALTIME_CHAT_SAVE = os.getenv('ENABLE_REALTIME_CHAT_SAVE', 'False').lower() == 'true'

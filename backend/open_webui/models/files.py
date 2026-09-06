@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import logging
 import time
 
@@ -13,6 +14,13 @@ from sqlalchemy import JSON, BigInteger, Column, String, Text, delete, func, sel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 log = logging.getLogger(__name__)
+
+
+FILE_COLLECTION_PREFIX = 'file-'
+
+
+def is_file_collection(collection_name: str) -> bool:
+    return isinstance(collection_name, str) and collection_name.startswith(FILE_COLLECTION_PREFIX)
 
 
 class File(Base):  # uploaded file record
@@ -195,10 +203,15 @@ class FilesTable:
             except Exception:
                 return None
 
-    async def get_files(self, db: AsyncSession | None = None) -> list[FileModel]:
+    async def get_file_hash_by_id(self, id: str, db: AsyncSession | None = None) -> str | None:
+        """Read the owner-keyed hash token without loading — and therefore
+        without decrypting — the row, so callers holding no key still work."""
         async with get_async_db_context(db) as db:
-            result = await db.execute(select(File))
-            return [FileModel.model_validate(file) for file in result.scalars().all()]
+            try:
+                result = await db.execute(select(File.hash).where(File.id == id))
+                return result.scalar()
+            except Exception:
+                return None
 
     async def count_files_by_user_id(
         self,
@@ -230,20 +243,18 @@ class FilesTable:
         self, ids: list[str], db: AsyncSession | None = None
     ) -> list[FileMetadataResponse]:
         async with get_async_db_context(db) as db:
-            result = await db.execute(
-                select(File.id, File.hash, File.meta, File.created_at, File.updated_at)
-                .filter(File.id.in_(ids))
-                .order_by(File.updated_at.desc())
-            )
+            # Load full rows rather than a column select: meta is encrypted at
+            # the column level, so it is only readable via the ORM load hook.
+            result = await db.execute(select(File).filter(File.id.in_(ids)).order_by(File.updated_at.desc()))
             return [
                 FileMetadataResponse(
-                    id=row.id,
-                    hash=row.hash,
-                    meta=row.meta,
-                    created_at=row.created_at,
-                    updated_at=row.updated_at,
+                    id=file.id,
+                    hash=file.hash,
+                    meta=file.meta,
+                    created_at=file.created_at,
+                    updated_at=file.updated_at,
                 )
-                for row in result.all()
+                for file in result.scalars().all()
             ]
 
     async def get_files_by_user_id(self, user_id: str, db: AsyncSession | None = None) -> list[FileModel]:
@@ -271,29 +282,6 @@ class FilesTable:
 
             return FileListResponse(items=items, total=total)
 
-    @staticmethod
-    def _glob_to_like_pattern(glob: str) -> str:
-        """
-        Convert a glob/fnmatch pattern to a SQL LIKE pattern.
-
-        Escapes SQL special characters and converts glob wildcards:
-        - `*` becomes `%` (match any sequence of characters)
-        - `?` becomes `_` (match exactly one character)
-
-        Args:
-            glob: A glob pattern (e.g., "*.txt", "file?.doc")
-
-        Returns:
-            A SQL LIKE compatible pattern with proper escaping.
-        """
-        # Escape SQL special characters first, then convert glob wildcards
-        pattern = glob.replace('\\', '\\\\')
-        pattern = pattern.replace('%', '\\%')
-        pattern = pattern.replace('_', '\\_')
-        pattern = pattern.replace('*', '%')
-        pattern = pattern.replace('?', '_')
-        return pattern
-
     async def search_files(
         self,
         user_id: str | None = None,
@@ -305,6 +293,9 @@ class FilesTable:
         """
         Search files with glob pattern matching, optional user filter, and pagination.
 
+        Filename is encrypted at the column level, so the pattern match runs
+        in Python after the load hook has decrypted each row.
+
         Args:
             user_id: Filter by user ID. If None, returns files for all users.
             filename: Glob pattern to match filenames (e.g., "*.txt"). Default "*" matches all.
@@ -313,20 +304,20 @@ class FilesTable:
             db: Optional database session.
 
         Returns:
-            List of matching FileModel objects, ordered by created_at descending.
+            List of matching FileModel objects, ordered by updated_at descending.
         """
         async with get_async_db_context(db) as db:
             stmt = select(File)
-
             if user_id:
                 stmt = stmt.filter_by(user_id=user_id)
 
-            pattern = self._glob_to_like_pattern(filename)
-            if pattern != '%':
-                stmt = stmt.filter(File.filename.ilike(pattern, escape='\\'))
+            result = await db.execute(stmt.order_by(File.updated_at.desc()))
+            files = result.scalars().all()
+            if filename != '*':
+                pattern = filename.lower()
+                files = [file for file in files if fnmatch.fnmatch((file.filename or '').lower(), pattern)]
 
-            result = await db.execute(stmt.order_by(File.created_at.desc(), File.id.desc()).offset(skip).limit(limit))
-            return [FileModel.model_validate(file) for file in result.scalars().all()]
+            return [FileModel.model_validate(file) for file in files[skip : skip + limit]]
 
     async def update_file_by_id(
         self, id: str, form_data: FileUpdateForm, db: AsyncSession | None = None

@@ -41,6 +41,7 @@ from open_webui.utils.chat_fork import build_fork_history
 from open_webui.utils.context_compaction import compact_chat_branch, get_chat_context_usage
 from open_webui.utils.misc import get_message_list
 from open_webui.utils.models import get_all_models
+from open_webui.utils.tag_tokens import normalize_tag_name, tag_id
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -1208,28 +1209,12 @@ async def get_shared_session_user_chat_list(
 async def get_shared_chat_by_id(
     share_id: str, user=Depends(get_optional_verified_user), db: AsyncSession = Depends(get_async_session)
 ):
-    shared = await SharedChats.get_by_id(share_id, db=db)
-    if shared:
-        if await is_open_shared_chat(shared, db=db) or (
-            user is not None and await can_read_shared_chat(user, shared, db=db)
-        ):
-            chat = await Chats.get_chat_by_share_id(share_id, db=db)
-            if chat:
-                return ChatResponse.model_validate(chat, from_attributes=True)
-
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=ERROR_MESSAGES.ACCESS_PROHIBITED if user else ERROR_MESSAGES.INVALID_TOKEN,
-        )
-
-    # Fallback: admins can also access any chat directly by chat ID
-    chat = None
-    if user is not None and user.role == 'admin' and ENABLE_ADMIN_CHAT_ACCESS:
-        chat = await Chats.get_chat_by_id(share_id, db=db)
-        if chat:
-            return ChatResponse.model_validate(chat, from_attributes=True)
-
-    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.NOT_FOUND)
+    # Counterpart of share_chat_by_id: no share can be created, and this path
+    # loaded the owner's own chat row, decrypting it for whoever held the link.
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail="Chat sharing is unavailable: a share link has no named recipient whose key could wrap the chat's data encryption key.",
+    )
 
 
 ############################
@@ -1936,44 +1921,13 @@ async def share_chat_by_id(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    if user.role != 'admin' and not await has_permission(user.id, 'chat.share', await Config.get('user.permissions')):
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
-
-    chat = await Chats.get_chat_by_id_and_user_id(id, user.id, db=db)
-    if not chat:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
-
-    # If a share already exists, re-snapshot it
-    if chat.share_id:
-        shared = await SharedChats.update(chat.share_id, db=db)
-        if shared:
-            chat = await Chats.get_chat_by_id(id, db=db)
-            await publish_event(
-                request,
-                EVENTS.CHAT_SHARED,
-                actor=user,
-                subject_id=id,
-                data={'share_id': chat.share_id, 'updated': True},
-            )
-            return ChatResponse.model_validate(chat, from_attributes=True)
-
-    # Create a new share
-    shared = await SharedChats.create(id, user.id, db=db)
-    if not shared:
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail=ERROR_MESSAGES.DEFAULT())
-
-    chat = await Chats.update_chat_share_id_by_id(id, shared.id, db=db)
-    if not chat:
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail=ERROR_MESSAGES.DEFAULT())
-
-    await publish_event(
-        request,
-        EVENTS.CHAT_SHARED,
-        actor=user,
-        subject_id=id,
-        data={'share_id': shared.id},
+    # A share link has no named recipient, so there is no public key to wrap the
+    # chat's encryption key with. Encrypted knowledge sharing is named-recipient
+    # only for the same reason (see utils/resource_crypto.py).
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail="Chat sharing is unavailable: a share link has no named recipient whose key could wrap the chat's data encryption key.",
     )
-    return ChatResponse.model_validate(chat, from_attributes=True)
 
 
 # --- Delete Shared Chat ---
@@ -2176,15 +2130,14 @@ async def add_tag_by_id_and_tag_name(
     chat = await Chats.get_chat_by_id_and_user_id(id, user.id, db=db)
     if chat:
         tags = chat.meta.get('tags', [])
-        tag_id = form_data.name.replace(' ', '_').lower()
 
-        if tag_id == 'none':
+        if normalize_tag_name(form_data.name) == 'none':
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=ERROR_MESSAGES.DEFAULT("Tag name cannot be 'None'"),
             )
 
-        if tag_id not in tags:
+        if tag_id(form_data.name, user.id) not in tags:
             await Chats.add_chat_tag_by_id_and_user_id_and_tag_name(id, user.id, form_data.name, db=db)
             await publish_event(
                 request,

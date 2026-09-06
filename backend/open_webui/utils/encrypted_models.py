@@ -11,19 +11,30 @@ is the user making the request.
 
 import logging
 from dataclasses import dataclass
+from typing import Optional
 
-from sqlalchemy import event
-from sqlalchemy.orm import Session
+from sqlalchemy import event, inspect, select
+from sqlalchemy import delete as sql_delete
+from sqlalchemy.orm import Session, object_session
 
 from open_webui.internal.db import Base
+from open_webui.models.access_grants import (
+    PRINCIPAL_TYPE_USER,
+    WILDCARD_PRINCIPAL_ID,
+    AccessGrant,
+)
+from open_webui.models.calendar import Calendar, CalendarEvent
+from open_webui.models.chat_messages import ChatMessage
 from open_webui.models.chats import Chat
 from open_webui.models.files import File
 from open_webui.models.folders import Folder
-from open_webui.models.knowledge import Knowledge
+from open_webui.models.knowledge import Knowledge, KnowledgeDirectory
 from open_webui.models.memories import Memory
 from open_webui.models.notes import Note
+from open_webui.models.prompt_history import PromptHistory
 from open_webui.models.prompts import Prompt
 from open_webui.models.resource_keys import ResourceKey
+from open_webui.models.skills import Skill
 from open_webui.models.tags import Tag
 from open_webui.crypto_exceptions import EncryptedDataAccessDeniedError
 from open_webui.utils.crypto_context import (
@@ -31,10 +42,11 @@ from open_webui.utils.crypto_context import (
     require_current_user_dek,
 )
 from open_webui.utils.resource_crypto import (
+    ResourceKeyAccessError,
+    SharingNotSupportedError,
+    _add_key,
     create_owner_key,
     resolve_key,
-    sync_shared_keys,
-    validate_shareable_access_control,
 )
 from open_webui.utils.crypto_utils import (
     decrypt_json_value,
@@ -72,7 +84,30 @@ class EncryptionPolicy:
 
 
 ENCRYPTED_MODELS: dict[type, EncryptionPolicy] = {
-    Chat: EncryptionPolicy(owner="user_id", text=("title",), json=("chat",)),
+    # `tasks` and `summary` are upstream's chat auto-summary/task columns —
+    # conversation content, so they travel with the chat body.
+    Chat: EncryptionPolicy(
+        owner="user_id", text=("title", "summary"), json=("chat", "tasks")
+    ),
+    # The normalized message store upstream reads chat content from. `usage`,
+    # `role`, `model_id` and the tree columns stay clear: the admin usage
+    # dashboard aggregates them across users, and branch queries walk them in
+    # SQL — the same reasoning as File.hash. `context_summary` carries the
+    # compaction checkpoint, i.e. a distillation of the conversation.
+    ChatMessage: EncryptionPolicy(
+        owner="user_id",
+        text=("context_summary",),
+        json=(
+            "content",
+            "output",
+            "files",
+            "sources",
+            "embeds",
+            "meta",
+            "status_history",
+            "error",
+        ),
+    ),
     # `hash` is deliberately absent: it never holds a plain SHA-256. The
     # fingerprint is keyed to its owner where it is computed (file_hash_token in
     # rag_crypto), because it must stay readable to people without the owner's
@@ -80,6 +115,16 @@ ENCRYPTED_MODELS: dict[type, EncryptionPolicy] = {
     # administrator deleting without reading — who pass it around opaquely.
     File: EncryptionPolicy(owner="user_id", text=("filename",), json=("data", "meta")),
     Memory: EncryptionPolicy(owner="user_id", text=("content",)),
+    Calendar: EncryptionPolicy(owner="user_id", text=("name",), json=("data", "meta")),
+    # `rrule` is content too — a recurrence pattern says when someone is
+    # where. Dates stay clear: the range queries that page a calendar walk
+    # them in SQL. Attendee rows are refused at the single place they are
+    # written (models/calendar.py set_attendees), so events stay one-reader.
+    CalendarEvent: EncryptionPolicy(
+        owner="user_id",
+        text=("title", "description", "location", "rrule"),
+        json=("data", "meta"),
+    ),
     Folder: EncryptionPolicy(
         owner="user_id", text=("name",), json=("items", "meta", "data")
     ),
@@ -102,10 +147,59 @@ ENCRYPTED_MODELS: dict[type, EncryptionPolicy] = {
     # owner's key, which is in hand before the lookup; a shared prompt is not.
     Prompt: EncryptionPolicy(
         owner="user_id",
-        text=("title", "content"),
+        text=("name", "content"),
         shared=True,
         identity="command",
     ),
+    # A skill is instructions a person wrote, loaded only inside requests where
+    # a signed-in user picked it — so unlike Tools and Functions it always has
+    # a key in hand. The grants-scoped listing keeps rows the requester cannot
+    # open out of every query, so a skill someone else attached to a model is
+    # simply unavailable rather than an error, exactly like encrypted
+    # knowledge attached to a model.
+    Skill: EncryptionPolicy(
+        owner="user_id",
+        text=("name", "description", "content"),
+        json=("meta",),
+        shared=True,
+    ),
+    # A history entry duplicates its prompt's content, so it is opened with the
+    # prompt's own key (see BORROWED_KEYS below): readable by exactly whoever
+    # can read the prompt, and sharing follows the prompt's grants with nothing
+    # extra stored or revoked.
+    PromptHistory: EncryptionPolicy(
+        owner="user_id",
+        json=("snapshot",),
+        shared=True,
+    ),
+    # A directory names part of a knowledge base's structure, so it rides on
+    # the knowledge base's key (BORROWED_KEYS): readable by exactly whoever
+    # can open the base.
+    KnowledgeDirectory: EncryptionPolicy(
+        owner="user_id",
+        text=("name",),
+        shared=True,
+    ),
+}
+
+
+def _knowledge_directory_key_of(session, target) -> tuple[str, Optional[str]]:
+    return ("Knowledge", target.knowledge_id)
+
+
+def _prompt_history_key_of(session, target) -> tuple[str, Optional[str]]:
+    row = (
+        session.query(Prompt.command).filter(Prompt.id == target.prompt_id).first()
+    )
+    return ("Prompt", row[0] if row else None)
+
+
+# Rows that duplicate another row's content are opened with that row's key
+# rather than one of their own. Provisioning skips them: they never own key
+# copies, so nothing is created on insert or cleaned up on delete.
+BORROWED_KEYS: dict[type, "object"] = {
+    PromptHistory: _prompt_history_key_of,
+    KnowledgeDirectory: _knowledge_directory_key_of,
 }
 
 
@@ -114,6 +208,25 @@ _RESOURCE_KEY_STASH = "_resource_key"
 
 def _key_for(target, policy: EncryptionPolicy) -> bytes:
     """The key that opens this row."""
+    borrowed = BORROWED_KEYS.get(type(target))
+    if borrowed is not None:
+        actor = get_current_user_id()
+        if actor is None:
+            raise RuntimeError("No current user context. Cannot access encrypted data.")
+        session = object_session(target)
+        resource_type, resource_id = borrowed(session, target)
+        key = (
+            resolve_key(resource_type, resource_id, actor, db=session)
+            if resource_id is not None
+            else None
+        )
+        if key is None:
+            raise EncryptedDataAccessDeniedError(
+                f"{actor} holds no key for the {resource_type} behind "
+                f"{type(target).__name__} {getattr(target, policy.identity)}."
+            )
+        return key
+
     if not policy.shared:
         return require_current_user_dek(getattr(target, policy.owner))
 
@@ -128,7 +241,11 @@ def _key_for(target, policy: EncryptionPolicy) -> bytes:
         raise RuntimeError("No current user context. Cannot access encrypted data.")
 
     resource_id = getattr(target, policy.identity)
-    key = resolve_key(type(target).__name__, resource_id, actor)
+    # The row's own session is reused: this runs inside ORM events, where
+    # opening a second connection would stall the async engine's event loop.
+    key = resolve_key(
+        type(target).__name__, resource_id, actor, db=object_session(target)
+    )
     if key is None:
         raise EncryptedDataAccessDeniedError(
             f"{actor} holds no key for {type(target).__name__} {resource_id}."
@@ -136,11 +253,135 @@ def _key_for(target, policy: EncryptionPolicy) -> bytes:
     return key
 
 
+# Grant rows name resources by their lowercase API type and primary key; the
+# key store names them by model class and policy identity. This table carries
+# a grant to the shared encrypted model it concerns; grant types not listed
+# (models, tools, ...) hold no encrypted content and pass through untouched.
+GRANTED_SHARED_MODELS: dict[str, type] = {
+    "knowledge": Knowledge,
+    "note": Note,
+    "prompt": Prompt,
+    "skill": Skill,
+}
+
+
+def _grant_key_identity(session, model: type, resource_id: str) -> Optional[str]:
+    """The key-store id for a granted resource.
+
+    Grants carry the row's primary key, but a prompt's key is stored against
+    its command (see the Prompt policy). Read as a column query so the row
+    itself is not loaded — and therefore not decrypted — along the way.
+    """
+    policy = ENCRYPTED_MODELS[model]
+    if policy.identity == "id":
+        return resource_id
+    row = (
+        session.query(getattr(model, policy.identity))
+        .filter(model.id == resource_id)
+        .first()
+    )
+    return row[0] if row else None
+
+
+def _validate_grant(grant) -> None:
+    """Named people only; a group, everyone, or a wildcard cannot be keyed."""
+    if grant.principal_type != PRINCIPAL_TYPE_USER or (
+        grant.principal_id == WILDCARD_PRINCIPAL_ID
+    ):
+        raise SharingNotSupportedError(
+            "Sharing with a group or with everyone is not available: encrypted "
+            "content is shared by handing a key to each named person."
+        )
+
+
+def _sync_granted_keys(session) -> None:
+    """Bring the stored key copies in line with the access grants being written.
+
+    set_access_grants replaces a resource's grants wholesale — it deletes the
+    old rows and adds the full new set through the ORM — so the flush shows
+    every change here: the wanted audience is the surviving grant rows plus
+    the pending ones.
+    """
+    touched: dict[tuple[str, str], type] = {}
+    for grant in list(session.new) + list(session.deleted):
+        if isinstance(grant, AccessGrant):
+            model = GRANTED_SHARED_MODELS.get(grant.resource_type)
+            if model is not None:
+                touched[(grant.resource_type, grant.resource_id)] = model
+
+    for (grant_type, grant_resource_id), model in touched.items():
+        new_grants = [
+            g
+            for g in session.new
+            if isinstance(g, AccessGrant)
+            and g.resource_type == grant_type
+            and g.resource_id == grant_resource_id
+        ]
+        for grant in new_grants:
+            _validate_grant(grant)
+
+        deleted_ids = {
+            g.id
+            for g in session.deleted
+            if isinstance(g, AccessGrant)
+            and g.resource_type == grant_type
+            and g.resource_id == grant_resource_id
+        }
+        surviving = [
+            g
+            for g in session.query(AccessGrant).filter_by(
+                resource_type=grant_type, resource_id=grant_resource_id
+            )
+            if g.id not in deleted_ids
+        ]
+
+        wanted = {g.principal_id for g in surviving + new_grants}
+
+        resource_type = model.__name__
+        resource_id = _grant_key_identity(session, model, grant_resource_id)
+        if resource_id is None:
+            # The resource is gone; its keys go with it below, or are already gone.
+            continue
+
+        key_rows = {
+            row.user_id: row
+            for row in session.query(ResourceKey).filter_by(
+                resource_type=resource_type, resource_id=resource_id
+            )
+        }
+        owner_row = (
+            session.query(getattr(model, ENCRYPTED_MODELS[model].owner))
+            .filter(model.id == grant_resource_id)
+            .first()
+        )
+        owner_id = owner_row[0] if owner_row else None
+
+        added = wanted - set(key_rows) - {owner_id}
+        removed = set(key_rows) - wanted - {owner_id}
+
+        if added:
+            actor = get_current_user_id()
+            key = (
+                resolve_key(resource_type, resource_id, actor, db=session)
+                if actor
+                else None
+            )
+            if key is None:
+                raise ResourceKeyAccessError(
+                    "Cannot change who this is shared with without holding its key."
+                )
+            for user_id in added:
+                _add_key(session, resource_type, resource_id, user_id, key)
+
+        for user_id in removed:
+            session.delete(key_rows[user_id])
+
+
 def _provision_resource_keys(session, flush_context, instances) -> None:
     """Give shared rows a key, and keep the shared copies in step.
 
     Runs before the flush, which is the only point where new rows may be added
-    to it. A feature that sets access_control gets the key handling for free —
+    to it. A feature that writes access grants gets the key handling for free —
     or a refusal, if it asks for an audience that cannot be keyed.
     """
     written = list(session.new) + [
@@ -149,32 +390,43 @@ def _provision_resource_keys(session, flush_context, instances) -> None:
 
     for target in written:
         policy = ENCRYPTED_MODELS.get(type(target))
-        if policy is None or not policy.shared:
+        if policy is None or not policy.shared or type(target) in BORROWED_KEYS:
             continue
 
         resource_type = type(target).__name__
         resource_id = getattr(target, policy.identity)
         owner_id = getattr(target, policy.owner)
-        access_control = getattr(target, "access_control", None)
-
-        validate_shareable_access_control(access_control)
 
         if target in session.new:
             key = create_owner_key(resource_type, resource_id, owner_id, session)
         else:
+            # A renamed identity (a prompt's command can be edited) must carry
+            # the stored key copies along, or the row becomes undecryptable.
+            history = inspect(target).attrs[policy.identity].history
+            if history.has_changes() and history.deleted:
+                session.query(ResourceKey).filter_by(
+                    resource_type=resource_type, resource_id=history.deleted[0]
+                ).update(
+                    {ResourceKey.resource_id: resource_id},
+                    synchronize_session=False,
+                )
+
             actor = get_current_user_id()
-            key = resolve_key(resource_type, resource_id, actor) if actor else None
+            key = (
+                resolve_key(resource_type, resource_id, actor, db=session)
+                if actor
+                else None
+            )
 
         setattr(target, _RESOURCE_KEY_STASH, key)
-        sync_shared_keys(
-            resource_type, resource_id, owner_id, access_control, key, session
-        )
+
+    _sync_granted_keys(session)
 
     # A deleted resource takes its key copies with it, or the wrapped keys of
     # content that no longer exists would be left behind.
     for target in session.deleted:
         policy = ENCRYPTED_MODELS.get(type(target))
-        if policy is None or not policy.shared:
+        if policy is None or not policy.shared or type(target) in BORROWED_KEYS:
             continue
         session.query(ResourceKey).filter_by(
             resource_type=type(target).__name__,
@@ -187,10 +439,14 @@ def named_recipient_resources() -> list[str]:
 
     Handed to the interface so it can offer the audiences that will actually
     work. Read off the registry rather than written out again, so encrypting a
-    new model changes what is offered without anyone remembering to.
+    new model changes what is offered without anyone remembering to. Models
+    that borrow another row's key are left out: they are not shared on their
+    own, they follow the row they belong to.
     """
     return sorted(
-        model.__name__ for model, policy in ENCRYPTED_MODELS.items() if policy.shared
+        model.__name__
+        for model, policy in ENCRYPTED_MODELS.items()
+        if policy.shared and model not in BORROWED_KEYS
     )
 
 
@@ -246,6 +502,44 @@ def delete_without_reading(session, model: type, ids: list[str]) -> None:
     )
 
 
+async def read_without_decrypting_async(session, model: type, id: str, *columns: str):
+    """read_without_decrypting for the async table APIs."""
+    policy = ENCRYPTED_MODELS.get(model)
+    if policy is not None:
+        encrypted = set(columns) & set(policy.columns)
+        if encrypted:
+            raise ValueError(
+                f"{', '.join(sorted(encrypted))} on {model.__name__} is encrypted. "
+                "Load the row itself, with the key, to read it."
+            )
+
+    result = await session.execute(
+        select(*[getattr(model, column) for column in columns]).where(
+            _identity_column(model) == id
+        )
+    )
+    return result.first()
+
+
+async def delete_without_reading_async(session, model: type, ids: list[str]) -> None:
+    """delete_without_reading for the async table APIs."""
+    if not ids:
+        return
+
+    policy = ENCRYPTED_MODELS.get(model)
+    if policy is not None and policy.shared:
+        await session.execute(
+            sql_delete(ResourceKey).where(
+                ResourceKey.resource_type == model.__name__,
+                ResourceKey.resource_id.in_(ids),
+            )
+        )
+
+    await session.execute(
+        sql_delete(model).where(_identity_column(model).in_(ids))
+    )
+
+
 def _encrypt(target, policy: EncryptionPolicy) -> None:
     dek = _key_for(target, policy)
 
@@ -253,19 +547,27 @@ def _encrypt(target, policy: EncryptionPolicy) -> None:
     stash = {column: getattr(target, column) for column in policy.columns}
     setattr(target, _PLAINTEXT_STASH, stash)
 
+    # None stays None without entering the crypto layer, so an empty column
+    # costs nothing and the decrypt counters in the tests measure real work.
     for column in policy.text:
-        setattr(target, column, encrypt_text(stash[column], dek))
+        if stash[column] is not None:
+            setattr(target, column, encrypt_text(stash[column], dek))
     for column in policy.json:
-        setattr(target, column, encrypt_json_value(stash[column], dek))
+        if stash[column] is not None:
+            setattr(target, column, encrypt_json_value(stash[column], dek))
 
 
 def _decrypt(target, policy: EncryptionPolicy) -> None:
     dek = _key_for(target, policy)
 
     for column in policy.text:
-        setattr(target, column, decrypt_text(getattr(target, column), dek))
+        value = getattr(target, column)
+        if value is not None:
+            setattr(target, column, decrypt_text(value, dek))
     for column in policy.json:
-        setattr(target, column, decrypt_json_value(getattr(target, column), dek))
+        value = getattr(target, column)
+        if value is not None:
+            setattr(target, column, decrypt_json_value(value, dek))
 
 
 def _restore_plaintext(target) -> None:
@@ -357,6 +659,24 @@ NOT_ENCRYPTED: dict[str, str] = {
     "ChannelWebhook": "channels are closed; the token is compared by value anyway",
     "Message": "channels are closed; messages have many readers and no single owner",
     "MessageReaction": "channels are closed; emoji names",
+    # Rows of identifiers and flags only.
+    "AccessGrant": "ids and permission names; drives the resource-key sync in this module",
+    "PinnedNote": "join table of ids",
+    # An attendee row is ids and an RSVP status. Writing one is refused at the
+    # single place it happens (models/calendar.py set_attendees): an attendee
+    # would be a second reader of an event encrypted with its owner's key.
+    "CalendarEventAttendee": "attendee rows are refused; ids and RSVP status only",
+    # Automations are closed here rather than encrypted: a scheduled run
+    # executes with nobody signed in, so no DEK is in memory to open the
+    # prompt it should send or write the chat it would produce. Every endpoint
+    # returns 501 (see routers/automations.py), so these tables stay empty.
+    # Reopening means designing key escrow for scheduled work first.
+    "Automation": "automations are closed; scheduled runs hold no key",
+    "AutomationRun": "automations are closed; run records only",
+    # Chat sharing is closed here rather than encrypted: a share link has no
+    # named recipient whose key could wrap the snapshot. The share endpoints
+    # return 501 (see routers/chats.py), so this table stays empty.
+    "SharedChat": "chat sharing is closed; a share link has no recipient to key for",
 }
 
 

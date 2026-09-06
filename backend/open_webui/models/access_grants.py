@@ -373,17 +373,27 @@ class AccessGrantsTable:
     ) -> bool:
         """Remove a single access grant."""
         async with get_async_db_context(db) as db:
-            result = await db.execute(
-                delete(AccessGrant).filter_by(
-                    resource_type=resource_type,
-                    resource_id=resource_id,
-                    principal_type=principal_type,
-                    principal_id=principal_id,
-                    permission=permission,
+            # ORM deletes so the encryption layer's flush hook can withdraw
+            # the matching wrapped resource key.
+            rows = (
+                (
+                    await db.execute(
+                        select(AccessGrant).filter_by(
+                            resource_type=resource_type,
+                            resource_id=resource_id,
+                            principal_type=principal_type,
+                            principal_id=principal_id,
+                            permission=permission,
+                        )
+                    )
                 )
+                .scalars()
+                .all()
             )
+            for grant_row in rows:
+                await db.delete(grant_row)
             await db.commit()
-            return result.rowcount > 0
+            return len(rows) > 0
 
     async def revoke_all_access(
         self,
@@ -393,14 +403,24 @@ class AccessGrantsTable:
     ) -> int:
         """Remove all access grants for a resource."""
         async with get_async_db_context(db) as db:
-            result = await db.execute(
-                delete(AccessGrant).filter_by(
-                    resource_type=resource_type,
-                    resource_id=resource_id,
+            # ORM deletes so the encryption layer's flush hook can withdraw
+            # the matching wrapped resource keys.
+            rows = (
+                (
+                    await db.execute(
+                        select(AccessGrant).filter_by(
+                            resource_type=resource_type,
+                            resource_id=resource_id,
+                        )
+                    )
                 )
+                .scalars()
+                .all()
             )
+            for grant_row in rows:
+                await db.delete(grant_row)
             await db.commit()
-            return result.rowcount
+            return len(rows)
 
     async def set_access_control(
         self,
@@ -414,13 +434,22 @@ class AccessGrantsTable:
         This is the primary bridge for backward compat with the frontend.
         """
         async with get_async_db_context(db) as db:
-            # Delete all existing grants for this resource
-            await db.execute(
-                delete(AccessGrant).filter_by(
-                    resource_type=resource_type,
-                    resource_id=resource_id,
+            # Delete all existing grants for this resource — through the ORM,
+            # so the encryption layer's flush hook sees each revocation.
+            existing = (
+                (
+                    await db.execute(
+                        select(AccessGrant).filter_by(
+                            resource_type=resource_type,
+                            resource_id=resource_id,
+                        )
+                    )
                 )
+                .scalars()
+                .all()
             )
+            for grant_row in existing:
+                await db.delete(grant_row)
 
             # Convert JSON to grant dicts
             grant_dicts = access_control_to_grants(resource_type, resource_id, access_control)
@@ -451,12 +480,23 @@ class AccessGrantsTable:
         Replace all grants for a resource from a direct access_grants list.
         """
         async with get_async_db_context(db) as db:
-            await db.execute(
-                delete(AccessGrant).filter_by(
-                    resource_type=resource_type,
-                    resource_id=resource_id,
+            # Deleted row by row through the ORM rather than by statement, so
+            # the encryption layer's flush hook sees each revocation and can
+            # withdraw the matching wrapped resource key.
+            existing = (
+                (
+                    await db.execute(
+                        select(AccessGrant).filter_by(
+                            resource_type=resource_type,
+                            resource_id=resource_id,
+                        )
+                    )
                 )
+                .scalars()
+                .all()
             )
+            for grant_row in existing:
+                await db.delete(grant_row)
 
             normalized_grants = normalize_access_grants(access_grants)
 

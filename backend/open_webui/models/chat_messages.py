@@ -891,7 +891,10 @@ class ChatMessageTable:
         db: Optional[AsyncSession] = None,
     ) -> list[dict]:
         async with get_async_db_context(db) as db:
-            stmt = select(ChatMessage.output, ChatMessage.meta).filter(
+            # Loaded as entities, not bare columns: output/meta are encrypted
+            # at rest and only the ORM load hook decrypts them. The filter is
+            # the requester's own messages, so their key is in hand.
+            stmt = select(ChatMessage).filter(
                 ChatMessage.user_id == user_id,
                 ChatMessage.created_at >= start_date,
                 ChatMessage.created_at <= end_date,
@@ -899,10 +902,10 @@ class ChatMessageTable:
             result = await db.execute(stmt)
 
             counts: Counter[str] = Counter()
-            for output, meta in result.all():
-                for name in _extract_tool_names(output):
+            for message in result.scalars().all():
+                for name in _extract_tool_names(message.output):
                     counts[name] += 1
-                for name in _extract_tool_names(meta):
+                for name in _extract_tool_names(message.meta):
                     counts[name] += 1
 
             return [{'name': name, 'count': count} for name, count in counts.most_common(limit)]

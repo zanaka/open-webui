@@ -273,6 +273,31 @@ def render_chat_variables(
     return CHAT_VARIABLE_ANY_RE.sub(replace, system_prompt)
 
 
+def decrypt_user_variables(user) -> dict[str, str]:
+    """The stored value is encrypted with its owner's DEK.
+
+    The user table itself is exempt from row encryption (rows are read across
+    users for sign-in and admin screens), so this one personal field is
+    encrypted by hand where it is written (routers/users.py) and opened here.
+    Both ends live in self-scoped requests, so the key is the requester's own.
+    """
+    from open_webui.utils.crypto_context import get_cached_dek
+    from open_webui.utils.crypto_utils import decrypt_json_value
+
+    raw = getattr(user, 'variables', None)
+    if not raw:
+        return {}
+    dek = get_cached_dek(user.id)
+    if dek is None:
+        return {}
+    try:
+        return normalize_user_variables(decrypt_json_value(raw, dek))
+    except Exception:
+        # Pre-encryption plaintext, or a row that is not the requester's:
+        # unreadable either way, so render as if no variables were set.
+        return {}
+
+
 def render_user_variables(system_prompt: str | None, variables: Any) -> str | None:
     if not system_prompt:
         return system_prompt

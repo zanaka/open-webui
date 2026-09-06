@@ -100,6 +100,7 @@ from open_webui.utils.filter import (
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.mcp.client import MCPClient
 from open_webui.utils.memory import add_memory_context, review_memory_after_turn
+from open_webui.utils.log_redaction import describe
 from open_webui.utils.misc import (
     add_or_update_system_message,
     add_or_update_user_message,
@@ -1487,7 +1488,7 @@ async def chat_completion_tools_handler(
         log.debug('Error: %s', e)
         content = None
 
-    log.debug('tool_contexts: %s', sources)
+    log.debug('tool_contexts: %s', describe(sources))
 
     if skip_files and 'files' in body.get('metadata', {}):
         del body['metadata']['files']
@@ -2074,7 +2075,7 @@ async def chat_completion_files_handler(
         except Exception as e:
             log.exception(e)
 
-        log.debug('rag_contexts:sources: %s', sources)
+        log.debug('rag_contexts:sources: %s', describe(sources))
 
         unique_ids = set()
         for source in sources or []:
@@ -2401,7 +2402,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     model_system_prompt = (form_data.get('params') or {}).get('system')
 
     form_data = apply_params_to_form_data(form_data, model)
-    log.debug('form_data: %s', form_data)
+    log.debug('form_data: %s', describe(form_data))
 
     # Guided regeneration: extract before it reaches the LLM provider
     regeneration_prompt = form_data.pop('regeneration_prompt', None)

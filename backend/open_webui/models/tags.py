@@ -8,6 +8,7 @@ import uuid
 
 # local imports
 from open_webui.internal.db import Base, JSONField, get_async_db_context
+from open_webui.utils.tag_tokens import tag_id
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import JSON, BigInteger, Column, Index, PrimaryKeyConstraint, String, delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -58,9 +59,9 @@ class TagTable:
     ) -> TagModel | None:
         """Create a new tag, deriving the id from the name."""
         async with get_async_db_context(db) as db:
-            tag_id = name.replace(' ', '_').lower()
+            id = tag_id(name, user_id)
             try:
-                record = Tag(id=tag_id, user_id=user_id, name=name)
+                record = Tag(id=id, user_id=user_id, name=name)
                 db.add(record)
                 await db.commit()
                 return TagModel.model_validate(record) if record else None
@@ -72,7 +73,7 @@ class TagTable:
         self, name: str, user_id: str, db: AsyncSession | None = None
     ) -> TagModel | None:
         try:
-            id = name.replace(' ', '_').lower()
+            id = tag_id(name, user_id)
             async with get_async_db_context(db) as db:
                 result = await db.execute(select(Tag).filter_by(id=id, user_id=user_id))
                 tag = result.scalars().first()
@@ -95,7 +96,7 @@ class TagTable:
     async def delete_tag_by_name_and_user_id(self, name: str, user_id: str, db: AsyncSession | None = None) -> bool:
         try:
             async with get_async_db_context(db) as db:
-                id = name.replace(' ', '_').lower()
+                id = tag_id(name, user_id)
                 result = await db.execute(delete(Tag).filter_by(id=id, user_id=user_id))
                 log.debug('res: %s', result.rowcount)
                 await db.commit()
@@ -123,12 +124,12 @@ class TagTable:
         """Create tag rows for any *names* that don't already exist for *user_id*."""
         if not names:
             return
-        ids = [n.replace(' ', '_').lower() for n in names]
+        ids = [tag_id(n, user_id) for n in names]
         async with get_async_db_context(db) as db:
             result = await db.execute(select(Tag.id).filter(Tag.id.in_(ids), Tag.user_id == user_id))
             existing = {row[0] for row in result.all()}
             new_tags = [
-                Tag(id=tag_id, name=name, user_id=user_id) for tag_id, name in zip(ids, names) if tag_id not in existing
+                Tag(id=id, name=name, user_id=user_id) for id, name in zip(ids, names) if id not in existing
             ]
             if new_tags:
                 db.add_all(new_tags)

@@ -17,11 +17,9 @@ import hashlib
 import time
 
 import pytest
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
+from conftest import run, sqlite_test_database
+from sqlalchemy import text
 
-from open_webui.internal import db as internal_db
-from open_webui.internal.db import Base
 from open_webui.models.files import File, Files
 from open_webui.retrieval.vector.encrypting_client import _protect_filter
 from open_webui.utils import crypto_context
@@ -102,39 +100,35 @@ class TestTheDeleteFilterStillMatches:
 
 
 @pytest.fixture
-def db(monkeypatch):
-    monkeypatch.setattr(internal_db, "DATABASE_ENABLE_SESSION_SHARING", True)
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine, tables=[File.__table__])
-    session = sessionmaker(bind=engine)()
+def db(monkeypatch, tmp_path):
+    with sqlite_test_database(
+        monkeypatch, tmp_path / "test.db", tables=[File.__table__]
+    ) as session:
+        cache_dek(OWNER, OWNER_DEK, jti=OWNER, expires_at=time.time() + 3600)
+        cache_dek(INTRUDER, INTRUDER_DEK, jti=INTRUDER, expires_at=time.time() + 3600)
+        set_current_user_id(OWNER)
 
-    cache_dek(OWNER, OWNER_DEK, jti=OWNER, expires_at=time.time() + 3600)
-    cache_dek(INTRUDER, INTRUDER_DEK, jti=INTRUDER, expires_at=time.time() + 3600)
-    set_current_user_id(OWNER)
-
-    now = int(time.time())
-    session.add(
-        File(
-            id="f1",
-            user_id=OWNER,
-            filename="plan.txt",
-            path="/uploads/f1",
-            data={"content": CONTENT},
-            meta={"name": "plan.txt"},
-            hash=TOKEN,
-            created_at=now,
-            updated_at=now,
+        now = int(time.time())
+        session.add(
+            File(
+                id="f1",
+                user_id=OWNER,
+                filename="plan.txt",
+                path="/uploads/f1",
+                data={"content": CONTENT},
+                meta={"name": "plan.txt"},
+                hash=TOKEN,
+                created_at=now,
+                updated_at=now,
+            )
         )
-    )
-    session.commit()
-    session.expire_all()
+        session.commit()
+        session.expire_all()
 
-    yield session
+        yield session
 
-    set_current_user_id(None)
-    session.close()
-    engine.dispose()
-    crypto_context._dek_cache.clear()
+        set_current_user_id(None)
+        crypto_context._dek_cache.clear()
 
 
 class TestAtRest:
@@ -149,22 +143,22 @@ class TestAtRest:
         shared-knowledge member, an administrator cleaning up — hold no key for
         this row and must not need one."""
         set_current_user_id(INTRUDER)
-        assert Files.get_file_hash_by_id("f1", db=db) == TOKEN
+        assert run(Files.get_file_hash_by_id("f1")) == TOKEN
 
     def test_a_missing_file_has_no_hash(self, db):
-        assert Files.get_file_hash_by_id("no-such-file", db=db) is None
+        assert run(Files.get_file_hash_by_id("no-such-file")) is None
 
     def test_a_new_token_is_stored_as_given(self, db):
         other = file_hash_token("some-other-sha256", OWNER_DEK)
-        Files.update_file_hash_by_id("f1", other, db=db)
+        run(Files.update_file_hash_by_id("f1", other))
 
         raw = db.execute(text("SELECT hash FROM file WHERE id = 'f1'")).scalar()
         assert raw == other
 
     def test_clearing_it_is_allowed(self, db):
         """process_file clears the hash on failure so the upload can be retried."""
-        Files.update_file_hash_by_id("f1", None, db=db)
-        assert Files.get_file_hash_by_id("f1", db=db) is None
+        run(Files.update_file_hash_by_id("f1", None))
+        assert run(Files.get_file_hash_by_id("f1")) is None
 
 
 def test_the_registry_leaves_the_hash_column_out():

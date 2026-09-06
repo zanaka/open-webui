@@ -68,6 +68,7 @@ from open_webui.models.config import Config
 # Document loaders
 from open_webui.retrieval.loaders.youtube import YoutubeLoader, YoutubeTranscriptError
 from open_webui.retrieval.utils import (
+    KeyedCollection,
     build_loader_from_config,
     get_loader_config,
     filter_accessible_collections,
@@ -120,10 +121,13 @@ from open_webui.retrieval.web.yacy import search_yacy
 from open_webui.retrieval.web.yandex import search_yandex
 from open_webui.retrieval.web.ydc import search_youcom
 from open_webui.retrieval.web.linkup import search_linkup
-from open_webui.storage.provider import Storage
+from open_webui.crypto_exceptions import EncryptedDataAccessDeniedError
+from open_webui.models.access_grants import AccessGrants
 from open_webui.utils.access_control import has_permission
-from open_webui.utils.access_control.files import has_access_to_file
 from open_webui.utils.auth import get_admin_user, get_verified_user
+from open_webui.utils.file_crypto import decrypted_file_path
+from open_webui.utils.rag_crypto import file_hash_token
+from open_webui.utils.vector_keys import VectorKeyError, knowledge_key, owner_key
 from open_webui.utils.misc import (
     calculate_sha256_string,
     sanitize_text_for_db,
@@ -1639,6 +1643,8 @@ def save_docs_to_vector_db(
     docs,
     collection_name,
     config: RetrievalConfig,
+    *,
+    key: bytes,
     metadata: dict | None = None,
     overwrite: bool = False,
     split: bool = True,
@@ -1668,6 +1674,7 @@ def save_docs_to_vector_db(
         result = VECTOR_DB_CLIENT.query(
             collection_name=collection_name,
             filter={'hash': metadata['hash']},
+            key=key,
         )
 
         if result is not None and result.ids and len(result.ids) > 0:
@@ -1835,6 +1842,7 @@ def save_docs_to_vector_db(
         VECTOR_DB_CLIENT.insert(
             collection_name=collection_name,
             items=items,
+            key=key,
         )
 
         log.info('added %s items to collection %s', len(items), collection_name)
@@ -1867,10 +1875,9 @@ async def process_file(
     The session is committed before external API calls, and updates use a fresh session.
     """
     config = await get_retrieval_config()
-    if user.role == 'admin':
-        file = await Files.get_file_by_id(form_data.file_id, db=db)
-    else:
-        file = await Files.get_file_by_id_and_user_id(form_data.file_id, user.id, db=db)
+    # Owner-only: the stored blob and the chunks are encrypted with the
+    # owner's key, so nobody else could process this file anyway.
+    file = await Files.get_file_by_id_and_user_id(form_data.file_id, user.id, db=db)
 
     if file:
         try:
@@ -1878,9 +1885,15 @@ async def process_file(
             file_collection_name = f'file-{file.id}'
 
             if collection_name is None:
+                # The file's own chunks, kept under its owner's key.
                 collection_name = file_collection_name
+                collection_key = owner_key(user.id)
             else:
-                await _validate_collection_access([collection_name], user, access_type='write')
+                # Going into a knowledge base, so keyed by that knowledge base.
+                # Holding its key is not permission to write to it; check the
+                # grants as well.
+                await require_knowledge_write_access(collection_name, user, db=db)
+                collection_key = knowledge_key(collection_name, user.id)
             collection_names = [collection_name]
 
             if form_data.content:
@@ -1914,8 +1927,12 @@ async def process_file(
                 # Reuse file-{id} chunks when they exist; otherwise restore file-{id}
                 # from stored file content while adding the file to the knowledge collection.
 
+                # Read back under the file's own key; the chunks are re-encrypted
+                # under the knowledge base's key when they are inserted below.
                 file_result = await ASYNC_VECTOR_DB_CLIENT.query(
-                    collection_name=file_collection_name, filter={'file_id': file.id}
+                    collection_name=file_collection_name,
+                    filter={'file_id': file.id},
+                    key=owner_key(user.id),
                 )
                 stored_content = (file.data or {}).get('content')
 
@@ -1952,7 +1969,6 @@ async def process_file(
                 # Usage: /files/
                 file_path = file.path
                 if file_path:
-                    file_path = await asyncio.to_thread(Storage.get_file, file_path)
                     loader_config = await get_loader_config()
                     loader = build_loader_from_config(request, loader_config)
                     loader.user = user
@@ -1961,7 +1977,10 @@ async def process_file(
                         'file_name': file.filename,
                         'file_content_type': file.meta.get('content_type'),
                     }
-                    docs = await loader.aload(file.filename, file.meta.get('content_type'), file_path)
+                    # The stored blob is encrypted; hand the loader a decrypted
+                    # temporary copy that is removed afterwards.
+                    with decrypted_file_path(file, user_id=user.id) as plain_path:
+                        docs = await loader.aload(file.filename, file.meta.get('content_type'), plain_path)
 
                     docs = [
                         Document(
@@ -1997,7 +2016,12 @@ async def process_file(
                 {'content': text_content},
                 db=db,
             )
-            hash = calculate_sha256_string(text_content)
+            # Keyed to the owner right here, where the fingerprint is born.
+            # Everything downstream — the file row, the vector metadata, the
+            # delete filters quoting it back — carries this token opaquely, so
+            # no reader of either store can hash a document they hold and learn
+            # who stores it.
+            hash = file_hash_token(calculate_sha256_string(text_content), owner_key(file.user_id))
 
             if config.BYPASS_EMBEDDING_AND_RETRIEVAL:
                 await Files.update_file_data_by_id(file.id, {'status': 'completed', 'error': None}, db=db)
@@ -2036,6 +2060,9 @@ async def process_file(
                             docs=docs,
                             collection_name=name,
                             config=config,
+                            # The repair path also rebuilds file-{id}, which is
+                            # the owner's collection, not the knowledge base's.
+                            key=(owner_key(user.id) if name == file_collection_name else collection_key),
                             metadata={
                                 'file_id': file.id,
                                 'name': file.filename,
@@ -2083,6 +2110,11 @@ async def process_file(
                 except Exception as e:
                     raise e
 
+        except EncryptedDataAccessDeniedError:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=ERROR_MESSAGES.NOT_FOUND,
+            )
         except Exception as e:
             log.exception(e)
             # Fresh session for error status update.
@@ -2135,11 +2167,9 @@ async def process_text(
     form_data: ProcessTextForm,
     user=Depends(get_verified_user),
 ):
-    collection_name = form_data.collection_name
-    if collection_name is None:
-        collection_name = calculate_sha256_string(form_data.content)
-    else:
-        await _validate_collection_access([collection_name], user, access_type='write')
+    # Derived from the owner as well as the content, so two users pasting the same
+    # text never end up sharing one collection encrypted under two different keys.
+    collection_name = calculate_sha256_string(f'{user.id}:{form_data.content}')
 
     docs = [
         Document(
@@ -2151,7 +2181,15 @@ async def process_text(
     log.debug('text_content: %s', text_content)
 
     config = await get_retrieval_config()
-    result = await run_in_threadpool(save_docs_to_vector_db, request, docs, collection_name, config, user=user)
+    result = await run_in_threadpool(
+        save_docs_to_vector_db,
+        request,
+        docs,
+        collection_name,
+        config,
+        key=owner_key(user.id),
+        user=user,
+    )
     if result:
         await publish_event(
             request,
@@ -2389,11 +2427,9 @@ async def process_web(
         log.debug('text_content: %s', content)
 
         if process:
-            collection_name = form_data.collection_name
-            if not collection_name:
-                collection_name = calculate_sha256_string(form_data.url)[:63]
-            else:
-                await _validate_collection_access([collection_name], user, access_type='write')
+            # Derived from the owner as well as the URL, so two users reading the
+            # same page never share one collection encrypted under two keys.
+            collection_name = calculate_sha256_string(f'{user.id}:{form_data.url}')[:63]
 
             if not config.BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL:
                 await run_in_threadpool(
@@ -2402,6 +2438,7 @@ async def process_web(
                     docs,
                     collection_name,
                     config,
+                    key=owner_key(user.id),
                     overwrite=overwrite,
                     add=(not overwrite),
                     user=user,
@@ -2926,7 +2963,8 @@ async def process_web_search(request: Request, form_data: SearchForm, user=Depen
             }
         else:
             # Create a single collection for all documents
-            # Bind the ephemeral collection to its owner so filter_accessible_collections can scope it per-user.
+            # Bind the ephemeral collection to its owner so filter_accessible_collections
+            # can scope it per-user, and encrypt it under that owner's key.
             collection_name = f'web-search-{user.id}-{calculate_sha256_string("-".join(form_data.queries))}'[:63]
 
             try:
@@ -2936,6 +2974,7 @@ async def process_web_search(request: Request, form_data: SearchForm, user=Depen
                     docs,
                     collection_name,
                     config,
+                    key=owner_key(user.id),
                     overwrite=True,
                     user=user,
                 )
@@ -2964,6 +3003,35 @@ async def process_web_search(request: Request, form_data: SearchForm, user=Depen
         )
 
 
+async def require_knowledge_write_access(knowledge_id: str, user, db=None) -> None:
+    """Holding a knowledge base's key is not permission to write to it.
+
+    Read-only members are handed the same key as writers, so possession alone
+    would let them inject chunks: check the access grants as well. Read
+    without decrypting, because deciding is also for people — an administrator
+    — who hold no key, and loading the row would refuse them.
+    """
+    knowledge = await Knowledges.get_knowledge_access_by_id(knowledge_id, db=db)
+    if not knowledge:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+
+    if (
+        knowledge.user_id != user.id
+        and user.role != 'admin'
+        and not await AccessGrants.has_access(
+            user_id=user.id,
+            resource_type='knowledge',
+            resource_id=knowledge_id,
+            permission='write',
+            db=db,
+        )
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+        )
+
+
 async def _validate_collection_access(collection_names: list[str], user, access_type: str = 'read') -> None:
     """
     Raise 403 if the user lacks access to any of the requested collections.
@@ -2978,6 +3046,26 @@ async def _validate_collection_access(collection_names: list[str], user, access_
             status_code=status.HTTP_403_FORBIDDEN,
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
+
+
+def _keyed_collection(collection_name: str, user) -> KeyedCollection:
+    """The key that opens a validated collection, judged by its name.
+
+    Mirrors the naming policy of filter_accessible_collections: file-*,
+    user-memory-* and web-search-* collections belong to one user and open
+    with that user's key; anything else that passed validation is a knowledge
+    base (or a legacy collection the caller brought in, likewise keyed to the
+    caller). knowledge_key raises rather than guessing when the caller holds
+    no key for the knowledge base.
+    """
+    if collection_name.startswith(('file-', 'user-memory-', 'web-search-')):
+        return KeyedCollection(collection_name, owner_key(user.id))
+    try:
+        return KeyedCollection(collection_name, knowledge_key(collection_name, user.id))
+    except VectorKeyError:
+        # Not a knowledge base this user holds a key for; a legacy/ephemeral
+        # collection (pasted text, processed URL) is keyed to its creator.
+        return KeyedCollection(collection_name, owner_key(user.id))
 
 
 class QueryDocForm(BaseModel):
@@ -3000,9 +3088,11 @@ async def query_doc_handler(
     await _validate_collection_access([form_data.collection_name], user)
 
     try:
+        collection = _keyed_collection(form_data.collection_name, user)
+
         if config.ENABLE_RAG_HYBRID_SEARCH and (form_data.hybrid is None or form_data.hybrid):
             return await query_doc_with_hybrid_search(
-                collection_name=form_data.collection_name,
+                collection=collection,
                 collection_result=None,
                 query=form_data.query,
                 embedding_function=lambda query, prefix: request.app.state.EMBEDDING_FUNCTION(
@@ -3030,7 +3120,7 @@ async def query_doc_handler(
             # offload so the request's event loop stays responsive.
             return await asyncio.to_thread(
                 query_doc,
-                collection_name=form_data.collection_name,
+                collection=collection,
                 query_embedding=query_embedding,
                 k=form_data.k if form_data.k else config.TOP_K,
                 user=user,
@@ -3066,9 +3156,11 @@ async def query_collection_handler(
     await _validate_collection_access(form_data.collection_names, user)
 
     try:
+        collections = [_keyed_collection(name, user) for name in form_data.collection_names]
+
         if config.ENABLE_RAG_HYBRID_SEARCH and (form_data.hybrid is None or form_data.hybrid):
             return await query_collection_with_hybrid_search(
-                collection_names=form_data.collection_names,
+                collections=collections,
                 queries=[form_data.query],
                 embedding_function=lambda query, prefix: request.app.state.EMBEDDING_FUNCTION(
                     query, prefix=prefix, user=user
@@ -3095,7 +3187,7 @@ async def query_collection_handler(
         else:
             return await query_collection(
                 request,
-                collection_names=form_data.collection_names,
+                collections=collections,
                 queries=[form_data.query],
                 embedding_function=lambda query, prefix: request.app.state.EMBEDDING_FUNCTION(
                     query, prefix=prefix, user=user
@@ -3134,37 +3226,16 @@ async def delete_entries_from_collection(
 ):
     try:
         if await ASYNC_VECTOR_DB_CLIENT.has_collection(collection_name=form_data.collection_name):
-            file = await Files.get_file_by_id(form_data.file_id, db=db)
-            if not file:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=ERROR_MESSAGES.NOT_FOUND,
-                )
-            hash = file.hash
-
-            # Refuse to issue a `filter={'hash': None}` query — the
-            # match semantics of a null filter value are
-            # backend-dependent (some backends ignore the key, some
-            # match every row whose metadata lacks `hash`) and risk
-            # deleting unrelated entries. Files without a hash are
-            # typically unprocessed / failed / legacy records that
-            # can't be targeted by hash anyway.
-            if hash is None:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=ERROR_MESSAGES.DEFAULT('File has no hash; cannot delete vector entries by hash.'),
-                )
-
-            # Pre-existing bug: this used `metadata=` which is not a
-            # parameter on `VectorDBBase.delete` nor on any backend
-            # implementation, so the call always raised TypeError that
-            # was silently swallowed by the surrounding `except
-            # Exception` and the endpoint reported `{'status': False}`
-            # for every request. Use `filter` to actually do what the
-            # endpoint name promises.
+            # By file_id rather than by content hash. The stored hash is keyed
+            # with the collection's key, and this endpoint takes any collection
+            # name, so which key applies could only be guessed from the name.
+            # Every chunk of a file carries its file_id, and that is what
+            # "delete this file's entries" means anyway; the hash would also
+            # have taken out a different file that happened to say the same
+            # thing.
             await ASYNC_VECTOR_DB_CLIENT.delete(
                 collection_name=form_data.collection_name,
-                filter={'hash': hash},
+                filter={'file_id': form_data.file_id},
             )
             await publish_event(
                 request,
@@ -3276,8 +3347,10 @@ async def process_files_batch(
     config = await get_retrieval_config()
     collection_name = form_data.collection_name
 
-    if collection_name:
-        await _validate_collection_access([collection_name], user, access_type='write')
+    # Holding the knowledge base's key is not permission to write to it:
+    # read-only members hold the same key as writers, so the grants are
+    # checked, not possession.
+    await require_knowledge_write_access(collection_name, user, db=db)
 
     file_results: list[BatchProcessFilesResult] = []
     file_errors: list[BatchProcessFilesResult] = []
@@ -3286,35 +3359,20 @@ async def process_files_batch(
     # Prepare all documents first
     all_docs: list[Document] = []
 
-    for file in form_data.files:
+    for submitted in form_data.files:
         try:
-            # Ownership check: verify the requesting user owns the file or is an admin
-            db_file = await Files.get_file_by_id(file.id, db=db)
-            if not db_file:
-                file_errors.append(
-                    BatchProcessFilesResult(
-                        file_id=file.id,
-                        status='failed',
-                        error='File not found',
-                    )
-                )
-                continue
-            if db_file.user_id != user.id and user.role != 'admin':
-                file_errors.append(
-                    BatchProcessFilesResult(
-                        file_id=file.id,
-                        status='failed',
-                        error='Permission denied: not file owner',
-                    )
-                )
-                continue
+            # Read the file from the database rather than trusting the request
+            # body, and only the caller's own files.
+            file = await Files.get_file_by_id_and_user_id(submitted.id, user.id, db=db)
+            if not file:
+                raise ValueError(f'No file {submitted.id} belonging to this user.')
 
-            text_content = file.data.get('content', '')
+            text_content = (file.data or {}).get('content', '')
             docs: list[Document] = [
                 Document(
                     page_content=text_content.replace('<br/>', '\n'),
                     metadata={
-                        **file.meta,
+                        **(file.meta or {}),
                         'name': file.filename,
                         'created_by': file.user_id,
                         'file_id': file.id,
@@ -3327,15 +3385,17 @@ async def process_files_batch(
 
             file_updates.append(
                 FileUpdateForm(
-                    hash=calculate_sha256_string(text_content),
+                    # The same owner-keyed token process_file stores; the files
+                    # here are the caller's own, so user.id is the owner.
+                    hash=file_hash_token(calculate_sha256_string(text_content), owner_key(user.id)),
                     data={'content': text_content},
                 )
             )
             file_results.append(BatchProcessFilesResult(file_id=file.id, status='prepared'))
 
         except Exception as e:
-            log.error(f'process_files_batch: Error processing file {file.id}: {str(e)}')
-            file_errors.append(BatchProcessFilesResult(file_id=file.id, status='failed', error=str(e)))
+            log.error(f'process_files_batch: Error processing file {submitted.id}: {str(e)}')
+            file_errors.append(BatchProcessFilesResult(file_id=submitted.id, status='failed', error=str(e)))
 
     # Save all documents in one batch
     if all_docs:
@@ -3345,7 +3405,10 @@ async def process_files_batch(
                 request,
                 all_docs,
                 collection_name,
-                config,
+                config=config,
+                # The chunks belong to the knowledge base, so the caller must
+                # hold its key; resolving it here enforces that.
+                key=knowledge_key(collection_name, user.id, db=db),
                 add=True,
                 user=user,
             )

@@ -973,6 +973,7 @@ ${content}
 		bind:show={showAccessControlModal}
 		bind:accessGrants={note.access_grants}
 		accessRoles={['read', 'write']}
+		resourceType="Note"
 		share={$user?.permissions?.sharing?.notes || $user?.role === 'admin'}
 		sharePublic={$user?.permissions?.sharing?.public_notes || $user?.role === 'admin'}
 		shareUsers={($user?.permissions?.access_grants?.allow_users ?? true) || $user?.role === 'admin'}

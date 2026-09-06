@@ -4,6 +4,7 @@ import uuid
 from typing import Optional
 
 from open_webui.config import RAG_FILE_CONTENT_SEARCH_MAX_CHARS
+from open_webui.crypto_exceptions import CryptoPolicyError
 from open_webui.internal.db import Base, JSONField, get_async_db_context
 from open_webui.models.access_grants import AccessGrantModel, AccessGrants
 from open_webui.models.files import (
@@ -26,12 +27,10 @@ from sqlalchemy import (
     UniqueConstraint,
     delete,
     func,
-    or_,
     select,
     update,
 )
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import defer
 
 log = logging.getLogger(__name__)
 
@@ -225,6 +224,10 @@ class KnowledgeTable:
                     return await self._to_knowledge_model(result, db=db)
                 else:
                     return None
+            except CryptoPolicyError:
+                # A refused audience is an answer for the caller, not a failure
+                # to write, so it must not be flattened into None here.
+                raise
             except Exception:
                 return None
 
@@ -272,35 +275,17 @@ class KnowledgeTable:
             async with get_async_db_context(db) as db:
                 stmt = select(Knowledge, User).outerjoin(User, User.id == Knowledge.user_id)
 
+                query_key = None
+                source = None
                 if filter:
                     query_key = filter.get('query')
-                    if query_key:
-                        stmt = stmt.filter(
-                            or_(
-                                Knowledge.name.ilike(f'%{query_key}%'),
-                                Knowledge.description.ilike(f'%{query_key}%'),
-                                User.name.ilike(f'%{query_key}%'),
-                                User.email.ilike(f'%{query_key}%'),
-                                User.username.ilike(f'%{query_key}%'),
-                            )
-                        )
+                    source = filter.get('source')
 
                     view_option = filter.get('view_option')
                     if view_option == 'created':
                         stmt = stmt.filter(Knowledge.user_id == user_id)
                     elif view_option == 'shared':
                         stmt = stmt.filter(Knowledge.user_id != user_id)
-
-                    source = filter.get('source')
-                    if source == 'external':
-                        stmt = stmt.filter(Knowledge.meta['source'].as_string() == 'external')
-                    elif source == 'local':
-                        stmt = stmt.filter(
-                            or_(
-                                Knowledge.meta.is_(None),
-                                Knowledge.meta['source'].as_string() != 'external',
-                            )
-                        )
 
                     stmt = AccessGrants.has_permission_filter(
                         db=db,
@@ -314,7 +299,7 @@ class KnowledgeTable:
                 order_by = (filter or {}).get('order_by')
                 direction = (filter or {}).get('direction')
 
-                if order_by in KNOWLEDGE_SORTABLE_FIELDS:
+                if order_by in KNOWLEDGE_SORTABLE_FIELDS and order_by != 'name':
                     column = getattr(Knowledge, order_by)
                     if (direction or 'desc').lower() == 'asc':
                         stmt = stmt.order_by(column.asc(), Knowledge.id.asc())
@@ -323,15 +308,43 @@ class KnowledgeTable:
                 else:
                     stmt = stmt.order_by(Knowledge.updated_at.desc(), Knowledge.id.asc())
 
-                count_result = await db.execute(select(func.count()).select_from(stmt.subquery()))
-                total = count_result.scalar()
-                if skip:
-                    stmt = stmt.offset(skip)
-                if limit:
-                    stmt = stmt.limit(limit)
-
                 result = await db.execute(stmt)
                 items = result.all()
+
+                # The name, the description and the meta are matched after they
+                # are read, because they are encrypted at rest and SQL only
+                # ever sees ciphertext.
+                if source == 'external':
+                    items = [(kb, user) for kb, user in items if (kb.meta or {}).get('source') == 'external']
+                elif source == 'local':
+                    items = [(kb, user) for kb, user in items if (kb.meta or {}).get('source') != 'external']
+
+                if query_key:
+                    needle = query_key.lower()
+                    items = [
+                        (kb, user)
+                        for kb, user in items
+                        if needle in (kb.name or '').lower()
+                        or needle in (kb.description or '').lower()
+                        or (user is not None and needle in (user.name or '').lower())
+                        or (user is not None and needle in (user.email or '').lower())
+                        or (user is not None and needle in (user.username or '').lower())
+                    ]
+
+                if order_by == 'name':
+                    # Sorted on the decrypted name, which SQL never sees.
+                    items = sorted(
+                        items,
+                        key=lambda item: (item[0].name or '').lower(),
+                        reverse=(direction or 'desc').lower() != 'asc',
+                    )
+
+                # Counted after filtering, so the total matches what is returned.
+                total = len(items)
+                if skip:
+                    items = items[skip:]
+                if limit:
+                    items = items[:limit]
 
                 knowledge_ids = [kb.id for kb, _ in items]
                 grants_map = await AccessGrants.get_grants_by_resources('knowledge', knowledge_ids, db=db)
@@ -394,56 +407,40 @@ class KnowledgeTable:
                     permission='read',
                 )
 
-                # Apply filename / content search
-                search_filter = None
-                if filter:
-                    q = filter.get('query')
-                    if q:
-                        if filter.get('include_content'):
-                            # Use ->> (as_string) instead of CAST(-> AS TEXT)
-                            # to avoid PostgreSQL "invalid memory alloc request
-                            # size" on large extracted-content rows (#24670).
-                            content_text = File.data['content'].as_string()
-                            content_text = func.substr(content_text, 1, RAG_FILE_CONTENT_SEARCH_MAX_CHARS)
-                            search_filter = or_(
-                                File.filename.ilike(f'%{q}%'),
-                                content_text.ilike(f'%{q}%'),
-                            )
-                        else:
-                            search_filter = File.filename.ilike(f'%{q}%')
-                        stmt = stmt.filter(search_filter)
-
                 # Order by file changes
                 stmt = stmt.order_by(File.updated_at.desc(), File.id.asc())
 
-                # Lightweight count: avoid selecting File.data and ORDER BY
-                count_stmt = (
-                    select(func.count(File.id))
-                    .select_from(File)
-                    .join(KnowledgeFile, File.id == KnowledgeFile.file_id)
-                    .join(Knowledge, KnowledgeFile.knowledge_id == Knowledge.id)
-                )
-                count_stmt = AccessGrants.has_permission_filter(
-                    db=db,
-                    query=count_stmt,
-                    DocumentModel=Knowledge,
-                    filter=filter,
-                    resource_type='knowledge',
-                    permission='read',
-                )
-                if search_filter is not None:
-                    count_stmt = count_stmt.filter(search_filter)
-                count_result = await db.execute(count_stmt)
-                total = count_result.scalar()
-
-                if skip:
-                    stmt = stmt.offset(skip)
-                if limit:
-                    stmt = stmt.limit(limit)
-
-                stmt = stmt.options(defer(File.data))
                 result = await db.execute(stmt)
                 rows = result.all()
+
+                # The filename and the content are matched after they are read,
+                # because they are encrypted at rest and SQL only ever sees
+                # ciphertext.
+                if filter:
+                    q = filter.get('query')
+                    if q:
+                        needle = q.lower()
+                        include_content = bool(filter.get('include_content'))
+                        filtered_rows = []
+                        for file, user, knowledge in rows:
+                            if needle in (file.filename or '').lower():
+                                filtered_rows.append((file, user, knowledge))
+                                continue
+                            if include_content:
+                                content = ((file.data or {}).get('content') or '')
+                                if not isinstance(content, str):
+                                    content = str(content)
+                                if needle in content[:RAG_FILE_CONTENT_SEARCH_MAX_CHARS].lower():
+                                    filtered_rows.append((file, user, knowledge))
+                        rows = filtered_rows
+
+                # Counted after filtering, so the total matches what is returned.
+                total = len(rows)
+
+                if skip:
+                    rows = rows[skip:]
+                if limit:
+                    rows = rows[:limit]
 
                 items = []
                 for file, user, knowledge in rows:
@@ -475,7 +472,12 @@ class KnowledgeTable:
         db: Optional[AsyncSession] = None,
         user_group_ids: set[str] | None = None,
     ) -> bool:
-        knowledge = await self.get_knowledge_by_id(id, db=db)
+        # Deciding whether an action is allowed needs ownership and grants,
+        # never the contents — so it must not need the key. Loading the row
+        # here would decrypt it and refuse for anyone who holds no key, and
+        # the refusal would read as "no access" for people (an administrator,
+        # a write-checked member) the answer should be yes for.
+        knowledge = await self.get_knowledge_access_by_id(id, db=db)
         if not knowledge:
             return False
         if knowledge.user_id == user_id:
@@ -501,14 +503,52 @@ class KnowledgeTable:
         except Exception:
             return None
 
-    async def get_knowledges_by_file_id(self, file_id: str, db: Optional[AsyncSession] = None) -> list[KnowledgeModel]:
+    async def get_knowledge_access_by_id(self, id: str, db: Optional[AsyncSession] = None):
+        """Who owns this knowledge base, without reading it.
+
+        For callers that only have to decide whether an action is allowed —
+        deleting, above all. Deleting does not need the contents, so it must
+        not need the key: an administrator can remove someone's knowledge base
+        without being able to open it. Who may reach it lives in the
+        access_grant table, keyless as well.
+        """
+        # See delete_knowledge_by_id for why this import is not at the top.
+        from open_webui.utils.encrypted_models import read_without_decrypting_async
+
+        async with get_async_db_context(db) as db:
+            return await read_without_decrypting_async(db, Knowledge, id, 'id', 'user_id')
+
+    async def get_knowledges_by_file_id(
+        self, file_id: str, user_id: str, db: Optional[AsyncSession] = None
+    ) -> list[KnowledgeModel]:
+        """The knowledge bases holding this file that this person may open.
+
+        Scoped to one person because a knowledge base is decrypted as it is
+        read, so loading one whose key this person does not hold would raise
+        rather than simply be filtered out.
+        """
         try:
             async with get_async_db_context(db) as db:
-                result = await db.execute(
+                filter = {'user_id': user_id}
+                groups = await Groups.get_groups_by_member_id(user_id, db=db)
+                if groups:
+                    filter['group_ids'] = [group.id for group in groups]
+
+                stmt = (
                     select(Knowledge)
                     .join(KnowledgeFile, Knowledge.id == KnowledgeFile.knowledge_id)
                     .filter(KnowledgeFile.file_id == file_id)
                 )
+                stmt = AccessGrants.has_permission_filter(
+                    db=db,
+                    query=stmt,
+                    DocumentModel=Knowledge,
+                    filter=filter,
+                    resource_type='knowledge',
+                    permission='read',
+                )
+
+                result = await db.execute(stmt)
                 knowledges = result.scalars().all()
                 knowledge_ids = [k.id for k in knowledges]
                 grants_map = await AccessGrants.get_grants_by_resources('knowledge', knowledge_ids, db=db)
@@ -552,23 +592,12 @@ class KnowledgeTable:
                 # Default sort: updated_at descending
                 primary_sort = File.updated_at.desc()
 
+                query_key = None
+                order_by = None
+                direction = None
+
                 if filter:
                     query_key = filter.get('query')
-                    if query_key:
-                        if filter.get('include_content'):
-                            # Use ->> (as_string) instead of CAST(-> AS TEXT)
-                            # to avoid PostgreSQL memory allocation failures on
-                            # large content (#24670).
-                            content_text = File.data['content'].as_string()
-                            content_text = func.substr(content_text, 1, RAG_FILE_CONTENT_SEARCH_MAX_CHARS)
-                            stmt = stmt.filter(
-                                or_(
-                                    File.filename.ilike(f'%{query_key}%'),
-                                    content_text.ilike(f'%{query_key}%'),
-                                )
-                            )
-                        else:
-                            stmt = stmt.filter(File.filename.ilike(f'%{query_key}%'))
 
                     view_option = filter.get('view_option')
                     if view_option == 'created':
@@ -580,9 +609,7 @@ class KnowledgeTable:
                     direction = filter.get('direction')
                     is_asc = direction == 'asc'
 
-                    if order_by == 'name':
-                        primary_sort = File.filename.asc() if is_asc else File.filename.desc()
-                    elif order_by == 'created_at':
+                    if order_by == 'created_at':
                         primary_sort = File.created_at.asc() if is_asc else File.created_at.desc()
                     elif order_by == 'updated_at':
                         primary_sort = File.updated_at.asc() if is_asc else File.updated_at.desc()
@@ -590,18 +617,43 @@ class KnowledgeTable:
                 # Apply sort with secondary key for deterministic pagination
                 stmt = stmt.order_by(primary_sort, File.id.asc())
 
-                # Count BEFORE pagination
-                count_result = await db.execute(select(func.count()).select_from(stmt.subquery()))
-                total = count_result.scalar()
-
-                if skip:
-                    stmt = stmt.offset(skip)
-                if limit:
-                    stmt = stmt.limit(limit)
-
-                stmt = stmt.options(defer(File.data))
                 result = await db.execute(stmt)
                 items = result.all()
+
+                # The filename and the content are matched after they are
+                # read, because they are encrypted at rest and SQL only ever
+                # sees ciphertext.
+                if query_key:
+                    needle = query_key.lower()
+                    include_content = bool(filter.get('include_content'))
+                    filtered_items = []
+                    for file, user in items:
+                        if needle in (file.filename or '').lower():
+                            filtered_items.append((file, user))
+                            continue
+                        if include_content:
+                            content = ((file.data or {}).get('content') or '')
+                            if not isinstance(content, str):
+                                content = str(content)
+                            if needle in content[:RAG_FILE_CONTENT_SEARCH_MAX_CHARS].lower():
+                                filtered_items.append((file, user))
+                    items = filtered_items
+
+                if order_by == 'name':
+                    # Sorted on the decrypted filename, which SQL never sees.
+                    items = sorted(
+                        items,
+                        key=lambda item: (item[0].filename or '').lower(),
+                        reverse=direction != 'asc',
+                    )
+
+                # Counted after filtering, so the total matches what is returned.
+                total = len(items)
+
+                if skip:
+                    items = items[skip:]
+                if limit:
+                    items = items[:limit]
 
                 files = [
                     FileUserResponse(
@@ -757,20 +809,30 @@ class KnowledgeTable:
         overwrite: bool = False,
         db: Optional[AsyncSession] = None,
     ) -> Optional[KnowledgeModel]:
+        # Written through the loaded row rather than as a bulk UPDATE: a bulk
+        # UPDATE skips the mapper events, so the name and description would be
+        # stored in the clear. Setting the grants flushes the dirty row in the
+        # same session, so a refused audience rolls the whole change back.
         try:
             async with get_async_db_context(db) as db:
-                await db.execute(
-                    update(Knowledge)
-                    .filter_by(id=id)
-                    .values(
-                        **form_data.model_dump(exclude={'access_grants'}),
-                        updated_at=int(time.time()),
-                    )
-                )
-                await db.commit()
+                result = await db.execute(select(Knowledge).filter_by(id=id))
+                knowledge = result.scalars().first()
+                if not knowledge:
+                    return None
+
+                knowledge.name = form_data.name
+                knowledge.description = form_data.description
+                knowledge.updated_at = int(time.time())
+
                 if form_data.access_grants is not None:
                     await AccessGrants.set_access_grants('knowledge', id, form_data.access_grants, db=db)
-                return await self.get_knowledge_by_id(id=id, db=db)
+
+                await db.commit()
+                return await self._to_knowledge_model(knowledge, db=db)
+        except CryptoPolicyError:
+            # A refused audience is an answer for the caller, not a failure
+            # to write, so it must not be flattened into None here.
+            raise
         except Exception as e:
             log.exception(e)
             return None
@@ -778,40 +840,54 @@ class KnowledgeTable:
     async def update_knowledge_meta_by_id(
         self, id: str, meta: dict, db: Optional[AsyncSession] = None
     ) -> Optional[KnowledgeModel]:
+        # Written through the loaded row: meta is encrypted at rest, and a
+        # bulk UPDATE would skip the mapper events and store it in the clear.
         try:
             async with get_async_db_context(db) as db:
-                await db.execute(
-                    update(Knowledge)
-                    .filter_by(id=id)
-                    .values(
-                        meta=meta,
-                        updated_at=int(time.time()),
-                    )
-                )
+                result = await db.execute(select(Knowledge).filter_by(id=id))
+                knowledge = result.scalars().first()
+                if not knowledge:
+                    return None
+
+                knowledge.meta = meta
+                knowledge.updated_at = int(time.time())
+
                 await db.commit()
-                return await self.get_knowledge_by_id(id=id, db=db)
+                return await self._to_knowledge_model(knowledge, db=db)
+        except CryptoPolicyError:
+            raise
         except Exception as e:
             log.exception(e)
             return None
 
     async def delete_knowledge_by_id(self, id: str, db: Optional[AsyncSession] = None) -> bool:
+        # Deleting does not need the contents, so it must not need the key: the
+        # helper removes the row by statement — never loading, and therefore
+        # never decrypting, it — and takes the wrapped key copies with it.
+        # Imported here because the registry imports every model, this one
+        # included, so importing it at the top would close a cycle.
+        from open_webui.utils.encrypted_models import delete_without_reading_async
+
         try:
             async with get_async_db_context(db) as db:
                 await AccessGrants.revoke_all_access('knowledge', id, db=db)
-                await db.execute(delete(Knowledge).filter_by(id=id))
+                await delete_without_reading_async(db, Knowledge, [id])
                 await db.commit()
                 return True
         except Exception:
             return False
 
     async def delete_all_knowledge(self, db: Optional[AsyncSession] = None) -> bool:
+        # See delete_knowledge_by_id for why this import is not at the top.
+        from open_webui.utils.encrypted_models import delete_without_reading_async
+
         async with get_async_db_context(db) as db:
             try:
                 result = await db.execute(select(Knowledge.id))
                 knowledge_ids = [row[0] for row in result.all()]
                 for knowledge_id in knowledge_ids:
                     await AccessGrants.revoke_all_access('knowledge', knowledge_id, db=db)
-                await db.execute(delete(Knowledge))
+                await delete_without_reading_async(db, Knowledge, knowledge_ids)
                 await db.commit()
 
                 return True

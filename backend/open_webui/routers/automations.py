@@ -32,7 +32,36 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 log = logging.getLogger(__name__)
 
-router = APIRouter()
+############################
+# Automations Closed Dependency
+############################
+
+
+AUTOMATIONS_UNAVAILABLE = (
+    'Automations are unavailable in this deployment: a scheduled run executes '
+    'with nobody signed in, so no data encryption key is in memory to open or '
+    'write the user\'s encrypted data with.'
+)
+
+
+def check_automations_access():
+    """Automations are closed here, whatever the configuration says.
+
+    An automation runs headless on a schedule. The per-user encryption model
+    only ever holds a user's key while one of their sessions is signed in, so
+    a run firing at 3am has no key to read the prompt it should send or to
+    write the chat it would produce. Refusing here keeps the tables empty;
+    reopening means designing key escrow for scheduled work first.
+    """
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail=AUTOMATIONS_UNAVAILABLE,
+    )
+
+
+# Declared on the router rather than in each handler, so a route added later is
+# closed too.
+router = APIRouter(dependencies=[Depends(check_automations_access)])
 
 PAGE_ITEM_COUNT = 30
 
